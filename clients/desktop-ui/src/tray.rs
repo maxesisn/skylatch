@@ -14,8 +14,19 @@
 use crate::host_mgr::{HostStatus, MISSING_TEXT};
 use gpui::{App, Window};
 
-/// The Lock-Bolt icon, compiled in: no file has to sit next to the executable.
+/// The Carbon Precision Lock-Bolt icon, compiled in: no file has to sit next to the executable.
+#[cfg(not(target_os = "macos"))]
 const ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/skylatch-256.png");
+
+/// macOS menu bar template image: 36x36, pure black on transparent. The system tints it for
+/// light and dark menu bars and wallpapers.
+#[cfg(target_os = "macos")]
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/skylatch-tray-template.png");
+
+#[cfg(test)]
+const TEMPLATE_PNG: &[u8] = include_bytes!("../../../assets/icon/skylatch-tray-template.png");
+#[cfg(test)]
+const COLOUR_PNG: &[u8] = include_bytes!("../../../assets/icon/skylatch-256.png");
 
 pub const ID_OPEN: &str = "skylatch.open";
 pub const ID_HOST: &str = "skylatch.host";
@@ -54,7 +65,7 @@ pub fn host_label(enabled: bool, status: &HostStatus) -> String {
     }
 }
 
-/// Decodes the embedded icon to RGBA8: `(pixels, width, height)`.
+/// Decodes the embedded tray icon to RGBA8: `(pixels, width, height)`.
 pub fn icon_rgba() -> Result<(Vec<u8>, u32, u32), String> {
     decode_png(ICON_PNG)
 }
@@ -117,13 +128,17 @@ mod imp {
             let menu = Menu::new();
             menu.append_items(&[&open, &host, &add, &PredefinedMenuItem::separator(), &quit])
                 .map_err(|e| e.to_string())?;
-            let tray = TrayIconBuilder::new()
+            let builder = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_menu_on_left_click(false)
-                .with_tooltip("Skylatch")
-                .with_icon(icon)
-                .build()
-                .map_err(|e| e.to_string())?;
+                .with_tooltip("Skylatch");
+            // macOS: a template image, which the menu bar draws in the system's monochrome
+            // (the replacement of the deprecated `with_icon_as_template(true)`)
+            #[cfg(target_os = "macos")]
+            let builder = builder.with_icon_templated(icon);
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.with_icon(icon);
+            let tray = builder.build().map_err(|e| e.to_string())?;
             Ok(Tray {
                 _icon: tray,
                 host_item: host,
@@ -302,12 +317,52 @@ mod tests {
     #[test]
     fn the_embedded_icon_decodes_to_rgba() {
         let (rgba, w, h) = icon_rgba().expect("icon decodes");
-        assert_eq!((w, h), (256, 256));
-        assert_eq!(rgba.len(), 256 * 256 * 4);
+        #[cfg(target_os = "macos")]
+        assert_eq!((w, h), (36, 36), "macOS embeds the menu bar template");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!((w, h), (256, 256), "Windows embeds the colour icon");
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
         assert!(
             rgba.iter().skip(3).step_by(4).any(|&alpha| alpha == 255),
             "has opaque pixels"
         );
         assert!(decode_png(b"not a png").is_err());
+    }
+
+    #[test]
+    fn the_macos_template_is_black_with_alpha_and_the_colour_icon_is_not() {
+        let (rgba, w, h) = decode_png(TEMPLATE_PNG).expect("template decodes");
+        assert_eq!((w, h), (36, 36));
+        assert_eq!(rgba.len(), 36 * 36 * 4);
+        let alphas: Vec<u8> = rgba.iter().skip(3).step_by(4).copied().collect();
+        assert!(alphas.contains(&0), "transparent background");
+        assert!(alphas.contains(&255), "opaque glyph");
+        assert!(
+            alphas.iter().any(|&a| a > 0 && a < 255),
+            "anti-aliased edges keep their alpha"
+        );
+        // a template image carries its shape in alpha only: every visible pixel is black
+        assert!(
+            rgba.chunks(4)
+                .filter(|p| p[3] > 0)
+                .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
+            "template pixels are pure black"
+        );
+        // the glyph fills most of the canvas without touching the border
+        let at = |x: usize, y: usize| rgba[(y * 36 + x) * 4 + 3];
+        assert!(
+            (0..36).all(|i| at(i, 0) == 0 && at(0, i) == 0 && at(i, 35) == 0 && at(35, i) == 0)
+        );
+        assert!(alphas.iter().filter(|&&a| a > 0).count() > 36 * 36 / 8);
+
+        // the Windows icon is the 256 px colour version, cobalt bolt included
+        let (colour, cw, ch) = decode_png(COLOUR_PNG).expect("colour icon decodes");
+        assert_eq!((cw, ch), (256, 256));
+        assert!(
+            colour
+                .chunks(4)
+                .any(|p| p[3] == 255 && p[2] > 200 && p[0] < 90),
+            "cobalt bolt"
+        );
     }
 }

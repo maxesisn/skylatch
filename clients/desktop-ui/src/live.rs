@@ -4,10 +4,12 @@
 //! stream client for the selected device.
 //!
 //! The GPUI thread never blocks on the network. A worker thread owns a small tokio runtime,
-//! calls [`skylatch_client_core::list_devices`] on start-up, on every manual refresh and
-//! every [`POLL_INTERVAL`], and sends the outcome back over a channel that the UI drains.
+//! calls [`skylatch_client_core::list_devices`] (and fetches the saved workspace layout next to
+//! it) on start-up, on every manual refresh and every [`POLL_INTERVAL`], and sends the outcome
+//! back over a channel that the UI drains. Saving a layout runs on its own short-lived thread
+//! ([`save_layout`]).
 
-use skylatch_client_core::{ClientError, list_devices};
+use skylatch_client_core::{ClientError, WorkspaceLayout, get_layout, list_devices, put_layout};
 use skylatch_proto::control::DeviceInfo;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -43,6 +45,9 @@ enum Cmd {
 #[derive(Debug)]
 pub struct PollResult {
     pub devices: Result<Vec<DeviceInfo>, String>,
+    /// The account's saved arrangement; `None` when it could not be fetched (the device list
+    /// is still good then).
+    pub layout: Option<WorkspaceLayout>,
 }
 
 /// Handle to the polling worker.
@@ -141,11 +146,21 @@ fn worker(cmd_rx: Receiver<Cmd>, res_tx: Sender<(u64, PollResult)>) {
         if Instant::now() < due {
             continue;
         }
-        let devices = rt
-            .block_on(list_devices(&t.url, &t.token))
-            .map_err(|e| describe_error(&e));
+        let (devices, layout) = rt.block_on(async {
+            let devices = list_devices(&t.url, &t.token)
+                .await
+                .map_err(|e| describe_error(&e));
+            let layout = match devices {
+                Ok(_) => get_layout(&t.url, &t.token).await.ok(),
+                Err(_) => None,
+            };
+            (devices, layout)
+        });
         due = Instant::now() + POLL_INTERVAL;
-        if res_tx.send((generation, PollResult { devices })).is_err() {
+        if res_tx
+            .send((generation, PollResult { devices, layout }))
+            .is_err()
+        {
             return;
         }
     }
@@ -171,6 +186,22 @@ where
             }
         });
     rx
+}
+
+/// Saves `layout` on the hub in the background (`PUT /api/v1/layout`). The answer, the layout
+/// the hub stored or a one-line explanation, arrives on the returned channel; the UI thread
+/// never waits for it.
+pub fn save_layout(
+    hub_url: &str,
+    token: &str,
+    layout: &WorkspaceLayout,
+) -> Receiver<Result<WorkspaceLayout, String>> {
+    let (url, token, layout) = (hub_url.to_string(), token.to_string(), layout.clone());
+    run_async(async move {
+        put_layout(&url, &token, &layout)
+            .await
+            .map_err(|e| describe_error(&e))
+    })
 }
 
 /// One-line, user-facing explanation of a discovery failure.

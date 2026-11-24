@@ -7,7 +7,8 @@ client for the screen you pick, with one click. **License: Apache-2.0.**
 - **Desk view** – every room becomes an L-shaped corner desk. Desktops and mini PCs stand on the
   right-back wing with one screen per real monitor (true aspect ratio, landscape or portrait),
   laptops on the left-back wing, VMs and servers in a 19" mini rack beside the desk. A separate
-  **VM Rack** tab shows all VMs and servers in one larger rack.
+  **VM Rack** tab only exists for VMs that no desk shows: a room without a desk of its own, or
+  more VMs than the sidecar rack holds.
 - **Shelf view** (`V`) – the same devices as a flat front elevation, physical machines on the upper
   shelves, VMs below. Machines that do not fit on a desk (more than four per room) are only shown
   here; a chip in the footer says so.
@@ -21,6 +22,14 @@ client for the screen you pick, with one click. **License: Apache-2.0.**
   existing account token) or **Direct Connect** (`ws://` / `wss://` address of one host plus an
   optional token, starts the native client at once). See
   [Onboarding and adding devices](#onboarding-and-adding-devices).
+- **Arrange workstation** (`整理工位`, key `E`) – drag machines onto empty slots, add L-desks,
+  straight desks, racks and rooms, rename machines and move them between rooms; the arrangement is
+  saved on the hub (`PUT /api/v1/layout`) and shared by every client of the account. See
+  [Arranging the workstation](#arranging-the-workstation).
+- **Camera** – the scroll wheel zooms (0.6x to 2.4x) around the pointer, dragging empty floor or
+  using the right / middle button pans, `0` or **重置视野** returns to the automatic fit.
+- **This machine** – the device the launcher itself runs on (read from the local `agent.json`) is
+  marked **本机** and is never taken over from itself.
 - **Add device** – while signed in, `+ 添加设备` in the top bar shows a one-time 6-digit pairing code and
   a copyable `skylatch-agent join` command.
 - **Demo fleet** – `--demo` (and only `--demo`) shows the built-in demo fleet, to try the UI without a
@@ -138,8 +147,10 @@ native client while it runs, because the client takes it as `--token`.
 
 ## Taking over a screen
 
-Double-click a screen or a rack blade, click **接管屏幕**, or press `Enter`. The launcher looks for
-the native client in this order:
+Double-click a screen or a rack blade, click **接管屏幕**, or press `Enter`. The machine the launcher
+runs on is the exception: it is marked **本机**, stays selectable (its hardware model, arrangement
+and name can still be looked at and changed) and its button reads **当前设备** and does nothing.
+The launcher looks for the native client in this order:
 
 1. `client_bin` from the settings drawer / config file, or `SKYLATCH_CLIENT`;
 2. `skylatch-client` (`.exe` on Windows) next to the launcher;
@@ -168,8 +179,45 @@ started.
   beyond that is shown on the shelf (and, for VMs, in the VM Rack tab, which holds up to six blades).
 - Crowded captions stack upwards instead of overlapping, and the drawing area reserves room for them.
 
+- A **VM Rack** tab is only added for VMs no desk shows: VMs of a room without a physical machine,
+  and the VMs of a room that has more than four (the room's sidecar rack is dropped then).
+- The footer and the VM preview panel show the agent's `hardware_model` (for example
+  `Mac mini (Apple M4)`) when it reports one.
+
 Keys: `←` `→` `Tab` cycle screens, `1`–`9` switch tab, `V` shelf, `T` theme, `R` refresh, `H` hub
-drawer, `Enter` take over.
+drawer, `E` arrange, `0` reset the camera, `Enter` take over.
+
+## Arranging the workstation
+
+Click **整理工位** in the top bar (or press `E`; it is there while signed in to a hub and with
+`--demo`). The floor grid brightens, every empty slot of every desk and rack is drawn as a dashed
+outline, and a toolbar appears under the top bar. Daily mode stays locked: clicking selects,
+double-clicking takes over, nothing can be dragged by accident.
+
+- **Drag and drop** – press a machine and drag it; the compatible empty slots light up cobalt, the one
+  under the pointer glows, releasing snaps the machine into it. A laptop fits the laptop bay and
+  any seat, a desktop or mini PC any seat, a VM any rack bay. Occupied slots and slots of the wrong
+  kind refuse the drop.
+- `+ L形桌`, `+ 直桌`, `+ 机柜` add a piece of furniture on free floor of the room on screen;
+  `移除空家具` removes an empty one (a room keeps at least one piece).
+- `+ 新建房间` asks for a name and adds a room with an empty L-desk.
+- With a machine selected: **改名** gives it a name of its own (all its screens), the room chips
+  under **移到房间** move it to the first open slot of that room, **恢复自动布局** forgets the
+  whole arrangement and goes back to the automatic one.
+- **完成** (or `E`, `Esc`) leaves arrange mode. Leaving without a change restores what was there.
+
+The arrangement is a `WorkspaceLayout` (rooms, furniture at `(grid_x, grid_y)` of an isometric
+floor grid, device placements as `(furniture_id, slot)` with an optional `custom_name`). It is
+fetched together with the device list and saved in the background after every change, one request
+at a time, so the window never waits for the hub; the toolbar shows `保存中…`, `已保存到 Hub` or the
+error. A fetched layout is ignored while a save is on its way or while arranging. Machines that
+have no placement yet (newly enrolled ones) take the first open compatible slot of their own room,
+then of any room; what finds no slot stays on the shelf, and VMs without a blade go to the VM Rack
+tab. Placements of machines that are offline are kept, so they find their seat again. Without a
+hub (`--demo`) the arrangement only lives until the launcher closes.
+
+Each piece of furniture has fixed slots: an L-desk has a laptop bay on the left wing and three seats
+on the right wing, a straight desk three seats, a rack four blade bays.
 
 ## Tests
 
@@ -177,4 +225,7 @@ drawer, `Enter` take over.
 normalisation, client discovery and arguments, scene geometry for demo and live fleets at seven
 window sizes: no overlapping hit targets, no overlapping labels, everything inside the stage) and
 headless GPUI tests that render and drive the view without opening an OS window (demo and live
-fleets, light and dark, desk and shelf, the Hub drawer, one-click launch).
+fleets, light and dark, desk and shelf, the Hub drawer, one-click launch, this machine, arrange
+mode with drag and drop and saving to a fake hub, camera zoom and pan). The tray icon assets decode
+as 36x36 (macOS menu bar template) and 256x256 RGBA, and no user-facing text uses the middot as a
+separator.

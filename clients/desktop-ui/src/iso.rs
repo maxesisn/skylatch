@@ -162,6 +162,75 @@ impl Fit {
     }
 }
 
+/// Narrowest and widest zoom of the isometric canvas.
+pub const ZOOM_MIN: f32 = 0.6;
+pub const ZOOM_MAX: f32 = 2.4;
+
+/// The user's camera over the default fit: a zoom about the centre of the stage plus a pan in
+/// stage pixels. The default (`zoom = 1`, `pan = 0`) is the automatic fit of the whole room.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    pub zoom: f32,
+    pub pan: (f32, f32),
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Camera {
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+        }
+    }
+}
+
+impl Camera {
+    pub fn is_default(&self) -> bool {
+        (self.zoom - 1.0).abs() < 1e-4 && self.pan.0.abs() < 0.5 && self.pan.1.abs() < 0.5
+    }
+
+    pub fn reset(&mut self) {
+        *self = Camera::default();
+    }
+
+    /// Zooms by `factor`, keeping the stage point `at` (cursor) where it is.
+    pub fn zoom_at(&mut self, factor: f32, at: P2, view: (f32, f32)) {
+        let z0 = self.zoom;
+        let z1 = (z0 * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        let (cx, cy) = (view.0 * 0.5, view.1 * 0.5);
+        let k = z1 / z0;
+        self.pan.0 = (at.x - cx) - (at.x - cx - self.pan.0) * k;
+        self.pan.1 = (at.y - cy) - (at.y - cy - self.pan.1) * k;
+        self.zoom = z1;
+        self.clamp(view);
+    }
+
+    pub fn pan_by(&mut self, dx: f32, dy: f32, view: (f32, f32)) {
+        self.pan.0 += dx;
+        self.pan.1 += dy;
+        self.clamp(view);
+    }
+
+    /// Keeps the middle of the scene inside the stage, so it can never be lost.
+    fn clamp(&mut self, view: (f32, f32)) {
+        let (mx, my) = (view.0 * 0.5 * self.zoom, view.1 * 0.5 * self.zoom);
+        self.pan.0 = self.pan.0.clamp(-mx, mx);
+        self.pan.1 = self.pan.1.clamp(-my, my);
+    }
+}
+
+impl Fit {
+    /// This fit seen through the camera: scaled about the stage centre, then panned. Hit
+    /// testing, label layout and painting all use this one transform.
+    pub fn with_camera(self, cam: &Camera, view: (f32, f32)) -> Fit {
+        let (cx, cy) = (view.0 * 0.5, view.1 * 0.5);
+        Fit {
+            scale: self.scale * cam.zoom,
+            tx: cx + (self.tx - cx) * cam.zoom + cam.pan.0,
+            ty: cy + (self.ty - cy) * cam.zoom + cam.pan.1,
+        }
+    }
+}
+
 /// A planar quad in world space described by an origin and two edge vectors:
 /// `a` runs along the quad's width, `b` along its height.
 #[derive(Clone, Copy, Debug)]
@@ -558,6 +627,159 @@ mod tests {
                 P2::new(probe_px.x + w, probe_px.y),
                 &screen_poly
             ));
+        }
+    }
+
+    const VIEW: (f32, f32) = (1200.0, 600.0);
+
+    fn base_fit() -> Fit {
+        Fit::new(
+            Rect2 {
+                x: -300.0,
+                y: -40.0,
+                w: 900.0,
+                h: 520.0,
+            },
+            VIEW.0,
+            VIEW.1,
+            (56.0, 100.0, 150.0, 56.0),
+        )
+    }
+
+    #[test]
+    fn the_default_camera_is_the_automatic_fit() {
+        let (base, cam) = (base_fit(), Camera::default());
+        assert!(cam.is_default());
+        let seen = base.with_camera(&cam, VIEW);
+        for p in [
+            P2::new(0.0, 0.0),
+            P2::new(-300.0, -40.0),
+            P2::new(600.0, 480.0),
+        ] {
+            let (a, b) = (base.apply(p), seen.apply(p));
+            assert!(close(a.x, b.x) && close(a.y, b.y));
+        }
+        assert!(close(seen.scale, base.scale));
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_pointer_and_stays_in_range() {
+        let base = base_fit();
+        let scene_pt = P2::new(120.0, 210.0);
+        for at in [
+            P2::new(600.0, 300.0),
+            P2::new(380.0, 190.0),
+            P2::new(820.0, 420.0),
+        ] {
+            let mut cam = Camera::default();
+            // put the scene point under the pointer first, then zoom there
+            let seen = base.with_camera(&cam, VIEW);
+            let p = seen.apply(scene_pt);
+            cam.pan_by(at.x - p.x, at.y - p.y, VIEW);
+            for factor in [1.3, 1.3, 1.3, 0.9, 1.6] {
+                cam.zoom_at(factor, at, VIEW);
+                let q = base.with_camera(&cam, VIEW).apply(scene_pt);
+                assert!(
+                    (q.x - at.x).abs() < 0.05 && (q.y - at.y).abs() < 0.05,
+                    "zoom {} drifted to {q:?} from {at:?}",
+                    cam.zoom
+                );
+                assert!((ZOOM_MIN..=ZOOM_MAX).contains(&cam.zoom));
+            }
+        }
+        // the range is hard
+        let mut cam = Camera::default();
+        for _ in 0..40 {
+            cam.zoom_at(1.5, P2::new(600.0, 300.0), VIEW);
+        }
+        assert!(close(cam.zoom, ZOOM_MAX) && ZOOM_MAX == 2.4);
+        for _ in 0..80 {
+            cam.zoom_at(0.6, P2::new(10.0, 10.0), VIEW);
+        }
+        assert!(close(cam.zoom, ZOOM_MIN) && ZOOM_MIN == 0.6);
+        // zooming about the stage centre never moves the view sideways
+        let mut c = Camera::default();
+        c.zoom_at(2.0, P2::new(VIEW.0 * 0.5, VIEW.1 * 0.5), VIEW);
+        assert!(c.pan.0.abs() < 1e-3 && c.pan.1.abs() < 1e-3);
+    }
+
+    #[test]
+    fn panning_moves_the_scene_and_cannot_lose_it_and_reset_restores_the_fit() {
+        let base = base_fit();
+        let mut cam = Camera::default();
+        cam.pan_by(40.0, -25.0, VIEW);
+        let (a, b) = (
+            base.apply(P2::new(10.0, 10.0)),
+            base.with_camera(&cam, VIEW).apply(P2::new(10.0, 10.0)),
+        );
+        assert!(close(b.x - a.x, 40.0) && close(b.y - a.y, -25.0));
+        assert!(!cam.is_default());
+        // dragged far away: the middle of the scene stays on the stage
+        cam.pan_by(1e6, -1e6, VIEW);
+        let centre = base.with_camera(&cam, VIEW).apply(P2::new(150.0, 220.0));
+        assert!(centre.x <= VIEW.0 * 1.5 + 1.0 && centre.y >= -VIEW.1 * 0.5 - 1.0);
+        cam.zoom_at(2.0, P2::new(300.0, 300.0), VIEW);
+        cam.reset();
+        assert!(cam.is_default());
+        let p = P2::new(33.0, 77.0);
+        let (x, y) = (base.apply(p), base.with_camera(&cam, VIEW).apply(p));
+        assert!(close(x.x, y.x) && close(x.y, y.y));
+        // a tiny residue still counts as "not default", a sub-pixel one does not
+        let mut tiny = Camera::default();
+        tiny.pan_by(0.3, 0.0, VIEW);
+        assert!(tiny.is_default());
+        tiny.pan_by(2.0, 0.0, VIEW);
+        assert!(!tiny.is_default());
+    }
+
+    #[test]
+    fn hit_testing_follows_zoom_and_pan() {
+        // a screen quad, tested through the camera at several zooms and pans
+        let q = Quad3::new(
+            p3(200.0, 70.0, 44.0),
+            p3(210.0, 0.0, 0.0),
+            p3(0.0, 0.0, 118.0),
+        );
+        let poly: Vec<P2> = q.corners().iter().map(|&c| project(c)).collect();
+        let base = Fit::new(
+            Rect2::of_points(&poly).unwrap(),
+            VIEW.0,
+            VIEW.1,
+            (80.0, 80.0, 80.0, 80.0),
+        );
+        let centre = project(q.at(0.5, 0.5));
+        let mut cam = Camera::default();
+        let mut steps = vec![
+            (1.0, (0.0, 0.0)),
+            (1.8, (0.0, 0.0)),
+            (2.4, (-120.0, 60.0)),
+            (0.6, (200.0, -40.0)),
+        ];
+        steps.reverse();
+        while let Some((z, pan)) = steps.pop() {
+            cam.reset();
+            cam.zoom_at(z, P2::new(VIEW.0 * 0.5, VIEW.1 * 0.5), VIEW);
+            cam.pan_by(pan.0, pan.1, VIEW);
+            let fit = base.with_camera(&cam, VIEW);
+            let screen_poly: Vec<P2> = poly.iter().map(|&p| fit.apply(p)).collect();
+            let px = fit.apply(centre);
+            assert!(point_in_polygon(px, &screen_poly), "zoom {z} pan {pan:?}");
+            // the pixel inverts to the scene point, which is in the scene polygon
+            let back = fit.invert(px);
+            assert!(close(back.x, centre.x) && close(back.y, centre.y));
+            assert!(point_in_polygon(back, &poly));
+            // just outside the quad misses, at any zoom
+            let tl = fit.apply(poly[3]);
+            assert!(!point_in_polygon(
+                P2::new(tl.x - 3.0, tl.y + 3.0),
+                &screen_poly
+            ));
+            assert!(!point_in_polygon(
+                fit.invert(P2::new(px.x + 4000.0, px.y)),
+                &poly
+            ));
+            // the quad grows with the zoom
+            assert!(close(fit.scale, base.scale * cam.zoom));
         }
     }
 

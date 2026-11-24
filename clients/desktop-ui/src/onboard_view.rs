@@ -8,7 +8,7 @@ use crate::host_mgr::{ChipKind, chip_look};
 use crate::onboard::{self, OnbField, Tab};
 use crate::scene::HEADER_H;
 use crate::theme::Pal;
-use crate::{Proto, clip, mtxt, paint_mark, rgba, txt};
+use crate::{Proto, clip, hint_row, mtxt, paint_mark, rgba, txt};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, canvas, div, px,
@@ -355,8 +355,8 @@ impl Proto {
             (None, false) => (
                 match o.tab {
                     Tab::Hub if o.token_mode => "Token 保存在本机用户配置目录".to_string(),
-                    Tab::Hub => "密码只用于登录，不会被保存 · 仅保留返回的会话 Token".to_string(),
-                    Tab::Direct => "无需 Hub · 直接启动 skylatch-client --direct".to_string(),
+                    Tab::Hub => "密码只用于登录，不会被保存，仅保留返回的会话 Token".to_string(),
+                    Tab::Direct => "无需 Hub，直接启动 skylatch-client --direct".to_string(),
                 },
                 muted,
             ),
@@ -415,7 +415,10 @@ impl Proto {
                             |t, cx| t.onb_submit(cx),
                             cx,
                         ))
-                        .child(txt("Tab 切换字段 · Enter 提交 · Ctrl+V 粘贴", 10.5, muted)),
+                        .child(hint_row(
+                            &[("Tab", "切换字段"), ("Enter", "提交"), ("Ctrl+V", "粘贴")],
+                            pal,
+                        )),
                 ),
         )
     }
@@ -515,12 +518,12 @@ impl Proto {
                 mtxt(c.code.clone(), 46.0, ink).font_weight(FontWeight::SEMIBOLD)
             }
             Some(c) => mtxt(c.code.clone(), 46.0, rgba(pal.muted, 0.55)),
-            None => mtxt("···-···", 46.0, rgba(pal.muted, 0.45)),
+            None => mtxt("•••-•••", 46.0, rgba(pal.muted, 0.45)),
         };
         let (badge_text, badge_col) = match (&p.code, p.busy, &p.error) {
-            (Some(c), _, _) if c.expired() => ("已过期 · 请换一码".to_string(), warn),
+            (Some(c), _, _) if c.expired() => ("已过期，请换一码".to_string(), warn),
             (Some(c), _, _) => (
-                format!("{} 分钟内有效 · 仅限使用一次", c.minutes_left().max(1)),
+                format!("{} 分钟内有效，仅限使用一次", c.minutes_left().max(1)),
                 muted,
             ),
             (None, true, _) => ("正在生成配对码…".to_string(), rgba(pal.blue, 1.0)),
@@ -532,7 +535,7 @@ impl Proto {
                 &crate::config::normalize_hub_url(&self.eff.hub_url),
                 &c.code,
             ),
-            None => "skylatch-agent join <hub> --code ···-···".to_string(),
+            None => "skylatch-agent join <hub> --code <code>".to_string(),
         };
         let copied = p.copied_at.is_some();
 
@@ -673,7 +676,10 @@ impl Proto {
                 muted,
             ))
             .children(body)
-            .child(txt("Enter 复制命令 · R 换一码 · Esc 关闭", 10.5, muted));
+            .child(hint_row(
+                &[("Enter", "复制命令"), ("R", "换一码"), ("Esc", "关闭")],
+                pal,
+            ));
 
         div()
             .id("pair-scrim")
