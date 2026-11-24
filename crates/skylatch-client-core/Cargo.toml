@@ -15,6 +15,7 @@ bytes.workspace = true
 futures-util = { version = "0.3", features = ["sink"] }
 # Builds the bundled BSD-3-Clause libopus from source and links it statically.
 opusic-sys = "0.7"
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
