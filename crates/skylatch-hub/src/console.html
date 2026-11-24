@@ -184,6 +184,10 @@ tbody tr:first-child td { border-top: none; }
         <input class="command" id="command" aria-label="Device join command" readonly>
         <button class="primary" id="copy" type="button">Copy</button>
       </div>
+      <div class="cmd-row">
+        <input class="command" id="command-linux" aria-label="Linux headless install and join command" readonly>
+        <button id="copy-linux" type="button">Copy Linux</button>
+      </div>
     </section>
     <div class="empty" id="empty" hidden>No devices online. Click <strong>+ Add Device</strong> to enroll a workstation.</div>
     <div class="table-wrap" id="listing" hidden>
@@ -331,14 +335,17 @@ $('add').addEventListener('click', () => act($('add'), async () => {
   clearPairing();
   $('code').textContent = result.code;
   $('command').value = `skylatch-agent join "${location.origin}" --code ${result.code}`;
+  $('command-linux').value = `curl -fsSL https://raw.githubusercontent.com/maxesisn/skylatch/main/packaging/install-host.sh | sudo sh -s -- --hub \"${location.origin}\" --code ${result.code} --virtual-desktop`;
   $('pairing').hidden = false;
   $('copy').focus();
   pairingTimer = setTimeout(clearPairing, result.expires_in_secs * 1000);
 }));
-$('copy').addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText($('command').value); $('copy-state').textContent = 'Copied'; }
-  catch (_) { $('command').focus(); $('command').select(); $('copy-state').textContent = 'Selected'; }
-});
+for (const [button, field] of [['copy', 'command'], ['copy-linux', 'command-linux']]) {
+  $(button).addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($(field).value); $('copy-state').textContent = 'Copied'; }
+    catch (_) { $(field).focus(); $(field).select(); $('copy-state').textContent = 'Selected'; }
+  });
+}
 async function refresh() {
   const accountSession = session;
   const {devices} = await request('devices');

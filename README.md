@@ -82,6 +82,29 @@ Download packages and `SHA256SUMS` from [GitHub Releases](https://github.com/max
   `skylatch-agent join <hub-url> --code <6-digit>`. The static Linux `skylatch-hub` binary is
   published as a separate `x86_64-unknown-linux-musl` archive.
 
+### One-line install (Linux Hub & Headless Hosts)
+
+Hub (x86-64 Linux with systemd; verifies `SHA256SUMS`, installs a `skylatch-hub` service on
+`127.0.0.1:17920`, and prints reverse-proxy snippets for WSS on port 443):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/maxesisn/skylatch/main/packaging/install-hub.sh | sudo sh
+# options: --version <ver> --user <name> --password <pass> --port <port> --repo <owner/repo>
+```
+
+Host (Debian/Ubuntu amd64; installs the `.deb`, then enrolls and starts the agent):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/maxesisn/skylatch/main/packaging/install-host.sh \
+  | sudo sh -s -- --hub https://hub.example.com --code <6-digit> --virtual-desktop
+# options: --room <name> --resolution 1920x1080 --version <ver>
+```
+
+On a pure headless server or VM there is no desktop to stream. `--virtual-desktop` installs
+`xvfb` and `openbox`, runs them as `skylatch-xvfb.service` on `DISPLAY=:99` at the chosen
+resolution, and starts `skylatch-agent.service` after it. The Hub console shows this command
+with a fresh pairing code under **+ Add Device**.
+
 ## Quick start (from source)
 
 Requires a recent stable Rust toolchain (plus platform build tools for `host/` and native viewers).
