@@ -91,6 +91,10 @@ fn device(endpoints: Vec<DirectEndpoint>) -> DeviceInfo {
         host_version: "0.1.0".into(),
         monitors: 2,
         direct_endpoints: endpoints,
+        form_factor: Default::default(),
+        monitor_list: vec![],
+        room: None,
+        slot: None,
     }
 }
 

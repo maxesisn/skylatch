@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -162,6 +163,7 @@ fn spawn_agent(hub: SocketAddr, engine: SocketAddr) -> Child {
         ])
         .args(["--engine-url", &format!("ws://{engine}")])
         .args(["--direct-endpoint", "lan=192.0.2.10:17900"])
+        .args(["--form-factor", "mini", "--room", "Office", "--slot", "3"])
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .spawn()
@@ -229,21 +231,44 @@ async fn client_session_is_relayed_through_hub_and_agent() {
     ));
 
     // The agent registers asynchronously; poll the device list.
-    let device = loop {
-        send_json(&mut client, &ClientToHub::ListDevices).await;
-        let HubToClient::Devices { devices } = recv_json(&mut client).await else {
-            panic!("expected devices");
-        };
-        if let Some(d) = devices.into_iter().next() {
-            break d;
+    let device = timeout(WAIT, async {
+        loop {
+            send_json(&mut client, &ClientToHub::ListDevices).await;
+            let HubToClient::Devices { devices } = recv_json(&mut client).await else {
+                panic!("expected devices");
+            };
+            if let Some(d) = devices.into_iter().next() {
+                break d;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    })
+    .await
+    .expect("agent did not register");
     assert_eq!(device.device_id, "box-1");
     assert_eq!(device.name, "Test Box");
     assert_eq!(device.os, std::env::consts::OS);
     assert_eq!(device.direct_endpoints.len(), 1);
     assert_eq!(device.direct_endpoints[0].port, 17900);
+    assert_eq!(device.form_factor, DeviceFormFactor::Mini);
+    assert_eq!(device.room.as_deref(), Some("Office"));
+    assert_eq!(device.slot, Some(3));
+    assert!(!device.monitor_list.is_empty());
+    assert_eq!(device.monitors as usize, device.monitor_list.len());
+
+    // The HTTP directory serves the same registration, including the complete monitor list.
+    let response = timeout(WAIT, async {
+        let mut stream = TcpStream::connect(hub).await.unwrap();
+        stream.write_all(b"GET /api/v1/devices HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer tok-a\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }).await.expect("device directory request timed out");
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200"));
+    let listing: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(listing["devices"], serde_json::json!([device]));
+
     // Idle: the engine has not been touched yet.
     assert_eq!(engine.connections.load(Ordering::SeqCst), 0);
 
@@ -406,15 +431,15 @@ async fn keyframe_request_close_and_reconnect() {
     .unwrap();
     timeout(WAIT, engine.closed.recv()).await.unwrap().unwrap();
 
-    // A hub close makes the agent reconnect and register again.
+    // A hub close makes the agent reconnect with the same device metadata.
     host.close(None).await.unwrap();
     let (stream, _) = timeout(WAIT, hub_listener.accept()).await.unwrap().unwrap();
     let mut host = accept_async(stream).await.unwrap();
     let Message::Text(t) = host.next().await.unwrap().unwrap() else {
         panic!("expected register");
     };
-    assert!(matches!(
+    assert_eq!(
         serde_json::from_str::<HostToHub>(t.as_str()).unwrap(),
-        HostToHub::Register { .. }
-    ));
+        HostToHub::Register { token, device }
+    );
 }

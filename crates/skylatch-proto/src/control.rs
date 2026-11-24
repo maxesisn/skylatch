@@ -3,6 +3,7 @@
 //! Every message is a JSON object with a `type` discriminator in `snake_case`.
 //! Binary WebSocket messages carry `NSL1` data-plane messages (see [`crate::nsl1`]).
 
+use crate::nsl1::MonitorInfo;
 use serde::{Deserialize, Serialize};
 
 /// Control-plane protocol version advertised by the hub.
@@ -26,6 +27,18 @@ pub struct DirectEndpoint {
     pub port: u16,
 }
 
+/// Physical or virtual form factor advertised by a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceFormFactor {
+    #[default]
+    Desktop,
+    Laptop,
+    Mini,
+    Vm,
+    Server,
+}
+
 /// Public description of a registered host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -34,10 +47,18 @@ pub struct DeviceInfo {
     /// `windows`, `macos` or `linux`.
     pub os: String,
     pub host_version: String,
-    /// Number of capturable displays.
+    /// Legacy display count; a new agent reports at least one.
     pub monitors: u32,
     #[serde(default)]
     pub direct_endpoints: Vec<DirectEndpoint>,
+    #[serde(default)]
+    pub form_factor: DeviceFormFactor,
+    #[serde(default)]
+    pub monitor_list: Vec<MonitorInfo>,
+    #[serde(default)]
+    pub room: Option<String>,
+    #[serde(default)]
+    pub slot: Option<u32>,
 }
 
 /// Messages a host sends to the hub.
@@ -159,25 +180,47 @@ mod tests {
             name: "Studio".into(),
             os: "macos".into(),
             host_version: "0.1.0".into(),
-            monitors: 2,
+            monitors: 1,
+            form_factor: DeviceFormFactor::Mini,
+            monitor_list: vec![MonitorInfo {
+                id: "display-1".into(),
+                name: "Example display".into(),
+                x: -1440,
+                y: 0,
+                width: 1440,
+                height: 2560,
+                primary: false,
+                active: true,
+            }],
+            room: Some("Office".into()),
+            slot: Some(3),
             direct_endpoints: vec![DirectEndpoint {
                 kind: EndpointKind::Lan,
-                host: "192.168.1.20".into(),
+                host: "192.0.2.20".into(),
                 port: 7001,
             }],
         }
     }
 
-    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":2,"direct_endpoints":[{"kind":"lan","host":"192.168.1.20","port":7001}]}"#;
+    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":1,"direct_endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}],"form_factor":"mini","monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}],"room":"Office","slot":3}"#;
 
     #[test]
-    fn device_info_roundtrip_and_default_endpoints() {
+    fn device_info_roundtrip() {
         rt(device(), DEVICE_JSON);
+    }
+
+    #[test]
+    fn legacy_device_info_defaults_new_fields() {
         let d: DeviceInfo = serde_json::from_str(
             r#"{"device_id":"x","name":"n","os":"linux","host_version":"1","monitors":1}"#,
         )
         .unwrap();
         assert!(d.direct_endpoints.is_empty());
+        assert_eq!(d.monitors, 1);
+        assert_eq!(d.form_factor, DeviceFormFactor::Desktop);
+        assert!(d.monitor_list.is_empty());
+        assert_eq!(d.room, None);
+        assert_eq!(d.slot, None);
     }
 
     #[test]
@@ -209,7 +252,7 @@ mod tests {
             HostToHub::DirectEndpoints {
                 endpoints: device().direct_endpoints,
             },
-            r#"{"type":"direct_endpoints","endpoints":[{"kind":"lan","host":"192.168.1.20","port":7001}]}"#,
+            r#"{"type":"direct_endpoints","endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}]}"#,
         );
         rt(
             HostToHub::SessionReady {

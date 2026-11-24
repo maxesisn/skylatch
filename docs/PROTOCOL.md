@@ -134,9 +134,30 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 
 ```json
 DeviceInfo      { "device_id": "…", "name": "…", "os": "windows|macos|linux",
-                  "host_version": "…", "monitors": 2, "direct_endpoints": [DirectEndpoint] }
+                  "host_version": "…", "monitors": 2, "direct_endpoints": [DirectEndpoint],
+                  "form_factor": "mini", "monitor_list": [MonitorInfo, MonitorInfo],
+                  "room": "Office", "slot": 3 }
 DirectEndpoint  { "kind": "lan|overlay", "host": "192.0.2.10", "port": 7001 }
 ```
+
+The four hardware and placement fields are optional on input; the hub returns them in both the
+HTTP directory and WebSocket `devices` responses:
+
+| Field | Meaning | Default if absent |
+| --- | --- | --- |
+| `form_factor` | `desktop`, `laptop`, `mini`, `vm`, or `server`; the agent detects it unless overridden by `--form-factor` | `desktop` |
+| `monitor_list` | Startup snapshot of the desktop layout, using the [MonitorInfo](#sl1-extensions) fields | `[]` |
+| `room` | Optional physical room or workstation group (`--room`) | `null` |
+| `slot` | Optional unsigned 32-bit desk or rack slot index (`--slot`) | `null` |
+
+In this snapshot, `active` indicates an enabled display, not the currently selected capture source.
+Coordinates and sizes use the platform's desktop coordinate space (which may be scaled on macOS).
+Registration display IDs are not session `SelectMonitor` IDs. When probing fails or no display is
+available, the agent advertises one inactive `default` entry with zero dimensions. The legacy
+`monitors` count remains at least one.
+
+The agent reuses the configured room and slot on every registration. The hub directory still
+lists only connected hosts; slot values do not change when other devices go offline.
 
 ### Host ↔ hub (`/ws/host`)
 
