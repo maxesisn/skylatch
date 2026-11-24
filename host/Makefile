@@ -14,7 +14,7 @@ BACKEND_DIR_x11 = linux/x11
 BACKEND_PKGS_wayland = wayland-client xkbcommon
 BACKEND_DIR_wayland = linux/wayland
 BACKEND_DIR_windows = windows
-BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32
+BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32 -lws2_32
 BACKEND_FLAGS_windows = -DNOMINMAX -D_WIN32_WINNT=0x0A00
 BACKEND_DIR_macos = macos
 BACKEND_FLAGS_macos = -mmacosx-version-min=12.3 -Werror=unguarded-availability-new
