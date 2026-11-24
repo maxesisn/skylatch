@@ -40,6 +40,7 @@ xcuserdata/
 /clients/windows/*.obj
 /clients/windows/*.pdb
 /clients/macos/skylatch-client
+/clients/linux/skylatch-client
 
 # Secrets and local config
 .env
