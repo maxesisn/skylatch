@@ -683,7 +683,34 @@ fn build_room_scene(
     (scene, nav, infos, machines)
 }
 
-/// The scenes of an arranged layout. Rooms that have no furniture show a bare desk.
+/// Whether `name` is the hub's catch-all room (case-insensitive).
+pub fn is_default_room(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("default")
+}
+
+/// Drops rooms called "Default" that no placement refers to, as long as another room is left.
+/// Machines without a room only create "Default" while they sit in it, so an empty one is just
+/// a leftover. Returns whether something went.
+pub fn prune_empty_default(layout: &mut WorkspaceLayout) -> bool {
+    let before = layout.rooms.len();
+    let used: HashSet<String> = layout
+        .placements
+        .iter()
+        .map(|p| p.room_id.clone())
+        .collect();
+    let mut left = before;
+    layout.rooms.retain(|r| {
+        let ghost = left > 1 && is_default_room(&r.name) && !used.contains(&r.id);
+        if ghost {
+            left -= 1;
+        }
+        !ghost
+    });
+    layout.rooms.len() != before
+}
+
+/// The scenes of an arranged layout. Rooms that have no furniture show a bare desk; an empty
+/// "Default" room is left out while another room exists.
 fn build_layout_scene(machines: &[Machine], layout: &WorkspaceLayout) -> Scenes {
     let resolved = resolve(machines, layout);
     let machines: Vec<Machine> = machines
@@ -720,8 +747,22 @@ fn build_layout_scene(machines: &[Machine], layout: &WorkspaceLayout) -> Scenes 
             .position(|r| room_matches(r, &want))
             .unwrap_or(0)
     };
+    let occupied = |ri: usize| {
+        resolved.seats.keys().any(|(r, _, _)| *r == ri)
+            || resolved.overflow.iter().any(|&mi| home(mi) == ri)
+    };
+    let rooms = &resolved.layout.rooms;
+    let mut hidden_rooms: HashSet<usize> = (0..rooms.len())
+        .filter(|&ri| rooms.len() > 1 && is_default_room(&rooms[ri].name) && !occupied(ri))
+        .collect();
+    if hidden_rooms.len() == rooms.len() {
+        hidden_rooms.remove(&0);
+    }
     let mut desks: Vec<Desk> = Vec::new();
     for (ri, room) in resolved.layout.rooms.iter().enumerate() {
+        if hidden_rooms.contains(&ri) {
+            continue;
+        }
         let (scene, nav, furniture, placed) = build_room_scene(&devices, &targets, &resolved, ri);
         let (scene, furniture) = if furniture.is_empty() {
             (empty_desk(&devices).scene, furniture)
@@ -943,6 +984,31 @@ pub fn add_room(layout: &mut WorkspaceLayout, name: &str) -> Result<String, Stri
         }],
     });
     Ok(id)
+}
+
+/// Deletes a room nobody is in (placements of machines that are not online go with it; they
+/// get a new seat when they return). The last room cannot be deleted.
+pub fn remove_room(
+    layout: &mut WorkspaceLayout,
+    room_id: &str,
+    online: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    if !layout.rooms.iter().any(|r| r.id == room_id) {
+        return Err("房间不存在".into());
+    }
+    if layout.rooms.len() <= 1 {
+        return Err("至少要留一个房间".into());
+    }
+    if layout
+        .placements
+        .iter()
+        .any(|p| p.room_id == room_id && online(&p.device_id))
+    {
+        return Err("这个房间里还有设备".into());
+    }
+    layout.placements.retain(|p| p.room_id != room_id);
+    layout.rooms.retain(|r| r.id != room_id);
+    Ok(())
 }
 
 /// Puts a machine into a slot (swapping nothing: the slot has to be free or hold a machine

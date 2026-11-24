@@ -2023,3 +2023,151 @@ fn free_floor_is_found_for_every_kind() {
     assert!(rx as f32 * GRID >= desk_fp.0);
     assert_eq!(next_free_grid(FurnitureKind::LDesk, &[]), (0, 0));
 }
+
+// ───────────────────────────── the "Default" room ─────────────────────────────
+
+fn ghost_default() -> RoomLayout {
+    RoomLayout {
+        id: "ghost".into(),
+        name: "Default".into(),
+        furniture: vec![item("f1", FurnitureKind::LDesk, 0, 0)],
+    }
+}
+
+fn tab_names(sc: &Scenes) -> Vec<&str> {
+    sc.desks.iter().map(|d| d.name.as_str()).collect()
+}
+
+#[test]
+fn an_empty_default_room_is_not_shown_while_other_rooms_exist() {
+    let (devs, mut layout) = arranged();
+    layout.rooms.insert(0, ghost_default());
+    let sc = build_scene_with_layout(&devs, Some(&layout), None);
+    assert_eq!(tab_names(&sc), ["Office", "Home"], "no ghost tab");
+    assert_clean(&sc);
+    // the layout itself still lists it: it is only left off the desk
+    assert_eq!(sc.layout.as_ref().unwrap().rooms.len(), 3);
+
+    // any spelling of the name counts
+    layout.rooms[0].name = " DEFAULT ".into();
+    let sc = build_scene_with_layout(&devs, Some(&layout), None);
+    assert_eq!(tab_names(&sc), ["Office", "Home"]);
+
+    // a machine without a room sits in Default when there is one: then it shows
+    layout.rooms[0].name = "Default".into();
+    let mut with_stray = devs.clone();
+    with_stray.push(info(
+        "stray",
+        "Stray",
+        DeviceFormFactor::Desktop,
+        None,
+        None,
+        vec![mon("d1", 0, 1920, 1080)],
+    ));
+    let sc = build_scene_with_layout(&with_stray, Some(&layout), None);
+    assert_eq!(tab_names(&sc), ["Default", "Office", "Home"]);
+    assert!(sc.devices.iter().any(|d| d.machine_id == "stray"));
+
+    // the only room is never hidden
+    let alone = WorkspaceLayout {
+        version: 1,
+        rooms: vec![ghost_default()],
+        placements: vec![],
+    };
+    let sc = build_scene_with_layout(&devs, Some(&alone), None);
+    assert_eq!(tab_names(&sc), ["Default", "VM Rack"]);
+}
+
+#[test]
+fn the_automatic_arrangement_only_has_default_while_a_machine_has_no_room() {
+    let named = build_scene_from_devices(&office_fleet());
+    assert!(!tab_names(&named).contains(&"Default"));
+    let mut devs = office_fleet();
+    devs.push(info(
+        "stray",
+        "Stray",
+        DeviceFormFactor::Desktop,
+        None,
+        None,
+        vec![mon("d1", 0, 1920, 1080)],
+    ));
+    assert!(tab_names(&build_scene_from_devices(&devs)).contains(&"Default"));
+    devs.pop();
+    assert!(!tab_names(&build_scene_from_devices(&devs)).contains(&"Default"));
+}
+
+#[test]
+fn pruning_drops_only_an_unused_default_room_next_to_others() {
+    let (_, mut layout) = arranged();
+    layout.rooms.insert(0, ghost_default());
+    assert!(prune_empty_default(&mut layout));
+    assert_eq!(
+        layout
+            .rooms
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["office", "home"]
+    );
+    assert!(!prune_empty_default(&mut layout), "nothing left to prune");
+
+    // a placement keeps it
+    let (_, mut used) = arranged();
+    used.rooms.insert(0, ghost_default());
+    used.placements.push(place("someone", "ghost", "f1", 0));
+    assert!(!prune_empty_default(&mut used));
+    assert_eq!(used.rooms.len(), 3);
+
+    // the last room stays whatever it is called
+    let mut alone = WorkspaceLayout {
+        version: 1,
+        rooms: vec![ghost_default()],
+        placements: vec![],
+    };
+    assert!(!prune_empty_default(&mut alone));
+    assert_eq!(alone.rooms.len(), 1);
+
+    // two unused ones: one stays
+    let mut twice = WorkspaceLayout {
+        version: 1,
+        rooms: vec![
+            ghost_default(),
+            RoomLayout {
+                id: "ghost2".into(),
+                name: "default".into(),
+                furniture: vec![item("f1", FurnitureKind::LDesk, 0, 0)],
+            },
+        ],
+        placements: vec![],
+    };
+    assert!(prune_empty_default(&mut twice));
+    assert_eq!(twice.rooms.len(), 1);
+}
+
+#[test]
+fn an_empty_room_can_be_deleted_but_never_one_with_devices_or_the_last() {
+    let (devs, mut layout) = arranged();
+    let online = |id: &str| devs.iter().any(|d| d.device_id == id);
+    assert_eq!(
+        remove_room(&mut layout, "nowhere", &online),
+        Err("房间不存在".to_string())
+    );
+    assert!(
+        remove_room(&mut layout, "home", &online).is_err(),
+        "home-pc sits there"
+    );
+    let garage = add_room(&mut layout, "车库").unwrap();
+    // a machine that is not online does not keep the room alive; its seat goes with it
+    layout.placements.push(place("gone", &garage, "f1", 0));
+    remove_room(&mut layout, &garage, &online).unwrap();
+    assert!(layout.rooms.iter().all(|r| r.id != garage));
+    assert!(layout.placements.iter().all(|p| p.room_id != garage));
+    assert!(layout.validate().is_ok());
+
+    let mut single = WorkspaceLayout {
+        version: 1,
+        rooms: vec![ghost_default()],
+        placements: vec![],
+    };
+    assert!(remove_room(&mut single, "ghost", &online).is_err());
+}

@@ -247,9 +247,9 @@ pub trait Backend: Send + 'static {
     fn locate(&self) -> Result<Binaries, String>;
     /// Credentials for `hub_url` are saved already.
     fn enrolled(&self, hub_url: &str) -> bool;
-    /// Registers this machine with the hub (blocking).
-    fn enroll(&self, bins: &Binaries, hub: &HubTarget) -> Result<(), String>;
-    fn start(&self, bins: &Binaries) -> Result<Box<dyn Process>, String>;
+    /// Registers this machine with the hub (blocking), in `room` when one is chosen.
+    fn enroll(&self, bins: &Binaries, hub: &HubTarget, room: Option<&str>) -> Result<(), String>;
+    fn start(&self, bins: &Binaries, room: Option<&str>) -> Result<Box<dyn Process>, String>;
 }
 
 /// Variables that would make the agent use the launcher's account token instead of its own
@@ -261,7 +261,38 @@ const SCRUBBED_ENV: [&str; 4] = [
     "SKYLATCH_DEVICE_NAME",
 ];
 
-fn agent_command(bins: &Binaries, args: &[&str]) -> Command {
+/// Arguments of `skylatch-agent join` for a one-time `code`.
+pub fn join_args(hub_url: &str, code: &str, room: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "join".to_string(),
+        hub_url.to_string(),
+        "--code".to_string(),
+        code.to_string(),
+    ];
+    args.extend(room_args(room));
+    args
+}
+
+/// Arguments of the long-running agent.
+pub fn run_args(engine: &str, room: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--engine-bin".to_string(),
+        engine.to_string(),
+        "--enable-direct".to_string(),
+    ];
+    args.extend(room_args(room));
+    args
+}
+
+/// `--room <room>` for a non-blank room.
+fn room_args(room: Option<&str>) -> Vec<String> {
+    match room.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(room) => vec!["--room".to_string(), room.to_string()],
+        None => Vec::new(),
+    }
+}
+
+fn agent_command(bins: &Binaries, args: &[String]) -> Command {
     let mut cmd = Command::new(&bins.agent);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -496,7 +527,7 @@ impl Backend for SystemBackend {
             .is_some_and(|p| enrollment_state(p, hub_url) == Enrollment::Current)
     }
 
-    fn enroll(&self, bins: &Binaries, hub: &HubTarget) -> Result<(), String> {
+    fn enroll(&self, bins: &Binaries, hub: &HubTarget, room: Option<&str>) -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -507,7 +538,7 @@ impl Backend for SystemBackend {
             ))
             .map_err(|e| crate::onboard::describe_pairing_error(&e))?
             .code;
-        let mut cmd = agent_command(bins, &["join", &hub.url, "--code", &code]);
+        let mut cmd = agent_command(bins, &join_args(&hub.url, &code, room));
         cmd.stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("无法运行 join：{e}"))?;
         let deadline = Instant::now() + JOIN_TIMEOUT;
@@ -538,9 +569,9 @@ impl Backend for SystemBackend {
         Err(describe_join_failure(&stderr))
     }
 
-    fn start(&self, bins: &Binaries) -> Result<Box<dyn Process>, String> {
+    fn start(&self, bins: &Binaries, room: Option<&str>) -> Result<Box<dyn Process>, String> {
         let engine = bins.engine.to_string_lossy().into_owned();
-        let cmd = agent_command(bins, &["--engine-bin", &engine, "--enable-direct"]);
+        let cmd = agent_command(bins, &run_args(&engine, room));
         ChildProcess::spawn(cmd)
             .map(|p| Box::new(p) as Box<dyn Process>)
             .map_err(|e| format!("无法启动 {AGENT_NAME}：{e}"))
@@ -594,6 +625,8 @@ impl Default for Timing {
 struct Desired {
     enabled: bool,
     hub: Option<HubTarget>,
+    /// Room the machine should join (enrollment and agent start).
+    room: Option<String>,
 }
 
 enum Cmd {
@@ -644,9 +677,10 @@ impl HostManager {
         }
     }
 
-    /// Declares what should be running: host this machine for `hub`, or nothing.
-    pub fn configure(&self, enabled: bool, hub: Option<HubTarget>) {
-        let _ = self.tx.send(Cmd::Configure(Desired { enabled, hub }));
+    /// Declares what should be running: host this machine for `hub` (in `room`, when one is
+    /// chosen), or nothing.
+    pub fn configure(&self, enabled: bool, hub: Option<HubTarget>, room: Option<String>) {
+        let _ = self.tx.send(Cmd::Configure(Desired { enabled, hub, room }));
     }
 
     pub fn status(&self) -> HostStatus {
@@ -690,6 +724,7 @@ fn supervise(
     let mut desired = Desired {
         enabled: false,
         hub: None,
+        room: None,
     };
     let mut proc: Option<Box<dyn Process>> = None;
     let mut started_at = Instant::now();
@@ -711,9 +746,12 @@ fn supervise(
         match rx.recv_timeout(wait) {
             Ok(Cmd::Configure(next)) => {
                 // a new token for the same hub keeps the running agent: only the switch
-                // position or the hub itself restarts things
+                // position, the hub itself or the room restarts things
                 let key = |d: &Desired| d.hub.as_ref().map(|h| hub_key(&h.url));
-                if next.enabled != desired.enabled || key(&next) != key(&desired) {
+                if next.enabled != desired.enabled
+                    || key(&next) != key(&desired)
+                    || next.room != desired.room
+                {
                     stop_proc(&mut proc);
                     retry_at = None;
                     backoff = timing.backoff_initial;
@@ -761,7 +799,7 @@ fn supervise(
         }
         retry_at = None;
 
-        match launch(&*backend, &hub, status, stop) {
+        match launch(&*backend, &hub, desired.room.as_deref(), status, stop) {
             Launch::Started(p) => {
                 proc = Some(p);
                 started_at = Instant::now();
@@ -789,6 +827,7 @@ enum Launch {
 fn launch(
     backend: &dyn Backend,
     hub: &HubTarget,
+    room: Option<&str>,
     status: &Mutex<HostStatus>,
     stop: &AtomicBool,
 ) -> Launch {
@@ -798,7 +837,7 @@ fn launch(
     };
     if !backend.enrolled(&hub.url) {
         set_status(status, HostStatus::Enrolling);
-        if let Err(why) = backend.enroll(&bins, hub) {
+        if let Err(why) = backend.enroll(&bins, hub, room) {
             return Launch::Failed(HostStatus::Retrying(why));
         }
     }
@@ -806,7 +845,7 @@ fn launch(
     if stop.load(Ordering::SeqCst) {
         return Launch::Stopped;
     }
-    match backend.start(&bins) {
+    match backend.start(&bins, room) {
         Ok(p) => Launch::Started(p),
         Err(why) => Launch::Failed(HostStatus::Retrying(why)),
     }
@@ -828,6 +867,9 @@ pub mod testing {
         pub enroll_calls: usize,
         pub starts: usize,
         pub stops: usize,
+        /// the room each enrollment / agent start was asked for
+        pub enroll_rooms: Vec<Option<String>>,
+        pub start_rooms: Vec<Option<String>>,
         pub alive: Vec<Arc<AtomicBool>>,
     }
 
@@ -890,10 +932,16 @@ pub mod testing {
         fn enrolled(&self, _hub_url: &str) -> bool {
             self.0.0.lock().unwrap().enrolled
         }
-        fn enroll(&self, _bins: &Binaries, _hub: &HubTarget) -> Result<(), String> {
+        fn enroll(
+            &self,
+            _bins: &Binaries,
+            _hub: &HubTarget,
+            room: Option<&str>,
+        ) -> Result<(), String> {
             let delay = {
                 let mut s = self.0.0.lock().unwrap();
                 s.enroll_calls += 1;
+                s.enroll_rooms.push(room.map(str::to_string));
                 s.enroll_delay
             };
             std::thread::sleep(delay);
@@ -906,10 +954,11 @@ pub mod testing {
                 }
             }
         }
-        fn start(&self, _bins: &Binaries) -> Result<Box<dyn Process>, String> {
+        fn start(&self, _bins: &Binaries, room: Option<&str>) -> Result<Box<dyn Process>, String> {
             let alive = Arc::new(AtomicBool::new(true));
             let mut s = self.0.0.lock().unwrap();
             s.starts += 1;
+            s.start_rooms.push(room.map(str::to_string));
             s.alive.push(alive.clone());
             Ok(Box::new(FakeProcess {
                 fake: self.0.clone(),
@@ -1117,7 +1166,7 @@ mod tests {
         let fake = Fake::installed();
         let m = HostManager::with_backend(fake.backend(), FAST);
         assert_eq!(m.status(), HostStatus::Off);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until("agent running", || m.status() == HostStatus::Running);
         {
             let s = fake.0.lock().unwrap();
@@ -1125,11 +1174,11 @@ mod tests {
         }
         assert_eq!(fake.running(), 1);
 
-        m.configure(false, Some(hub("wss://hub.example.com")));
+        m.configure(false, Some(hub("wss://hub.example.com")), None);
         wait_until("agent stopped", || m.status() == HostStatus::Off);
         assert_eq!(fake.running(), 0, "switching off stops the agent");
 
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until("agent running again", || m.status() == HostStatus::Running);
         let s = fake.0.lock().unwrap();
         assert_eq!(s.enroll_calls, 1, "already enrolled: no second enrollment");
@@ -1141,7 +1190,7 @@ mod tests {
         let fake = Fake::installed();
         fake.0.lock().unwrap().enrolled = true;
         let m = HostManager::with_backend(fake.backend(), FAST);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until("first start", || fake.0.lock().unwrap().starts == 1);
         let crashed = Instant::now();
         fake.crash_all();
@@ -1162,7 +1211,7 @@ mod tests {
     fn missing_components_are_reported_without_failing_and_found_later() {
         let fake = Fake::default();
         let m = HostManager::with_backend(fake.backend(), FAST);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until(
             "missing status",
             || matches!(m.status(), HostStatus::Missing(ref t) if t.starts_with(MISSING_TEXT)),
@@ -1179,7 +1228,7 @@ mod tests {
         let fake = Fake::installed();
         fake.0.lock().unwrap().enroll_error = Some("Hub 拒绝了请求".into());
         let m = HostManager::with_backend(fake.backend(), FAST);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until(
             "retry status",
             || matches!(m.status(), HostStatus::Retrying(ref why) if why.contains("拒绝")),
@@ -1197,14 +1246,14 @@ mod tests {
         let fake = Fake::installed();
         fake.0.lock().unwrap().enrolled = true;
         let m = HostManager::with_backend(fake.backend(), FAST);
-        m.configure(true, Some(hub("wss://one.example.com")));
+        m.configure(true, Some(hub("wss://one.example.com")), None);
         wait_until("running", || m.status() == HostStatus::Running);
-        m.configure(true, Some(hub("wss://two.example.com")));
+        m.configure(true, Some(hub("wss://two.example.com")), None);
         wait_until("restarted for the new hub", || {
             fake.0.lock().unwrap().starts == 2
         });
         assert_eq!(fake.running(), 1, "the old agent is gone");
-        m.configure(true, None);
+        m.configure(true, None, None);
         wait_until("idle after sign-out", || m.status() == HostStatus::Idle);
         assert_eq!(fake.running(), 0);
     }
@@ -1214,7 +1263,7 @@ mod tests {
         let fake = Fake::installed();
         fake.0.lock().unwrap().enrolled = true;
         let m = HostManager::with_backend(fake.backend(), FAST);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until("running", || m.status() == HostStatus::Running);
         m.shutdown();
         assert_eq!(fake.running(), 0);
@@ -1225,7 +1274,7 @@ mod tests {
         let slow = Fake::installed();
         slow.0.lock().unwrap().enroll_delay = Duration::from_millis(150);
         let m = HostManager::with_backend(slow.backend(), FAST);
-        m.configure(true, Some(hub("wss://hub.example.com")));
+        m.configure(true, Some(hub("wss://hub.example.com")), None);
         wait_until("enrollment started", || {
             slow.0.lock().unwrap().enroll_calls == 1
         });
@@ -1238,10 +1287,69 @@ mod tests {
         dropped.0.lock().unwrap().enrolled = true;
         {
             let m = HostManager::with_backend(dropped.backend(), FAST);
-            m.configure(true, Some(hub("wss://hub.example.com")));
+            m.configure(true, Some(hub("wss://hub.example.com")), None);
             wait_until("running", || dropped.running() == 1);
         }
         assert_eq!(dropped.running(), 0);
+    }
+
+    #[test]
+    fn the_chosen_room_reaches_the_join_and_the_agent_command_lines() {
+        assert_eq!(
+            join_args("wss://hub.example.com", "482-917", Some("办公室")),
+            [
+                "join",
+                "wss://hub.example.com",
+                "--code",
+                "482-917",
+                "--room",
+                "办公室"
+            ]
+        );
+        assert_eq!(
+            join_args("wss://hub.example.com", "482-917", None),
+            ["join", "wss://hub.example.com", "--code", "482-917"]
+        );
+        assert_eq!(
+            run_args("engine", Some(" 客厅工作台 ")),
+            [
+                "--engine-bin",
+                "engine",
+                "--enable-direct",
+                "--room",
+                "客厅工作台"
+            ]
+        );
+        assert_eq!(
+            run_args("engine", Some("  ")),
+            ["--engine-bin", "engine", "--enable-direct"],
+            "a blank room is not passed"
+        );
+
+        // the supervisor hands the room to the enrollment and to every start, and a new room
+        // restarts the agent
+        let fake = Fake::installed();
+        let m = HostManager::with_backend(fake.backend(), FAST);
+        m.configure(
+            true,
+            Some(hub("wss://hub.example.com")),
+            Some("办公室".into()),
+        );
+        wait_until("running", || m.status() == HostStatus::Running);
+        m.configure(
+            true,
+            Some(hub("wss://hub.example.com")),
+            Some("书房".into()),
+        );
+        wait_until("restarted in the new room", || {
+            fake.0.lock().unwrap().starts == 2
+        });
+        let s = fake.0.lock().unwrap();
+        assert_eq!(s.enroll_rooms, [Some("办公室".to_string())]);
+        assert_eq!(
+            s.start_rooms,
+            [Some("办公室".to_string()), Some("书房".to_string())]
+        );
     }
 
     #[test]
