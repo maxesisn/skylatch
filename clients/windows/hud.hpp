@@ -19,24 +19,27 @@ using Microsoft::WRL::ComPtr;
 
 struct HudText {
     const wchar_t *monitor, *capture, *swap, *fullscreen;
+    const wchar_t *audio, *audioMuted, *audioOn, *audioOff;
     const wchar_t *captureOn, *captureOff, *fullscreenOn, *fullscreenOff, *swapOn, *swapOff;
     const wchar_t *lostTitle, *reconnectingTitle, *reconnect, *reconnecting, *close, *userDisconnected;
 };
 inline const HudText& hudText() {
     static const HudText zh{L"屏 %u", L"系统键", L"Ctrl↔Cmd", L"全屏",
-        L"已捕获系统键 · 双按右 Ctrl 释放", L"已释放系统键 · 双按右 Ctrl 捕获",
-        L"全屏 · 已捕获系统键 · 长按 Esc 退出", L"已退出全屏", L"Ctrl ↔ Cmd 互换已开启", L"Ctrl ↔ Cmd 互换已关闭",
+        L"音频", L"已静音", L"已开启远端音频", L"已静音远端音频",
+        L"已捕获系统键，双按右 Ctrl 释放", L"已释放系统键，双按右 Ctrl 捕获",
+        L"全屏已捕获系统键，长按 Esc 退出", L"已退出全屏", L"Ctrl ↔ Cmd 互换已开启", L"Ctrl ↔ Cmd 互换已关闭",
         L"与 %ls 的连接已中断", L"正在重新连接 %ls…", L"立即重连", L"重连中…", L"关闭窗口", L"你已主动断开连接"};
     static const HudText en{L"Screen %u", L"System keys", L"Ctrl↔Cmd", L"Fullscreen",
-        L"System keys captured · double-tap Right Ctrl to release", L"System keys released · double-tap Right Ctrl to capture",
-        L"Fullscreen · system keys captured · hold Esc to exit", L"Exited fullscreen", L"Ctrl ↔ Cmd swap on", L"Ctrl ↔ Cmd swap off",
+        L"Audio", L"Muted", L"Remote audio on", L"Remote audio muted",
+        L"System keys captured. Double-tap Right Ctrl to release", L"System keys released. Double-tap Right Ctrl to capture",
+        L"Fullscreen with system keys captured. Hold Esc to exit", L"Exited fullscreen", L"Ctrl ↔ Cmd swap on", L"Ctrl ↔ Cmd swap off",
         L"Connection to %ls was lost", L"Reconnecting to %ls…", L"Reconnect now", L"Reconnecting…", L"Close window", L"You disconnected"};
     static const bool chinese = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE;
     return chinese ? zh : en;
 }
 
-// The five pill buttons are consecutive so a button index maps straight to its action.
-enum class HudAction { None, Surface, Monitor, Capture, Swap, Fullscreen, Disconnect, Reconnect, Close };
+// The six pill buttons are consecutive so a button index maps straight to its action.
+enum class HudAction { None, Surface, Monitor, Audio, Capture, Swap, Fullscreen, Disconnect, Reconnect, Close };
 enum class HudOverlay { None, Lost, Reconnecting };
 
 class Hud {
@@ -47,12 +50,12 @@ class Hud {
         float h() const { return b - t; }
     };
     struct Layout {
-        Rect trigger, strip, pill, logo, name, stat, sep, btn[5], card, icon, title, reason, cbtn[2];
-        bool vis[5]{}, showStat{};
+        Rect trigger, strip, pill, logo, name, stat, sep, btn[6], card, icon, title, reason, cbtn[2];
+        bool vis[6]{}, showStat{};
     };
     struct View { UINT w{1}, h{1}, dpi{96}; };
 
-    static constexpr float pillH = 40, pillTop = 8, toastSeconds = 1.2f, collapseSeconds = 1.8f, expandSeconds = 0.18f;
+    static constexpr float pillH = 40, pillTop = 8, speakerSize = 14, toastSeconds = 1.2f, collapseSeconds = 1.8f, expandSeconds = 0.18f;
 
     static D2D1_COLOR_F hex(uint32_t rgb, float a = 1.f) {
         return {float((rgb >> 16) & 255) / 255.f, float((rgb >> 8) & 255) / 255.f, float(rgb & 255) / 255.f, a};
@@ -96,12 +99,12 @@ class Hud {
     bool ready{};
     ComPtr<IDWriteFactory> dw;
     ComPtr<IDWriteTextFormat> fName, fStat, fBtn, fToast, fTitle, fBody, fCardBtn;
-    std::wstring device, stat, toastText, reason, label[5];
+    std::wstring device, stat, toastText, reason, label[6];
     unsigned monitorActive{};
     size_t monitorCount{};
-    bool capture{}, swap{}, fullscreen{};
+    bool capture{}, swap{}, fullscreen{}, audioAvailable{}, audioOn{true};
     View view;
-    float nameW{}, statW{}, toastW{}, labelW[5]{};
+    float nameW{}, statW{}, toastW{}, labelW[6]{};
     bool metricsDirty{true};
     HudOverlay overlayState{HudOverlay::None};
     bool expandTarget{}, inside{};
@@ -142,8 +145,10 @@ class Hud {
         const auto& t = hudText();
         wchar_t buf[64]{};
         swprintf_s(buf, t.monitor, monitorActive + 1);
-        label[0] = buf; label[1] = t.capture; label[2] = t.swap; label[3] = t.fullscreen; label[4].clear();
-        for (int i = 0; i < 4; ++i) labelW[i] = measure(fBtn.Get(), label[i]);
+        label[0] = buf; label[1] = audioOn ? t.audio : t.audioMuted; label[2] = t.capture; label[3] = t.swap;
+        label[4] = t.fullscreen; label[5].clear();
+        for (int i = 0; i < 5; ++i) labelW[i] = measure(fBtn.Get(), label[i]);
+        labelW[1] = std::max(measure(fBtn.Get(), t.audio), measure(fBtn.Get(), t.audioMuted)) + speakerSize + 4;
         nameW = measure(fName.Get(), device);
         statW = measure(fStat.Get(), stat);
     }
@@ -156,11 +161,12 @@ class Hud {
 
         constexpr float padX = 10, gap = 8, btnGap = 4, logoSize = 22;
         L.vis[0] = monitorCount > 1;
-        for (int i = 1; i < 5; ++i) L.vis[i] = true;
-        const auto buttonW = [&](int i) { return i == 4 ? 30.f : labelW[i] + 22.f; };
+        L.vis[1] = audioAvailable;
+        for (int i = 2; i < 6; ++i) L.vis[i] = true;
+        const auto buttonW = [&](int i) { return i == 5 ? 30.f : labelW[i] + 22.f; };
         float buttons = 0;
         int shown = 0;
-        for (int i = 0; i < 5; ++i) if (L.vis[i]) buttons += buttonW(i) + (shown++ ? btnGap : 0);
+        for (int i = 0; i < 6; ++i) if (L.vis[i]) buttons += buttonW(i) + (shown++ ? btnGap : 0);
         float nW = std::min(nameW, 150.f);
         const auto total = [&](bool withStat, float n) {
             return padX + logoSize + gap + n + (withStat ? gap + statW : 0) + gap + 1 + gap + buttons + padX - 2;
@@ -181,7 +187,7 @@ class Hud {
         x += gap;
         L.sep = {x, pillTop + 10, x + 1, pillTop + pillH - 10};
         x += 1 + gap;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (!L.vis[i]) continue;
             L.btn[i] = {x, pillTop + 6, x + buttonW(i), pillTop + pillH - 6};
             x += buttonW(i) + btnGap;
@@ -204,7 +210,7 @@ class Hud {
             return HudAction::Surface;
         }
         if ((expandTarget || prog > 0.01f) && L.pill.has(x, y)) {
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < 6; ++i)
                 if (L.vis[i] && L.btn[i].has(x, y)) return HudAction(int(HudAction::Monitor) + i);
             return HudAction::Surface;
         }
@@ -228,6 +234,25 @@ class Hud {
         box(24, 29, 48, 35, 0, cobalt);
         box(20, 24, 24, 40, 0, ink);
     }
+    void drawSpeaker(const Painter& p, float cx, float cy, bool muted, D2D1_COLOR_F col) const {
+        constexpr float w = 1.4f, pi = 3.14159265f;
+        const float x = cx - speakerSize / 2, y = cy - speakerSize / 2;
+        const float body[7][2] = {{0, 5}, {3.5f, 5}, {7.5f, 1.5f}, {7.5f, 12.5f}, {3.5f, 9}, {0, 9}, {0, 5}};
+        for (int i = 0; i < 6; ++i) p.line(x + body[i][0], y + body[i][1], x + body[i + 1][0], y + body[i + 1][1], col, w);
+        if (muted) {
+            p.line(x + 1.5f, y + 0.5f, x + 13, y + 13.5f, col, w);
+            return;
+        }
+        for (const float radius : {3.6f, 6.4f}) {
+            float px = 0, py = 0;
+            for (int i = 0; i <= 6; ++i) {
+                const float angle = (-45.f + 15.f * float(i)) * pi / 180.f;
+                const float qx = x + 7.5f + radius * std::cos(angle), qy = y + 7 + radius * std::sin(angle);
+                if (i) p.line(px, py, qx, qy, col, w);
+                px = qx; py = qy;
+            }
+        }
+    }
     void drawPill(const Painter& p, const Layout& L) const {
         const float e = ease(prog);
         const auto stripColor = capture ? hex(0x2563EB, .96f) : hex(0x8E8C85, .6f);
@@ -242,19 +267,33 @@ class Hud {
         p.text(device, fName.Get(), L.name, hex(0xF4F2EC, a));
         if (L.showStat) p.text(stat, fStat.Get(), L.stat, hex(0xA9A69C, a));
         p.fill(L.sep, 0, hex(0xFFFFFF, .14f * a));
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (!L.vis[i]) continue;
             const Rect& r = L.btn[i];
             const auto action = HudAction(int(HudAction::Monitor) + i);
             const bool hot = hover == action, down = hot && pressed == action;
-            if (i == 4) {
+            if (i == 5) {
                 p.fill(r, 8, down ? hex(0xB91C1C, a) : hot ? hex(0xEF4444, a) : hex(0xDC2626, .85f * a));
                 const float cx = (r.l + r.r) / 2, cy = (r.t + r.b) / 2;
                 p.line(cx - 4.5f, cy - 4.5f, cx + 4.5f, cy + 4.5f, hex(0xFFFFFF, a), 1.7f);
                 p.line(cx - 4.5f, cy + 4.5f, cx + 4.5f, cy - 4.5f, hex(0xFFFFFF, a), 1.7f);
                 continue;
             }
-            const bool on = (i == 1 && capture) || (i == 2 && swap) || (i == 3 && fullscreen);
+            if (i == 1) {
+                const auto amber = [&](float alpha) { return hex(0xFBBF24, alpha * a); };
+                if (audioOn) {
+                    p.fill(r, 8, hex(0xFFFFFF, (down ? .24f : hot ? .16f : .07f) * a));
+                } else {
+                    p.fill(r, 8, amber(down ? .34f : hot ? .28f : .2f));
+                    p.stroke(r, 8, amber(.6f), 1.f);
+                }
+                const auto col = audioOn ? hex(0xF4F2EC, a) : amber(1.f);
+                const float textW = labelW[1] - speakerSize - 4, content = speakerSize + 4 + textW, left = (r.l + r.r) / 2 - content / 2;
+                drawSpeaker(p, left + speakerSize / 2, (r.t + r.b) / 2, !audioOn, col);
+                p.text(label[1], fBtn.Get(), {left + speakerSize + 4, r.t, left + content, r.b}, col);
+                continue;
+            }
+            const bool on = (i == 2 && capture) || (i == 3 && swap) || (i == 4 && fullscreen);
             p.fill(r, 8, on ? hex(down ? 0x1D4ED8 : hot ? 0x3B73F0 : 0x2563EB, a)
                             : hex(0xFFFFFF, (down ? .24f : hot ? .16f : .07f) * a));
             p.text(label[i], fBtn.Get(), r, on ? hex(0xFFFFFF, a) : hex(0xF4F2EC, a));
@@ -331,6 +370,8 @@ public:
         std::lock_guard g(m);
         capture = captureOn; swap = swapOn; fullscreen = fullscreenOn;
     }
+    void setAudioAvailable(bool available) { std::lock_guard g(m); audioAvailable = available; metricsDirty = true; }
+    void setAudio(bool on) { std::lock_guard g(m); if (on != audioOn) { audioOn = on; metricsDirty = true; } }
     void setView(UINT w, UINT h, UINT dpi) { std::lock_guard g(m); view = {std::max(1u, w), std::max(1u, h), std::max(96u, dpi)}; }
     void toast(std::wstring text, Clock::time_point now) {
         std::lock_guard g(m);

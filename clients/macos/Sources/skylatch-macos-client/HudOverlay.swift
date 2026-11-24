@@ -6,6 +6,7 @@ import SkylatchLogic
 struct HudText {
     let monitor: String  // format with the 1-based display number
     let capture, swap, fullscreen, disconnect: String
+    let audio, audioMuted, audioOn, audioOff: String
     let captureOn, captureOff, captureNeedsAccess: String
     let fullscreenOn, fullscreenOff, swapOn, swapOff: String
     let lostTitle, reconnectingTitle: String  // format with the device name
@@ -13,6 +14,7 @@ struct HudText {
 
     static let zh = HudText(
         monitor: "屏 %d", capture: "系统键", swap: "Cmd↔Ctrl", fullscreen: "全屏", disconnect: "断开",
+        audio: "音频", audioMuted: "已静音", audioOn: "已开启远端音频", audioOff: "已静音远端音频",
         captureOn: "已捕获系统键，双按右 Ctrl 释放", captureOff: "已释放系统键，双按右 Ctrl 捕获",
         captureNeedsAccess: "捕获系统键需要在“系统设置 › 隐私与安全性 › 辅助功能”中允许本应用",
         fullscreenOn: "全屏已捕获系统键，长按 Esc 退出", fullscreenOff: "已退出全屏",
@@ -21,6 +23,7 @@ struct HudText {
         reconnect: "立即重连", reconnecting: "重连中…", close: "关闭窗口", userDisconnected: "你已主动断开连接")
     static let en = HudText(
         monitor: "Screen %d", capture: "System keys", swap: "Cmd↔Ctrl", fullscreen: "Fullscreen", disconnect: "Disconnect",
+        audio: "Audio", audioMuted: "Muted", audioOn: "Remote audio on", audioOff: "Remote audio muted",
         captureOn: "System keys captured. Double-tap Right Ctrl to release",
         captureOff: "System keys released. Double-tap Right Ctrl to capture",
         captureNeedsAccess: "Capturing system keys needs this app in System Settings › Privacy & Security › Accessibility",
@@ -40,7 +43,7 @@ struct HudText {
 /// is consumed here; only the rest of the window reaches the video view (and so the remote host).
 final class HudOverlay: NSView {
     enum Action: Int {
-        case none, surface, monitor, capture, swap, fullscreen, disconnect, reconnect, close
+        case none, surface, monitor, audio, capture, swap, fullscreen, disconnect, reconnect, close
     }
 
     enum Card { case none, lost, reconnecting }
@@ -57,7 +60,7 @@ final class HudOverlay: NSView {
         var reconnect = NSRect.zero, close = NSRect.zero
     }
 
-    private static let pillHeight: CGFloat = 40, pillTop: CGFloat = 8
+    private static let pillHeight: CGFloat = 40, pillTop: CGFloat = 8, speakerSize: CGFloat = 14
     private static let toastSeconds = 1.2, collapseSeconds = 1.8, expandSeconds = 0.18
     private static let cobalt = NSColor(hex: 0x2563EB)
 
@@ -69,6 +72,7 @@ final class HudOverlay: NSView {
     private var device = "", stat = ""
     private var monitorActive = 0, monitorCount = 0
     private var captureOn = false, swapOn = false, fullscreenOn = false
+    private var audioAvailable = false, audioOn = true
     private var card = Card.none
     private var reason = ""
     private var expandTarget = false, inside = false
@@ -127,6 +131,17 @@ final class HudOverlay: NSView {
         refresh()
     }
 
+    func setAudioAvailable(_ available: Bool) {
+        audioAvailable = available
+        refresh()
+        window?.invalidateCursorRects(for: self)
+    }
+
+    func setAudioEnabled(_ on: Bool) {
+        audioOn = on
+        refresh()
+    }
+
     func toast(_ message: String) {
         toastText = message
         toastAt = ProcessInfo.processInfo.systemUptime
@@ -180,6 +195,7 @@ final class HudOverlay: NSView {
     private func buttonLabel(_ action: Action) -> String {
         switch action {
         case .monitor: return monitorLabel()
+        case .audio: return audioOn ? text.audio : text.audioMuted
         case .capture: return text.capture
         case .swap: return text.swap
         case .fullscreen: return text.fullscreen
@@ -204,8 +220,12 @@ final class HudOverlay: NSView {
         let padX: CGFloat = 10, gap: CGFloat = 8, btnGap: CGFloat = 4, logoSize: CGFloat = 22
         var actions: [Action] = []
         if monitorCount > 1 { actions.append(.monitor) }
+        if audioAvailable { actions.append(.audio) }
         actions += [.capture, .swap, .fullscreen, .disconnect]
-        func buttonWidth(_ a: Action) -> CGFloat { measure(buttonLabel(a), Self.buttonFont) + 22 }
+        func buttonWidth(_ a: Action) -> CGFloat {
+            if a == .audio { return max(measure(text.audio, Self.buttonFont), measure(text.audioMuted, Self.buttonFont)) + 22 + Self.speakerSize + 4 }
+            return measure(buttonLabel(a), Self.buttonFont) + 22
+        }
         let buttonsWidth = actions.reduce(CGFloat(0)) { $0 + buttonWidth($1) } + btnGap * CGFloat(actions.count - 1)
 
         var nameWidth = min(measure(device, Self.nameFont), 150)
@@ -514,6 +534,10 @@ final class HudOverlay: NSView {
                 draw(text.disconnect, in: r, font: Self.buttonFont, color: NSColor.white.withAlphaComponent(a))
                 continue
             }
+            if action == .audio {
+                drawAudioButton(r, hot: hot, down: down, alpha: a)
+                continue
+            }
             let on = (action == .capture && captureOn) || (action == .swap && swapOn) || (action == .fullscreen && fullscreenOn)
             if on {
                 let fill = down ? 0x1D4ED8 : hot ? 0x3B73F0 : 0x2563EB
@@ -524,6 +548,50 @@ final class HudOverlay: NSView {
             draw(buttonLabel(action), in: r, font: Self.buttonFont,
                  color: (on ? NSColor.white : NSColor(hex: 0xF4F2EC)).withAlphaComponent(a))
         }
+    }
+
+    private func drawAudioButton(_ r: NSRect, hot: Bool, down: Bool, alpha a: CGFloat) {
+        let amber = NSColor(hex: 0xFBBF24)
+        if audioOn {
+            rounded(r, 8, fill: NSColor.white.withAlphaComponent((down ? 0.24 : hot ? 0.16 : 0.07) * a))
+        } else {
+            rounded(r, 8, fill: amber.withAlphaComponent((down ? 0.34 : hot ? 0.28 : 0.2) * a))
+            outline(r, 8, color: amber.withAlphaComponent(0.6 * a))
+        }
+        let color = (audioOn ? NSColor(hex: 0xF4F2EC) : amber).withAlphaComponent(a)
+        let size = Self.speakerSize, label = buttonLabel(.audio)
+        let labelWidth = measure(label, Self.buttonFont), content = size + 4 + labelWidth
+        let left = r.midX - content / 2
+        drawSpeaker(NSRect(x: left, y: r.midY - size / 2, width: size, height: size), muted: !audioOn, color: color)
+        draw(label, in: NSRect(x: left + size + 4, y: r.minY, width: labelWidth, height: r.height), font: Self.buttonFont,
+             color: color, align: .left)
+    }
+
+    private func drawSpeaker(_ r: NSRect, muted: Bool, color: NSColor) {
+        let x = r.minX, y = r.minY
+        let path = NSBezierPath()
+        path.lineWidth = 1.4
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.move(to: NSPoint(x: x, y: y + 5))
+        path.line(to: NSPoint(x: x + 3.5, y: y + 5))
+        path.line(to: NSPoint(x: x + 7.5, y: y + 1.5))
+        path.line(to: NSPoint(x: x + 7.5, y: y + 12.5))
+        path.line(to: NSPoint(x: x + 3.5, y: y + 9))
+        path.line(to: NSPoint(x: x, y: y + 9))
+        path.close()
+        if muted {
+            path.move(to: NSPoint(x: x + 1.5, y: y + 0.5))
+            path.line(to: NSPoint(x: x + 13, y: y + 13.5))
+        } else {
+            let center = NSPoint(x: x + 7.5, y: y + 7)
+            for radius: CGFloat in [3.6, 6.4] {
+                path.move(to: NSPoint(x: center.x + radius * cos(.pi / 4), y: center.y - radius * sin(.pi / 4)))
+                path.appendArc(withCenter: center, radius: radius, startAngle: -45, endAngle: 45)
+            }
+        }
+        color.setStroke()
+        path.stroke()
     }
 
     private func drawToast(_ l: Layout) {

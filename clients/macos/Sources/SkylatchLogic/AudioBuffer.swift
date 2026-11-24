@@ -44,6 +44,13 @@ public struct PcmJitterBuffer {
         count += input.count
     }
 
+    /// Drops everything queued; output restarts after priming again.
+    public mutating func clear() {
+        head = 0
+        count = 0
+        priming = true
+    }
+
     /// Fills `out` with interleaved samples, padding with silence while priming or on underrun.
     /// Returns the number of frames that came from the buffer.
     @discardableResult

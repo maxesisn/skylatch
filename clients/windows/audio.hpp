@@ -86,6 +86,12 @@ public:
         if (wake) CloseHandle(wake);
     }
 
+    void clear() noexcept {
+        std::lock_guard guard(lock);
+        head = count = 0;
+        priming = true;
+    }
+
     // Thread-safe. Other sample rates and channel counts are ignored.
     void push(const int16_t* pcm, size_t frames, uint32_t sampleRate, uint8_t pcmChannels) noexcept {
         if (!pcm || sampleRate != rate || pcmChannels != channels) return;

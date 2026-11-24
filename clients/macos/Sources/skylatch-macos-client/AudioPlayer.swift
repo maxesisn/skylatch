@@ -56,6 +56,12 @@ final class AudioPlayer {
         }
     }
 
+    func clear() {
+        lock.lock()
+        jitter.clear()
+        lock.unlock()
+    }
+
     func stop() {
         guard let queue else { return }
         self.queue = nil

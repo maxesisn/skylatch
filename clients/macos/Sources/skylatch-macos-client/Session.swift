@@ -144,6 +144,19 @@ final class Session: @unchecked Sendable {
 
     // MARK: Sending from the main thread
 
+    /// Whether audio can be toggled: false with `--no-audio`, in smoke mode or without an output device.
+    var hasAudio: Bool { audio != nil }
+
+    /// Mutes or resumes host audio; muting also drops what is queued locally. False when the core refused.
+    func setAudio(_ on: Bool) -> Bool {
+        stateLock.lock()
+        let active = client
+        stateLock.unlock()
+        guard let active, !isStopping(), skylatch_set_audio_enabled(active, on ? 1 : 0) == SKYLATCH_OK else { return false }
+        if !on { audio?.clear() }
+        return true
+    }
+
     func sendInput(_ record: [UInt8]) {
         stateLock.lock()
         let active = client
