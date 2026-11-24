@@ -1,0 +1,4 @@
+module CSkylatchCore [system] {
+    header "../../../../crates/skylatch-client-core/include/skylatch_client_core.h"
+    export *
+}
