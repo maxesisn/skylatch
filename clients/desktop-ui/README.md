@@ -85,6 +85,31 @@ first-run screen.
   (valid 10 minutes, single use) and the copyable `skylatch-agent join <hub> --code <code>` command.
   `Enter` copies it, `R` or **换一码** mints another code, `Esc` closes.
 
+### Tray and hosting this machine
+
+Install the launcher on two computers, sign in on both, and each can take over the other — no
+command line. While the launcher is signed in to a hub and hosting is on (the default), it
+
+- enrolls this machine once per hub: it mints a pairing code with the account token and runs
+  `skylatch-agent join <hub> --code <code>`, so the agent writes its own `agent.json` (mode `0600`
+  on Unix) with a dedicated, revocable per-device token — your password is never stored;
+- keeps `skylatch-agent --engine-bin <engine> --enable-direct` running (no console window on
+  Windows), restarting it with a growing delay if it dies, and stops it when hosting is switched off,
+  when you sign out and when the launcher exits (on Windows through a kill-on-close job object, so
+  not even a crash of the launcher leaves an agent or engine behind).
+
+`skylatch-agent` and `skylatch-host-engine` are looked up next to the launcher (installed bundle),
+then in `target/release/` and `host/` of a source checkout. Without them the top bar says
+**未找到本机被控组件** and everything else keeps working.
+
+Switch hosting with the **允许远端接管本机** checkbox of the sign-in card, the chip in the top bar
+(**本机可被控** / **本机未共享**) or the tray menu (the choice is saved as `host_enabled` in the
+settings file). The system tray icon (Windows, macOS) has four items: **打开 Skylatch**,
+**本机被控：运行中 / 已暂停**, **+ 添加设备** (opens the pairing dialog) and **退出 Skylatch** (stops the
+agent, removes the icon, exits). A left click on the icon opens the window. While signed in, the
+window's close button hides the window to the tray instead of quitting, so other devices can still
+connect; without a hub, without a tray icon or with `--demo` it closes the app as before.
+
 ### Saved settings
 
 A JSON file in the per-user config directory:
@@ -102,6 +127,7 @@ A JSON file in the per-user config directory:
   "prefer_direct": true,
   "dark_mode": false,
   "shelf_mode": false,
+  "host_enabled": true,
   "client_bin": "/optional/path/to/skylatch-client"
 }
 ```

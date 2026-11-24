@@ -27,6 +27,9 @@ pub struct Config {
     pub prefer_direct: bool,
     pub dark_mode: bool,
     pub shelf_mode: bool,
+    /// Let other devices take over this machine: the launcher enrolls it as a host and keeps a
+    /// local `skylatch-agent` running while a hub is configured.
+    pub host_enabled: bool,
     /// Optional absolute path of the native stream client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_bin: Option<String>,
@@ -40,6 +43,7 @@ impl Default for Config {
             prefer_direct: true,
             dark_mode: false,
             shelf_mode: false,
+            host_enabled: true,
             client_bin: None,
         }
     }
@@ -61,6 +65,7 @@ impl fmt::Debug for Config {
             .field("prefer_direct", &self.prefer_direct)
             .field("dark_mode", &self.dark_mode)
             .field("shelf_mode", &self.shelf_mode)
+            .field("host_enabled", &self.host_enabled)
             .field("client_bin", &self.client_bin)
             .finish()
     }
@@ -351,6 +356,7 @@ mod tests {
             prefer_direct: false,
             dark_mode: true,
             shelf_mode: true,
+            host_enabled: false,
             client_bin: Some("/opt/skylatch/skylatch-client".into()),
         }
     }
@@ -365,6 +371,7 @@ mod tests {
             "prefer_direct",
             "dark_mode",
             "shelf_mode",
+            "host_enabled",
             "client_bin",
         ] {
             assert!(
@@ -387,6 +394,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"hub_url":"wss://h.example"}"#).unwrap();
         assert_eq!(cfg.hub_url, "wss://h.example");
         assert!(cfg.prefer_direct, "prefer_direct defaults to true");
+        assert!(cfg.host_enabled, "hosting this machine defaults to on");
         assert!(
             !cfg.dark_mode && !cfg.shelf_mode && cfg.token.is_empty() && cfg.client_bin.is_none()
         );
@@ -415,6 +423,25 @@ mod tests {
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::write(&path, "{not json").unwrap();
         assert!(matches!(load(&path), Err(ConfigError::Parse(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_enabled_is_persisted_and_defaults_on() {
+        assert!(Config::default().host_enabled);
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-host-cfg-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let off = Config {
+            host_enabled: false,
+            ..Config::default()
+        };
+        save(&path, &off).unwrap();
+        assert!(!load(&path).unwrap().host_enabled);
+        save(&path, &Config::default()).unwrap();
+        assert!(load(&path).unwrap().host_enabled);
+        // a config written before this setting existed keeps hosting on
+        std::fs::write(&path, r#"{"hub_url":"wss://h.example","token":"t"}"#).unwrap();
+        assert!(load(&path).unwrap().host_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
