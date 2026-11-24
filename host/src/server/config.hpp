@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/backend-options.hpp"
+#include "core/video-encoder.hpp"
 #include <libwebsockets.h>
 #include <chrono>
 #include <cstdint>
@@ -17,6 +18,8 @@ struct Config {
   int max_dimension = SurfaceBudget::default_max_dimension;
   /// Windows capture API selection; other backends ignore it.
   CaptureMode capture = CaptureMode::automatic;
+  /// --encoder, else SKYLATCH_ENCODER, else auto.
+  EncoderPreference encoder = EncoderPreference::automatic;
   uint64_t bitrate_min = 1000000, bitrate_start = 8000000, bitrate_max = 40000000;
   bool proxy = false, insecure_local = false, check = false, no_viewer = false;
   std::vector<std::string> allowed_origins;

@@ -80,7 +80,8 @@ int main(int argc, char** argv) {
   s.end(); s.streams[0]->capture.stop(); s.screenshot.stop(); s.clipboard.stop(); s.input.reset();
   const auto stats=s.streams[0]->capture.stats();
   std::cerr << "capture_stats captures=" << stats.captures << " encoded=" << stats.encoded
-            << " capture_ns=" << stats.capture_ns << " convert_ns=" << stats.convert_ns << " encode_ns=" << stats.encode_ns << '\n';
+            << " capture_ns=" << stats.capture_ns << " convert_ns=" << stats.convert_ns << " encode_ns=" << stats.encode_ns
+            << " encoder=" << stats.encoder_name << " hardware_encoder=" << (stats.hardware_encoder ? 1 : 0) << '\n';
   lws_sul_cancel(&heartbeat);
   s.wake->set(nullptr);
   lws_context_destroy(s.context); s.context=nullptr; heartbeatContext=nullptr;
