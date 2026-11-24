@@ -117,6 +117,7 @@ impl Hub {
             monitor_list: vec![],
             room: None,
             slot: None,
+            hardware_model: None,
         };
         socket
             .send(Message::Text(

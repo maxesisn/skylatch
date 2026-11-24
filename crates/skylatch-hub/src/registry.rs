@@ -392,6 +392,7 @@ mod tests {
             monitor_list: vec![],
             room: None,
             slot: None,
+            hardware_model: None,
         }
     }
 

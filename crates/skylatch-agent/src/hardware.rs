@@ -16,6 +16,8 @@ mod platform;
 pub struct HardwareProfile {
     pub form_factor: DeviceFormFactor,
     pub monitor_list: Vec<MonitorInfo>,
+    /// Human-readable model such as `Mac mini (Apple M4)`; `None` when it cannot be determined.
+    pub hardware_model: Option<String>,
 }
 
 #[derive(Default)]
@@ -76,6 +78,52 @@ fn classify_form_factor(hints: HardwareHints<'_>) -> DeviceFormFactor {
     }
 }
 
+/// Strips NUL and other control characters and trims surrounding whitespace.
+fn clean_text(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Generic firmware strings that carry no model information.
+fn is_placeholder(value: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &[
+        "to be filled by o.e.m.",
+        "system product name",
+        "default string",
+        "standard pc",
+        "system version",
+        "not specified",
+        "not applicable",
+        "o.e.m.",
+        "oem",
+        "none",
+        "unknown",
+        "n/a",
+    ];
+    let value = value.to_ascii_lowercase();
+    value.is_empty() || PLACEHOLDERS.contains(&value.as_str())
+}
+
+/// Builds a model name from DMI/BIOS strings. `family` is a friendlier product name that some
+/// vendors (e.g. Lenovo, whose product name is a machine-type code) publish separately.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn compose_firmware_model(vendor: &str, product: &str, family: &str) -> Option<String> {
+    let (vendor, product, family) = (clean_text(vendor), clean_text(product), clean_text(family));
+    if vendor.to_ascii_lowercase().contains("lenovo") && !is_placeholder(&family) {
+        return Some(family);
+    }
+    if !is_placeholder(&product) {
+        return Some(product);
+    }
+    // Hypervisors often publish only a bare "Standard PC"; the vendor makes it meaningful.
+    (product.eq_ignore_ascii_case("standard pc") && !is_placeholder(&vendor))
+        .then(|| format!("{vendor} {product}"))
+}
+
 /// Collects a startup snapshot. Call on a blocking worker when running in an async runtime.
 pub fn detect_hardware_profile() -> HardwareProfile {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -96,9 +144,14 @@ pub fn detect_hardware_profile() -> HardwareProfile {
             active: false,
         });
     }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let hardware_model = platform::hardware_model();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let hardware_model = None;
     HardwareProfile {
         form_factor,
         monitor_list,
+        hardware_model,
     }
 }
 
@@ -187,6 +240,62 @@ mod tests {
             Server
         );
         assert_eq!(classify_form_factor(HardwareHints::default()), Desktop);
+    }
+
+    #[test]
+    fn cleans_nul_and_whitespace() {
+        assert_eq!(clean_text(" Mac mini\0\0 \n"), "Mac mini");
+        assert_eq!(clean_text("Think\tPad  X1\0"), "Think Pad X1");
+    }
+
+    #[test]
+    fn filters_generic_firmware_placeholders() {
+        for placeholder in [
+            "To be filled by O.E.M.",
+            "System Product Name",
+            "Default string",
+            "Standard PC",
+            "",
+        ] {
+            assert_eq!(compose_firmware_model("", placeholder, ""), None);
+            assert_eq!(compose_firmware_model("ASUS", placeholder, ""), {
+                (placeholder == "Standard PC").then(|| "ASUS Standard PC".to_string())
+            });
+        }
+    }
+
+    #[test]
+    fn composes_firmware_models() {
+        assert_eq!(
+            compose_firmware_model("LENOVO", "21KC004UGE", "ThinkPad X1 Carbon Gen 12").as_deref(),
+            Some("ThinkPad X1 Carbon Gen 12")
+        );
+        assert_eq!(
+            compose_firmware_model("LENOVO", "21KC004UGE", "To be filled by O.E.M.").as_deref(),
+            Some("21KC004UGE")
+        );
+        assert_eq!(
+            compose_firmware_model("Dell Inc.", "XPS 13 9340\0", "XPS").as_deref(),
+            Some("XPS 13 9340")
+        );
+        assert_eq!(
+            compose_firmware_model("QEMU", "Standard PC", "").as_deref(),
+            Some("QEMU Standard PC")
+        );
+        assert_eq!(
+            compose_firmware_model("QEMU", "Standard PC (Q35 + ICH9, 2009)", "").as_deref(),
+            Some("Standard PC (Q35 + ICH9, 2009)")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detects_clean_macos_model() {
+        let model = detect_hardware_profile()
+            .hardware_model
+            .expect("a macOS model");
+        assert_eq!(model, clean_text(&model));
+        eprintln!("hardware_model: {model}");
     }
 
     #[cfg(target_os = "macos")]

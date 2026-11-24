@@ -84,10 +84,11 @@ pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         os: std::env::consts::OS.to_string(),
         host_version: env!("CARGO_PKG_VERSION").to_string(),
         monitors: hardware.monitor_list.len().max(1) as u32,
-        form_factor: cli.form_factor.resolve(hardware.form_factor),
         monitor_list: hardware.monitor_list,
+        form_factor: cli.form_factor.resolve(hardware.form_factor),
         room: cli.room.clone(),
         slot: cli.slot,
+        hardware_model: cli.model.clone().or(hardware.hardware_model),
         direct_endpoints: endpoints,
     };
     let engine = Arc::new(Mutex::new(match (&cli.engine_bin, &cli.engine_url) {

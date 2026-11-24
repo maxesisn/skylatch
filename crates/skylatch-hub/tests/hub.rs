@@ -107,6 +107,7 @@ fn device(id: &str) -> DeviceInfo {
         ],
         room: Some("Office".into()),
         slot: Some(3),
+        hardware_model: None,
     }
 }
 

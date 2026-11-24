@@ -59,11 +59,15 @@ pub struct DeviceInfo {
     pub room: Option<String>,
     #[serde(default)]
     pub slot: Option<u32>,
+    /// Human-readable hardware model, e.g. `Mac mini (Apple M4)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_model: Option<String>,
 }
 
 /// Messages a host sends to the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Register is sent once per connection; boxing would churn every caller.
 pub enum HostToHub {
     /// Must be the first message on `/ws/host`.
     Register {
@@ -198,6 +202,7 @@ mod tests {
             }],
             room: Some("Office".into()),
             slot: Some(3),
+            hardware_model: Some("Mac mini (Apple M4)".into()),
             direct_endpoints: vec![DirectEndpoint {
                 kind: EndpointKind::Lan,
                 host: "192.0.2.20".into(),
@@ -206,7 +211,7 @@ mod tests {
         }
     }
 
-    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":1,"direct_endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}],"form_factor":"mini","monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}],"room":"Office","slot":3}"#;
+    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":1,"direct_endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}],"form_factor":"mini","monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}],"room":"Office","slot":3,"hardware_model":"Mac mini (Apple M4)"}"#;
 
     #[test]
     fn device_info_roundtrip() {
@@ -225,6 +230,15 @@ mod tests {
         assert!(d.monitor_list.is_empty());
         assert_eq!(d.room, None);
         assert_eq!(d.slot, None);
+        assert_eq!(d.hardware_model, None);
+    }
+
+    #[test]
+    fn absent_hardware_model_is_not_serialized() {
+        let mut d = device();
+        d.hardware_model = None;
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("hardware_model").is_none());
     }
 
     #[test]

@@ -73,10 +73,13 @@ for name in skylatch-ui skylatch-client skylatch-agent skylatch-host-engine; do
     bundle_imports "$macos/$name" '@loader_path/../Frameworks'
 done
 
+# Prefer the 512 px master; fall back to the 256 px frame.
+icon="$repo/assets/icon/skylatch-512.png"
+[[ -f $icon ]] || icon="$repo/assets/icon/skylatch-256.png"
 for size in 16 32 128 256 512; do
-    sips -z "$size" "$size" "$repo/assets/icon/skylatch-256.png" \
+    sips -z "$size" "$size" "$icon" \
         --out "$iconset/icon_${size}x${size}.png" >/dev/null
-    sips -z "$((size * 2))" "$((size * 2))" "$repo/assets/icon/skylatch-256.png" \
+    sips -z "$((size * 2))" "$((size * 2))" "$icon" \
         --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$resources/Skylatch.icns"
