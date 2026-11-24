@@ -4,6 +4,7 @@ members = [
     "crates/skylatch-proto",
     "crates/skylatch-hub",
     "crates/skylatch-client-core",
+    "crates/skylatch-agent",
 ]
 
 [workspace.package]

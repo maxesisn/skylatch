@@ -1,0 +1,28 @@
+[package]
+name = "skylatch-agent"
+description = "Skylatch host agent: registers outbound with the hub and bridges NSL1 sessions to the local engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures-util = "0.3"
+gethostname = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json.workspace = true
+skylatch-proto.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[dev-dependencies]
+axum.workspace = true
+serde.workspace = true
+skylatch-hub = { path = "../skylatch-hub" }
