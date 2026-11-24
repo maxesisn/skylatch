@@ -1,0 +1,47 @@
+# Rust
+target/
+**/*.rs.bk
+
+# C / C++ / CMake / MSYS2 / MSVC
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.lib
+*.dll
+*.ilk
+*.exp
+*.vcxproj.user
+.vs/
+x64/
+Debug/
+Release/
+
+# macOS / Xcode / Swift
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+
+# Windows
+*.obj
+*.pdb
+*.exe
+
+# Secrets and local config
+.env
+.env.*
+*.token
+
+# Editors
+.idea/
+.vscode/
+*.swp

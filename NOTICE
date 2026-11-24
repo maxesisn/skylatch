@@ -1,0 +1,13 @@
+Skylatch
+Copyright 2026 The Skylatch contributors
+
+This product includes ideas and design from screen-relay
+(https://github.com/vercel-labs/screen-relay), licensed under the Apache License,
+Version 2.0:
+
+  - the NSL1 binary protocol lineage (20-byte header, frame / ACK / input / cursor /
+    clipboard-notice message types, viewer-wait feedback), and
+  - the design of the host capture and encoding engine under host/.
+
+The full Apache-2.0 text is in LICENSE-APACHE. See LICENSING.md for which parts of this
+repository are licensed under Apache-2.0 and which under GPL-3.0.

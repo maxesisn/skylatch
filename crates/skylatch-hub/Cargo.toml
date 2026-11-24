@@ -1,0 +1,23 @@
+[package]
+name = "skylatch-hub"
+description = "Skylatch central relay hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+skylatch-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
