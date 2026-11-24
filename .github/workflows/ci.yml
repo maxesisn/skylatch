@@ -37,3 +37,17 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p skylatch-client-core
+      - name: Build the native client
+        shell: cmd
+        run: clients\windows\build.bat --skip-rust
+      - name: Check console-only startup
+        shell: cmd
+        run: clients\windows\skylatch-client.exe --help
