@@ -52,10 +52,12 @@ across untrusted networks. Avoid putting real tokens in scripts or logs.
 - **F11** toggles borderless fullscreen on the current monitor.
 - **Ctrl+Alt+G** toggles forwarding of the Windows keys and Alt+Tab while the viewer is focused.
 - The viewer forwards physical keyboard keys, mouse movement and buttons, wheel input, and committed
-  IME text. IME composition is positioned near the local pointer. Clipboard synchronization is not
-  implemented in this client.
+  IME text. IME composition is positioned near the local pointer.
+- While connected, the viewer synchronizes local and remote plain text clipboard changes in both
+  directions using SL1 Type 19 (UTF-8, up to 1 MiB). Local clipboard changes can be shared even when
+  the viewer is not focused. Add **`--no-clipboard`** to disable both sending and receiving.
 - Add **`--smoke-seconds N`** to a connection command to exercise the decoder and presenter without
-  displaying or activating the window. This mode disables input; use `--device` when the hub lists
+  displaying or activating the window. This mode disables input and clipboard sync; use `--device` when the hub lists
   multiple devices. After N seconds from the first successful present, it prints resolution, frame
   counts, mean decode time, mean viewer wait, and decode mode. Setup/decode failure, early
   disconnection, or no presentation returns nonzero.

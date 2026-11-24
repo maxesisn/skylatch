@@ -6,6 +6,7 @@
 #include <atomic>
 #include <charconv>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -15,18 +16,20 @@ namespace {
 struct Config {
     std::string hub, direct, token, device;
     unsigned smoke{};
-    bool list{}, noDirect{}, help{};
+    bool list{}, noDirect{}, noClipboard{}, help{};
 };
 
 void usage() {
     std::puts("Usage:\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> --list\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]\n"
-              "                  [--no-direct] [--smoke-seconds N]\n"
-              "  skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>] [--smoke-seconds N]\n"
+              "                  [--no-direct] [--no-clipboard] [--smoke-seconds N]\n"
+              "  skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]\n"
+              "                  [--no-clipboard] [--smoke-seconds N]\n"
               "  skylatch-client --help\n\n"
               "Without --device, hub mode selects the sole device or opens a picker.\n"
-              "--no-direct forces the hub relay. --smoke-seconds runs hidden without input;\n"
+              "--no-direct forces the hub relay. --no-clipboard disables text clipboard sync.\n"
+              "--smoke-seconds runs hidden without input or clipboard sync;\n"
               "specify --device if the hub has multiple devices.\n"
               "F11: toggle borderless fullscreen. Ctrl+Alt+G: toggle system key capture.");
 }
@@ -47,8 +50,8 @@ Config parseArgs(int argc, wchar_t** argv) {
     }
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view option(argv[i]);
-        if (option == L"--list" || option == L"--no-direct") {
-            auto& flag = option == L"--list" ? c.list : c.noDirect;
+        if (option == L"--list" || option == L"--no-direct" || option == L"--no-clipboard") {
+            auto& flag = option == L"--list" ? c.list : option == L"--no-direct" ? c.noDirect : c.noClipboard;
             require(!flag, "duplicate option; see --help");
             flag = true;
             continue;
@@ -74,7 +77,8 @@ Config parseArgs(int argc, wchar_t** argv) {
     require(websocketUrl(c.hub.empty() ? c.direct : c.hub), "endpoint must be a ws:// or wss:// URL without user information");
     if (!c.hub.empty()) {
         require(!c.token.empty(), "--hub requires --token");
-        require(!c.list || (c.device.empty() && !c.noDirect && !c.smoke), "--list cannot be used with session options");
+        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.smoke),
+            "--list cannot be used with session options");
     } else {
         require(!c.list && c.device.empty() && !c.noDirect, "--list, --device and --no-direct require --hub");
         require(c.token.empty() || (c.token.size() == 64 && c.token.find_first_not_of("0123456789abcdefABCDEF") == c.token.npos),
@@ -84,7 +88,11 @@ Config parseArgs(int argc, wchar_t** argv) {
 }
 
 constexpr UINT msgDevices = WM_APP + 1, msgConnected = WM_APP + 2, msgCursor = WM_APP + 3, msgEnded = WM_APP + 4;
+constexpr UINT msgClipboard = WM_APP + 5;
 constexpr UINT_PTR statusTimer = 1;
+constexpr size_t maxClipboardBytes = 1024 * 1024;
+
+struct ClipboardClose { ~ClipboardClose() { CloseClipboard(); } };
 
 struct Stats {
     unsigned width{}, height{};
@@ -103,13 +111,17 @@ class Client {
     std::atomic<bool> stopping{false};
     std::atomic<SkylatchClient*> client{nullptr};
     std::thread worker;
-    std::mutex videoLock, statsLock, cursorLock, endLock;
+    std::mutex videoLock, statsLock, cursorLock, endLock, clipboardLock;
     std::condition_variable videoReady;
     std::deque<QueuedFrame> videoQ;
     size_t queuedBytes{};
     Stats stats;
     EndStatus endStatus;
     std::optional<Cursor> cursorIncoming;
+    std::optional<std::string> clipboardIncoming;
+    bool clipboardListening{};
+    std::optional<DWORD> lastAppliedClipSeq;
+    std::wstring lastSyncedClipboard;
     std::vector<Device> devices;
     Stats prevStats;
     Clock::time_point connectedAt{}, prevTitle{};
@@ -191,6 +203,73 @@ class Client {
     static void onDisconnected(void* ctx, const char* error) noexcept {
         static_cast<Client*>(ctx)->report(error ? error : "Remote session closed", error == nullptr);
     }
+    static void onClipboardData(void* ctx, const char* text, size_t len) noexcept {
+        auto& self = *static_cast<Client*>(ctx);
+        if (self.stopping || len > maxClipboardBytes || (!text && len)) return;
+        try {
+            std::lock_guard lock(self.clipboardLock);
+            const bool pending = self.clipboardIncoming.has_value();
+            self.clipboardIncoming.emplace(text ? text : "", len);
+            if (!pending && !PostMessageW(self.wnd, msgClipboard, 0, 0)) self.clipboardIncoming.reset();
+        } catch (const std::exception&) {
+            // Clipboard synchronization is best-effort and must not end the session.
+        }
+    }
+
+    bool clipboardEnabled() const { return !config.smoke && !config.noClipboard; }
+    void applyClipboard() {
+        std::optional<std::string> incoming;
+        { std::lock_guard lock(clipboardLock); incoming = std::exchange(clipboardIncoming, std::nullopt); }
+        if (!incoming || stopping || disconnected || incoming->find('\0') != incoming->npos) return;
+        const auto wide = fromUtf8(*incoming);
+        std::wstring text;
+        text.reserve(wide.size());
+        for (size_t i = 0; i < wide.size(); ++i) {
+            if (wide[i] == L'\n' && (i == 0 || wide[i - 1] != L'\r')) text.push_back(L'\r');
+            text.push_back(wide[i]);
+        }
+        const auto bytes = (text.size() + 1) * sizeof(wchar_t);
+        std::unique_ptr<void, decltype(&GlobalFree)> memory(GlobalAlloc(GMEM_MOVEABLE, bytes), GlobalFree);
+        if (!memory) return;
+        auto dest = GlobalLock(memory.get());
+        if (!dest) return;
+        memcpy(dest, text.c_str(), bytes);
+        GlobalUnlock(memory.get());
+        if (!OpenClipboard(wnd)) return;
+        ClipboardClose close;
+        if (!EmptyClipboard() || !SetClipboardData(CF_UNICODETEXT, memory.get())) return;
+        memory.release(); // Clipboard owns the allocation after SetClipboardData succeeds.
+        lastAppliedClipSeq = GetClipboardSequenceNumber();
+        lastSyncedClipboard = std::move(text);
+    }
+    std::wstring readClipboard() {
+        if (!OpenClipboard(wnd)) return {};
+        ClipboardClose close;
+        if (lastAppliedClipSeq == GetClipboardSequenceNumber()) return {};
+        const HGLOBAL memory = GetClipboardData(CF_UNICODETEXT);
+        if (!memory) return {};
+        const auto capacity = std::min(GlobalSize(memory) / sizeof(wchar_t), maxClipboardBytes + 1);
+        const auto text = static_cast<const wchar_t*>(GlobalLock(memory));
+        if (!text) return {};
+        struct Unlock { HGLOBAL memory; ~Unlock() { GlobalUnlock(memory); } } unlock{memory};
+        const auto end = std::find(text, text + capacity, L'\0');
+        return end == text + capacity ? std::wstring{} : std::wstring(text, end);
+    }
+    void sendClipboard() {
+        const auto active = client.load();
+        if (!clipboardListening || !active || stopping || disconnected ||
+            !IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
+        auto text = readClipboard();
+        if (text.empty() || text == lastSyncedClipboard) return;
+        std::string utf8;
+        try { utf8 = toUtf8(text); }
+        catch (const std::runtime_error&) { return; } // Other applications may publish malformed UTF-16.
+        if (utf8.size() <= maxClipboardBytes && skylatch_send_clipboard(active, utf8.data(), utf8.size()) == SKYLATCH_OK)
+            lastSyncedClipboard = std::move(text);
+    }
+    void removeClipboardListener() {
+        if (std::exchange(clipboardListening, false)) RemoveClipboardFormatListener(wnd);
+    }
 
     void stream() {
         try {
@@ -208,6 +287,11 @@ class Client {
             // Callbacks can queue video before connect returns. Publish before any input or ACK.
             client.store(active);
             if (stopping) return;
+            if (clipboardEnabled()) {
+                const SkylatchSl1Callbacks sl1Callbacks{nullptr, onClipboardData};
+                require(skylatch_set_sl1_callbacks(active, &sl1Callbacks, this) == SKYLATCH_OK,
+                    "could not register clipboard callback");
+            }
             PostMessageW(wnd, msgConnected, 0, 0);
 
             auto ack = [&](const FrameInfo& f, uint32_t wait) {
@@ -218,6 +302,7 @@ class Client {
             auto drop = [&](const FrameInfo& f) { ack(f, elapsedUs(f.arrival)); };
             std::unique_ptr<Decoder> decode;
             uint32_t currentGeneration = 0;
+            unsigned currentWidth = 0, currentHeight = 0;
             while (!stopping) {
                 QueuedFrame q;
                 {
@@ -226,14 +311,17 @@ class Client {
                     if (stopping) break;
                     q = std::move(videoQ.front()); videoQ.pop_front(); queuedBytes -= q.annexB.size();
                 }
-                if (q.info.generation != currentGeneration) {
-                    decode.reset(); currentGeneration = q.info.generation;
+                if (q.info.generation != currentGeneration || q.info.width != currentWidth || q.info.height != currentHeight) {
+                    // A size change can leave undecoded frames in the same ACK window.
+                    if (decode && q.info.generation == currentGeneration) decode->dropPending(drop);
+                    decode.reset();
+                    currentGeneration = q.info.generation;
+                    currentWidth = q.info.width;
+                    currentHeight = q.info.height;
                 }
-                if (!decode) {
-                    if (!q.key) { drop(q.info); continue; }
-                    decode = std::make_unique<Decoder>(render.device.Get());
-                }
-                decode->feed(q.annexB, q.info, q.key, [&](IMFSample* sample, const VideoFormat& fmt, const FrameInfo& f, uint32_t us) {
+                bool outputStarted = false;
+                auto output = [&](IMFSample* sample, const VideoFormat& fmt, const FrameInfo& f, uint32_t us) {
+                    outputStarted = true;
                     const auto result = render.draw(sample, fmt, f);
                     const auto now = Clock::now();
                     const auto wait = elapsedUs(f.arrival, now);
@@ -246,7 +334,21 @@ class Client {
                         if (!stats.presented) stats.firstPresent = now;
                         ++stats.presented; stats.waitUs += wait;
                     }
-                }, drop);
+                };
+                auto feed = [&] { decode->feed(q.annexB, q.info, q.key, output, drop); };
+                if (decode) { feed(); continue; }
+                if (!q.key) { drop(q.info); continue; }
+                try {
+                    decode = std::make_unique<Decoder>(render.device.Get(), true);
+                    feed();
+                } catch (const std::runtime_error&) {
+                    // DXVA can reject oversized surfaces only once the first input type is set.
+                    // Don't retry a frame that has already reached the renderer.
+                    if (outputStarted || (currentWidth <= 4096 && currentHeight <= 4096)) throw;
+                    decode.reset();
+                    decode = std::make_unique<Decoder>(render.device.Get(), false);
+                    feed();
+                }
             }
         } catch (const std::exception& e) { report(e.what()); }
     }
@@ -437,6 +539,7 @@ class Client {
             report("the hidden swap chain did not present any frames");
     }
     void stop() {
+        removeClipboardListener();
         {
             std::lock_guard lock(videoLock);
             if (stopping.exchange(true)) return;
@@ -482,6 +585,7 @@ class Client {
         case msgDevices: choose(); return 0;
         case msgConnected:
             if (!disconnected) {
+                if (clipboardEnabled()) clipboardListening = AddClipboardFormatListener(wnd) != FALSE;
                 connectedAt = prevTitle = Clock::now();
                 require(SetTimer(wnd, statusTimer, config.smoke ? 50 : 1000, nullptr) != 0, "could not start session timer");
                 if (!config.smoke) { shown = true; ShowWindow(wnd, SW_SHOW); UpdateWindow(wnd); }
@@ -489,6 +593,9 @@ class Client {
             return 0;
         case msgEnded: ended(); return 0;
         case msgCursor: changeCursor(); return 0;
+        case msgClipboard: applyClipboard(); return 0;
+        case WM_CLIPBOARDUPDATE: sendClipboard(); return 0;
+        case WM_DESTROY: removeClipboardListener(); break;
         case WM_TIMER: if (w == statusTimer && !disconnected) tick(); return 0;
         case WM_SETCURSOR: if (LOWORD(l) == HTCLIENT) { applyCursor(); return TRUE; } break;
         case WM_ERASEBKGND: return TRUE;
