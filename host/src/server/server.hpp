@@ -59,6 +59,9 @@ struct Server {
     std::optional<CursorImage> pending_cursor;
     bool last_write_cursor = false;
     bool clipboard_notices = false, clipboard_pending = false;
+    /// SL1 messages waiting for the first frame to go out: the monitor list (Type 17) and desktop clipboard text (Type 19).
+    std::optional<std::vector<MonitorInfo>> monitors_pending;
+    std::optional<std::string> clipboard_data_pending;
     size_t buffered_stream_bytes = 0;
     uint32_t stream_notsent_lowat = 0;
     uint64_t flow_timer_due_us = 0;
@@ -88,6 +91,8 @@ struct Server {
   lws* screenshot_client = nullptr;
   ClipboardWorker clipboard;
   std::atomic<bool> clipboard_changed{false};
+  /// The text a viewer wrote last, so the desktop's change notice for that write is not sent back.
+  EchoGuard echo;
   bool control_ready = false;
   uint32_t control_generation = 0;
   std::vector<uint8_t> control_received;
@@ -111,6 +116,14 @@ struct Server {
   void evict(lws* wsi, uint16_t code = close_taken, const char* reason = "taken");
   bool holdsInput() const { return control || input_viewer; }
   bool streamMessage(Stream& stream);
+  /// Every display the backend reports; empty when it cannot list them.
+  std::vector<MonitorInfo> monitorSnapshot();
+  /// Queues a Type 17 MonitorList with the current layout for every open stream.
+  void queueMonitorList();
+  /// Handles a Type 18 SelectMonitor from stream: only the viewer that owns input switches the display, for all streams.
+  void selectMonitor(Stream& stream, const std::string& id);
+  /// Routes the replies of SL1 clipboard requests that the ClipboardWorker finished.
+  void clipboardFinished(const ClipboardWorker::Reply& reply);
   bool controlMessage();
   std::string metrics();
   /// Holds the HTTP response until the backend applied or dropped the batch; posted counts records that reached it.

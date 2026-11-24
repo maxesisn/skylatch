@@ -138,6 +138,7 @@ void Connection::initialize() {
   output = outputInfo_->proxy;
   width = outputInfo_->width;
   height = outputInfo_->height;
+  outputName = outputInfo_->name;
   wl_registry_destroy(registry_);
   registry_ = nullptr;
 }
@@ -162,5 +163,22 @@ void Connection::cleanup() {
 bool initializeNativeBackend(const std::string& output, unsigned, const BackendOptions&) {
   selectedOutputName = output;
   return true;
+}
+
+std::vector<MonitorInfo> listMonitors() {
+  Connection connection;
+  MonitorInfo monitor;
+  monitor.id = connection.outputName.empty() ? "wayland-output" : connection.outputName;
+  monitor.name = monitor.id;
+  monitor.width = uint16_t(std::clamp(connection.width, 0, 65535));
+  monitor.height = uint16_t(std::clamp(connection.height, 0, 65535));
+  monitor.primary = true;
+  monitor.active = true;
+  return {monitor};
+}
+
+bool selectMonitor(const std::string& id) {
+  const auto monitors = listMonitors();
+  return !monitors.empty() && monitors[0].id == id;
 }
 }

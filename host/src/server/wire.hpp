@@ -3,6 +3,7 @@
 #include "core/capture.hpp"
 #include "core/clipboard.hpp"
 #include "core/input.hpp"
+#include "core/monitor.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -20,6 +21,8 @@ unsigned inputLength(const std::string& text, uint64_t& length);
 unsigned clipboardLength(const std::string& text, uint64_t& length);
 /** True for UTF-8 text without NUL, the only text the clipboard accepts. */
 bool validText(const std::string& text);
+/** True for well-formed UTF-8, NUL included; the check SL1 applies to its text payloads. */
+bool validUtf8(const std::string& text);
 /** A JSON string literal for text, with invalid UTF-8 replaced by U+FFFD. */
 std::string jsonString(const std::string& text);
 /** The WebSocket a request target opens. */
@@ -51,5 +54,27 @@ bool cursorMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, c
 void controlReady(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint16_t width, uint16_t height);
 /** Tells a controlling /stream viewer that the desktop clipboard changed; it reads the text from /clipboard. */
 void clipboardNotice(std::vector<uint8_t>& out, size_t pre, uint32_t generation);
+/// SL1 limits on the payload bytes of Types 17 to 19, as in docs/PROTOCOL.md.
+constexpr size_t max_monitor_list_bytes = 64 * 1024;
+constexpr size_t max_monitor_id_bytes = 256;
+constexpr size_t max_clipboard_data_bytes = 1024 * 1024;
+constexpr size_t nsl1_header_bytes = 20;
+/**
+ * The JSON array of MonitorInfo objects as Type 17 carries it: members in the order id, name, x, y, width, height,
+ * primary, active, without whitespace. Trailing monitors are left out when the array would pass max_monitor_list_bytes.
+ */
+std::string monitorListJson(const std::vector<MonitorInfo>& monitors);
+/** Type 17 MonitorList, host to viewer. */
+void monitorListMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::vector<MonitorInfo>& monitors);
+/** Type 18 SelectMonitor, viewer to host; false when id is empty, longer than max_monitor_id_bytes or not UTF-8. */
+bool selectMonitorMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::string& id);
+/** Type 19 ClipboardData in either direction; false when text is longer than max_clipboard_data_bytes or not UTF-8. */
+bool clipboardDataMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::string& text);
+/** Reads a SelectMonitor payload; false when it is empty, too long or not UTF-8. */
+bool selectMonitorId(const uint8_t* payload, size_t size, std::string& id);
+/** Reads a ClipboardData payload; false when it is too long or not UTF-8. */
+bool clipboardDataText(const uint8_t* payload, size_t size, std::string& text);
+/** The largest total size, header included, a received viewer message may reach, judged from the type byte once it is known. */
+size_t maxViewerMessage(const std::vector<uint8_t>& received);
 void inputReply(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, InputStatus status);
 }  // namespace relay

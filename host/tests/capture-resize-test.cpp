@@ -215,13 +215,59 @@ static void growthRespectsMaxDimension() {
   }
 }
 
+/// Switching to another display builds a fresh source: one IDR at the new size, same generation, sequence continues.
+static void reopenSwitchesDisplay() {
+  auto first = std::make_shared<Display>(640, 480), second = std::make_shared<Display>(960, 540);
+  std::atomic<int> chosen{0};
+  std::atomic<bool> available{true};
+  Frames frames;
+  relay::CaptureEncoder encoder([&](relay::EncodedFrame&& f) { return frames.publish(std::move(f)); }, settings,
+                                [&] {
+                                  if (!available) throw std::runtime_error("display unavailable");
+                                  return std::make_unique<ResizableSource>(chosen == 0 ? first : second);
+                                });
+  std::string error;
+  require(encoder.start(error), error.c_str());
+  encoder.beginSession(8);
+  requireIdr(frames.at(0), 8, 1, 640, 480, "first display IDR");
+  encoder.acknowledge(8, 1);
+
+  chosen = 1;
+  encoder.reopenSource();
+  requireIdr(frames.at(1), 8, 2, 960, 540, "switching display must emit an IDR at the new display size");
+  require(encoder.dimensions() == std::make_pair(960, 540), "dimensions() must report the new display");
+  encoder.acknowledge(8, 2);
+  second->repaint(77);
+  const auto delta = frames.at(2);
+  require(delta.sequence == 3 && delta.width == 960 && !delta.keyframe, "the new source keeps streaming deltas");
+  encoder.acknowledge(8, 3);
+
+  // A display of the same size still restarts the picture with an IDR.
+  auto twin = std::make_shared<Display>(960, 540);
+  first = twin; chosen = 0;
+  encoder.reopenSource();
+  requireIdr(frames.at(3), 8, 4, 960, 540, "same-size switch must still emit an IDR");
+  encoder.acknowledge(8, 4);
+
+  // A display that cannot be opened leaves the previous source streaming.
+  available = false; chosen = 1;
+  encoder.reopenSource();
+  std::this_thread::sleep_for(200ms);
+  require(encoder.error().empty() && encoder.dimensions() == std::make_pair(960, 540), "failed reopen keeps the old source");
+  twin->repaint(5);
+  const auto kept = frames.at(4);
+  require(kept.sequence == 5 && kept.width == 960 && !kept.keyframe, "old source still streams after a failed reopen");
+  encoder.stop();
+}
+
 int main() {
   try {
     resizeKeepsSession();
     resizeThenNewGeneration();
     resizeWhileIdle();
     growthRespectsMaxDimension();
-    std::puts("capture resize: IDR at new size, monotonic sequence, same generation, idle resize, max dimension passed");
+    reopenSwitchesDisplay();
+    std::puts("capture resize: IDR at new size, monotonic sequence, same generation, idle resize, max dimension passed, display switch");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "capture resize: %s\n", error.what());

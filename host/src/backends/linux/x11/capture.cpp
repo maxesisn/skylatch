@@ -1,4 +1,5 @@
 #include "core/backend-options.hpp"
+#include "backends/linux/x11/monitors.hpp"
 #include "core/capture-source.hpp"
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -37,6 +38,8 @@ class X11CaptureSource final : public CaptureSource {
   int damage_event = 0;
   int cursor_event = 0;
   int width = 0, height = 0;
+  /// Top-left of the streamed region in root window coordinates; zero when the whole screen is streamed.
+  int origin_x = 0, origin_y = 0;
   bool cursor_dirty = true;
  public:
   X11CaptureSource() { shm.shmid = -1; shm.shmaddr = reinterpret_cast<char*>(-1); }
@@ -59,7 +62,8 @@ class X11CaptureSource final : public CaptureSource {
             XFixesQueryVersion(display, &major, &minor) && major >= 1, "XFixes cursor tracking unavailable");
     require(XShmQueryExtension(display), "MIT-SHM unavailable");
     const int screen = DefaultScreen(display);
-    width = DisplayWidth(display, screen); height = DisplayHeight(display, screen);
+    const x11::ScreenRegion region = x11::streamedRegion(DisplayWidth(display, screen), DisplayHeight(display, screen));
+    origin_x = region.x; origin_y = region.y; width = region.width; height = region.height;
     image = XShmCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
                             ZPixmap, nullptr, &shm, width, height);
     require(image && image->bytes_per_line >= width * 4 && image->bytes_per_line <= width * 8 &&
@@ -94,11 +98,22 @@ class X11CaptureSource final : public CaptureSource {
   int fd() const override { return ConnectionNumber(display); }
   std::pair<int, int> dimensions() const override { return {width, height}; }
   bool drainDamage() override {
-    bool dirty = false;
+    bool dirty = false, stray = false;
     while (XPending(display)) {
       XEvent event; XNextEvent(display, &event);
-      if (event.type == damage_event + XDamageNotify) dirty = true;
+      if (event.type == damage_event + XDamageNotify) {
+        const auto& area = reinterpret_cast<XDamageNotifyEvent&>(event).area;
+        const bool inside = area.x < origin_x + width && area.x + int(area.width) > origin_x &&
+                            area.y < origin_y + height && area.y + int(area.height) > origin_y;
+        (inside ? dirty : stray) = true;
+      }
       if (event.type == cursor_event + XFixesCursorNotify) cursor_dirty = true;
+    }
+    if (stray && !dirty) {
+      // Only another output changed. The notice must still be subtracted or none would follow, and a part of the
+      // damage that landed inside the region meanwhile is kept.
+      collectDamage();
+      dirty = rects_valid && !rects.empty();
     }
     return dirty;
   }
@@ -141,15 +156,20 @@ class X11CaptureSource final : public CaptureSource {
     int count = 0;
     std::unique_ptr<XRectangle, decltype(&XFree)> fetched(XFixesFetchRegion(display, parts, &count), &XFree);
     if (fetched && count > 0) {
-      for (int i = 0; i < count; ++i)
-        rects.push_back({fetched.get()[i].x, fetched.get()[i].y, fetched.get()[i].width, fetched.get()[i].height});
+      for (int i = 0; i < count; ++i) {
+        // Root coordinates to region coordinates, clipped to the region.
+        const int x0 = std::max(fetched.get()[i].x - origin_x, 0), y0 = std::max(fetched.get()[i].y - origin_y, 0);
+        const int x1 = std::min(fetched.get()[i].x - origin_x + int(fetched.get()[i].width), width);
+        const int y1 = std::min(fetched.get()[i].y - origin_y + int(fetched.get()[i].height), height);
+        if (x1 > x0 && y1 > y0) rects.push_back({x0, y0, x1 - x0, y1 - y0});
+      }
       rects_valid = true;
     }
   }
   FrameView grab(int x, int y, int width, int height) {
     const Window root = RootWindow(display, DefaultScreen(display));
     if (x == 0 && y == 0 && width == image->width && height == image->height) {
-      require(XShmGetImage(display, root, image, 0, 0, AllPlanes), "XShmGetImage failed");
+      require(XShmGetImage(display, root, image, origin_x, origin_y, AllPlanes), "XShmGetImage failed");
       return {reinterpret_cast<const uint8_t*>(image->data), image->bytes_per_line,
               image->width, image->height, pixelFormat(), 0, 0};
     }
@@ -159,7 +179,7 @@ class X11CaptureSource final : public CaptureSource {
     require(scratch, "creating sub-rect X image failed");
     scratch->data = shm.shmaddr;
     require(scratch->bytes_per_line == width * 4, "unexpected sub-rect X image stride");
-    const bool ok = XShmGetImage(display, root, scratch, x, y, AllPlanes);
+    const bool ok = XShmGetImage(display, root, scratch, origin_x + x, origin_y + y, AllPlanes);
     FrameView view{reinterpret_cast<const uint8_t*>(scratch->data), scratch->bytes_per_line,
                    width, height, pixelFormat(), x, y};
     scratch->data = nullptr;
@@ -173,6 +193,9 @@ class X11CaptureSource final : public CaptureSource {
   }
   FrameView captureChanged(bool full) override {
     collectDamage();
+    // Damage that was all on other outputs leaves nothing to convert; a tiny view stands in for the frame.
+    if (!full && rects_valid && rects.empty() && pixelFormat() != PixelFormat::ARGB && image->width >= 16 && image->height >= 16)
+      return grab(0, 0, 16, 16);
     if (full || !rects_valid || rects.empty() || pixelFormat() == PixelFormat::ARGB)
       return grab(0, 0, image->width, image->height);
     int x0 = image->width, y0 = image->height, x1 = 0, y1 = 0;

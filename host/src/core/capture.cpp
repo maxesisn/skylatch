@@ -20,6 +20,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace relay {
 namespace {
@@ -242,7 +243,7 @@ struct CaptureEncoder::Impl {
   uint64_t bitrate = settings.start_bitrate, admit_until_us = 0;
   bool paused = false;
   uint64_t revision = 0;
-  bool active = false;
+  bool active = false, reopen = false;
   int stream_width = 0, stream_height = 0;
   CaptureStats counters;
   void wake() { wake_event.signal(); }
@@ -251,7 +252,7 @@ struct CaptureEncoder::Impl {
       auto source = source_factory();
       require(bool(source), "capture source factory returned null");
       require(validWaitHandle(source->fd()), "invalid capture source fd");
-      const auto format = source->pixelFormat();
+      auto format = source->pixelFormat();
       require(format == PixelFormat::BGRA || format == PixelFormat::ARGB, "unsupported capture pixel format");
       SurfacePlan plan;
       const auto fit = [&] {
@@ -319,7 +320,38 @@ struct CaptureEncoder::Impl {
         reset_refinement();
         return true;
       };
+      // Replaces the source with a fresh one from the factory, e.g. after the backend switched displays.
+      const auto reopen_source = [&] {
+        auto next = source_factory();
+        require(bool(next), "capture source factory returned null");
+        require(validWaitHandle(next->fd()), "invalid capture source fd");
+        const auto next_format = next->pixelFormat();
+        require(next_format == PixelFormat::BGRA || next_format == PixelFormat::ARGB, "unsupported capture pixel format");
+        SurfacePlan next_plan;
+        next = fitCaptureSourceToBudget(std::move(next), settings.fps, &next_plan, settings.max_dimension);
+        const auto size = next->dimensions();
+        requireSurfaceSize(size.first, size.second);
+        auto next_resources = std::make_unique<Resources>(next_format, size.first, size.second, settings);
+        next_resources->init();
+        std::fprintf(stderr, "capture: source reopened at %dx%d\n", size.first, size.second);
+        source = std::move(next);
+        plan = next_plan;
+        format = next_format;
+        resources = std::move(next_resources);
+        r = resources.get();
+        width = size.first; height = size.second;
+        { std::lock_guard<std::mutex> lock(mutex);
+          stream_width = width; stream_height = height; counters.cursor_supported = source->cursorSupported(); }
+        dirty = true; force_idr = true;
+        reset_refinement();
+      };
       while (true) {
+        bool reopen_now = false;
+        { std::lock_guard<std::mutex> lock(mutex); reopen_now = std::exchange(reopen, false); }
+        if (reopen_now) {
+          try { reopen_source(); }
+          catch (const std::exception& error) { std::fprintf(stderr, "capture: reopening the source failed: %s\n", error.what()); }
+        }
         if (source->drainDamage()) dirty = true;
         try { follow_size(); }
         catch (const std::exception& error) { std::fprintf(stderr, "capture: resize failed: %s\n", error.what()); }
@@ -571,6 +603,12 @@ void CaptureEncoder::acknowledge(uint32_t generation, uint32_t sequence) {
   std::lock_guard<std::mutex> lock(i.mutex);
   if (!generation || generation != i.generation || sequence != i.acknowledged + 1 || sequence > i.sequence) return;
   i.acknowledged = sequence;
+  i.wake();
+}
+void CaptureEncoder::reopenSource() {
+  auto& i = *impl_;
+  std::lock_guard<std::mutex> lock(i.mutex);
+  i.reopen = true;
   i.wake();
 }
 void CaptureEncoder::setFlowControl(uint32_t generation, unsigned window, uint64_t bitrate, bool paused, uint64_t admit_until_us) {

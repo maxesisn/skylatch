@@ -50,14 +50,15 @@ size_t utf8Length(const std::string& text, size_t i) {
   return count;
 }
 }  // namespace
-bool validText(const std::string& text) {
+bool validUtf8(const std::string& text) {
   for (size_t i = 0; i < text.size();) {
     const size_t count = utf8Length(text, i);
-    if (!count || !text[i]) return false;
+    if (!count) return false;
     i += count;
   }
   return true;
 }
+bool validText(const std::string& text) { return validUtf8(text) && text.find('\0') == std::string::npos; }
 std::string jsonString(const std::string& text) {
   static const char digits[] = "0123456789abcdef";
   std::string out = "\"";
@@ -128,6 +129,61 @@ void controlReady(std::vector<uint8_t>& out, size_t pre, uint32_t generation, ui
   put(p+16, 4, 4); put(p+20, width, 2); put(p+22, height, 2);
 }
 void clipboardNotice(std::vector<uint8_t>& out, size_t pre, uint32_t generation) { start(out, pre, 20, 7, generation); }
+std::string monitorListJson(const std::vector<MonitorInfo>& monitors) {
+  std::string json = "[";
+  for (const auto& m : monitors) {
+    const std::string entry = "{\"id\":" + jsonString(m.id) + ",\"name\":" + jsonString(m.name) +
+        ",\"x\":" + std::to_string(m.x) + ",\"y\":" + std::to_string(m.y) +
+        ",\"width\":" + std::to_string(m.width) + ",\"height\":" + std::to_string(m.height) +
+        ",\"primary\":" + (m.primary ? "true" : "false") + ",\"active\":" + (m.active ? "true" : "false") + "}";
+    const bool first = json.size() == 1;
+    if (json.size() + (first ? 0 : 1) + entry.size() + 1 > max_monitor_list_bytes) break;
+    if (!first) json += ',';
+    json += entry;
+  }
+  return json + ']';
+}
+void monitorListMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::vector<MonitorInfo>& monitors) {
+  const std::string json = monitorListJson(monitors);
+  auto* p = start(out, pre, nsl1_header_bytes + json.size(), 17, generation);
+  put(p+16, json.size(), 4);
+  std::memcpy(p+nsl1_header_bytes, json.data(), json.size());
+}
+bool selectMonitorMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::string& id) {
+  if (id.empty() || id.size() > max_monitor_id_bytes || !validUtf8(id)) return false;
+  auto* p = start(out, pre, nsl1_header_bytes + id.size(), 18, generation);
+  put(p+16, id.size(), 4);
+  std::memcpy(p+nsl1_header_bytes, id.data(), id.size());
+  return true;
+}
+bool clipboardDataMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, const std::string& text) {
+  if (text.size() > max_clipboard_data_bytes || !validUtf8(text)) return false;
+  auto* p = start(out, pre, nsl1_header_bytes + text.size(), 19, generation);
+  put(p+16, text.size(), 4);
+  if (!text.empty()) std::memcpy(p+nsl1_header_bytes, text.data(), text.size());
+  return true;
+}
+bool selectMonitorId(const uint8_t* payload, size_t size, std::string& id) {
+  if (!size || size > max_monitor_id_bytes) return false;
+  std::string text(reinterpret_cast<const char*>(payload), size);
+  if (!validUtf8(text)) return false;
+  id = std::move(text);
+  return true;
+}
+bool clipboardDataText(const uint8_t* payload, size_t size, std::string& text) {
+  if (size > max_clipboard_data_bytes) return false;
+  std::string value(reinterpret_cast<const char*>(payload), size);
+  if (!validUtf8(value)) return false;
+  text = std::move(value);
+  return true;
+}
+size_t maxViewerMessage(const std::vector<uint8_t>& received) {
+  if (received.size() > 5) {
+    if (received[5] == 18) return nsl1_header_bytes + max_monitor_id_bytes;
+    if (received[5] == 19) return nsl1_header_bytes + max_clipboard_data_bytes;
+  }
+  return 36;
+}
 void inputReply(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, InputStatus status) {
   auto* p = start(out, pre, 21, 5, generation);
   put(p+12, sequence, 4); put(p+16, 1, 4);

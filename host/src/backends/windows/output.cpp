@@ -1,15 +1,20 @@
 #include "backends/windows/output.hpp"
 #include "core/capture-source.hpp"
 #include "core/surface-budget.hpp"
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace relay {
 namespace windows {
 namespace {
 std::string chosen;
+std::mutex chosen_mutex;
+std::atomic<unsigned> selection_revision{0};
 unsigned target_fps = 60;
 int max_dimension = SurfaceBudget::default_max_dimension;
 CaptureMode capture_mode = CaptureMode::automatic;
@@ -18,16 +23,30 @@ std::string narrow(const wchar_t* text) {
   for (; *text; ++text) out += *text < 128 ? char(*text) : '?';
   return out;
 }
+std::string currentChoice() {
+  std::lock_guard<std::mutex> lock(chosen_mutex);
+  return chosen;
+}
+std::string utf8(const wchar_t* text) {
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 1) return {};
+  std::string out(size_t(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
+  out.pop_back();
+  return out;
+}
 struct MonitorEntry {
   GdiMonitor monitor;
   bool primary;
+  /// The GDI device name as the wide string Windows reported, for EnumDisplayDevicesW.
+  std::wstring device;
 };
 BOOL CALLBACK collectMonitor(HMONITOR handle, HDC, LPRECT, LPARAM list) {
   MONITORINFOEXW info{};
   info.cbSize = sizeof(info);
   if (GetMonitorInfoW(handle, &info))
     reinterpret_cast<std::vector<MonitorEntry>*>(list)->push_back(
-        {{info.rcMonitor, narrow(info.szDevice)}, (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+        {{info.rcMonitor, narrow(info.szDevice)}, (info.dwFlags & MONITORINFOF_PRIMARY) != 0, info.szDevice});
   return TRUE;
 }
 }
@@ -44,6 +63,7 @@ void check(HRESULT result, const char* action) {
   throw std::runtime_error(std::string(action) + " failed (" + code + ")");
 }
 Output findOutput() {
+  const std::string chosen = currentChoice();
   Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
   check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "creating the DXGI factory");
   std::string names;
@@ -70,6 +90,7 @@ Output findOutput() {
                                           : "Display " + chosen + " not found; attached displays: " + names);
 }
 GdiMonitor findGdiMonitor() {
+  const std::string chosen = currentChoice();
   std::vector<MonitorEntry> monitors;
   EnumDisplayMonitors(nullptr, nullptr, collectMonitor, reinterpret_cast<LPARAM>(&monitors));
   std::string names;
@@ -98,11 +119,51 @@ Geometry findGeometry() {
   geometry.bounds = findGdiMonitor().bounds;
   return geometry;
 }
+unsigned selectionRevision() { return selection_revision.load(); }
+std::vector<MonitorInfo> listMonitors() {
+  std::vector<MonitorEntry> entries;
+  EnumDisplayMonitors(nullptr, nullptr, collectMonitor, reinterpret_cast<LPARAM>(&entries));
+  const std::string choice = currentChoice();
+  std::vector<MonitorInfo> monitors;
+  for (const auto& entry : entries) {
+    MonitorInfo monitor;
+    monitor.id = entry.monitor.name;
+    monitor.name = entry.monitor.name;
+    DISPLAY_DEVICEW device{};
+    device.cb = sizeof(device);
+    if (EnumDisplayDevicesW(entry.device.c_str(), 0, &device, 0)) {
+      const std::string friendly = utf8(device.DeviceString);
+      if (!friendly.empty()) monitor.name = friendly;
+    }
+    monitor.x = int32_t(entry.monitor.bounds.left); monitor.y = int32_t(entry.monitor.bounds.top);
+    monitor.width = uint16_t(std::clamp<long>(entry.monitor.bounds.right - entry.monitor.bounds.left, 0, 65535));
+    monitor.height = uint16_t(std::clamp<long>(entry.monitor.bounds.bottom - entry.monitor.bounds.top, 0, 65535));
+    monitor.primary = entry.primary;
+    monitor.active = choice.empty() ? entry.primary : entry.monitor.name == choice;
+    monitors.push_back(std::move(monitor));
+  }
+  return monitors;
+}
+bool selectMonitor(const std::string& id) {
+  std::vector<MonitorEntry> entries;
+  EnumDisplayMonitors(nullptr, nullptr, collectMonitor, reinterpret_cast<LPARAM>(&entries));
+  const auto found = std::find_if(entries.begin(), entries.end(), [&](const MonitorEntry& e) { return e.monitor.name == id; });
+  if (found == entries.end()) return false;
+  Geometry geometry;
+  geometry.bounds = found->monitor.bounds;
+  try {
+    const auto size = geometry.streamSize();
+    requireSurfaceSize(size.first, size.second);
+  } catch (const std::exception&) { return false; }
+  std::lock_guard<std::mutex> lock(chosen_mutex);
+  if (chosen != id) { chosen = id; ++selection_revision; }
+  return true;
+}
 bool initializeNativeBackend(const std::string& output, unsigned fps, const BackendOptions& options) {
   static std::once_flag once;
   static bool initialized = false;
   std::call_once(once, [&] {
-    chosen = output;
+    { std::lock_guard<std::mutex> lock(chosen_mutex); chosen = output; }
     target_fps = fps ? fps : 60u;
     max_dimension = options.max_dimension;
     capture_mode = options.capture;
