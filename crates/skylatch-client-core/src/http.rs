@@ -11,6 +11,23 @@ use skylatch_proto::onboarding::{
 use std::sync::OnceLock;
 use std::time::Duration;
 
+fn http_runtime() -> Result<&'static tokio::runtime::Runtime, ClientError> {
+    // Keep reqwest's connection pool on one dedicated, always-active reactor so a pooled
+    // keep-alive socket is never parked on a caller's blocked or dropped current_thread runtime.
+    static HTTP_RT: OnceLock<Result<tokio::runtime::Runtime, ()>> = OnceLock::new();
+    HTTP_RT
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("skylatch-http")
+                .enable_all()
+                .build()
+                .map_err(|_| ())
+        })
+        .as_ref()
+        .map_err(|_| ClientError::Unexpected("cannot initialize hub HTTP runtime"))
+}
+
 fn client() -> Result<&'static Client, ClientError> {
     static CLIENT: OnceLock<Result<Client, ()>> = OnceLock::new();
     CLIENT
@@ -44,33 +61,40 @@ fn post(hub_url: &str, route: &str) -> Result<RequestBuilder, ClientError> {
     Ok(client()?.post(endpoint(hub_url, route)?))
 }
 
-async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, ClientError> {
-    let response = request.send().await.map_err(|error| {
-        if error.is_timeout() {
-            ClientError::Timeout("hub HTTP request")
-        } else {
-            ClientError::Unexpected("could not reach hub HTTP endpoint")
-        }
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = match status.as_u16() {
-            400 | 422 => "invalid request",
-            401 => "invalid or expired credentials",
-            404 => "endpoint or device not found",
-            409 => "device already enrolled; revoke its token first",
-            429 => "too many attempts; try again shortly",
-            _ => "request failed",
-        };
-        return Err(ClientError::Hub {
-            code: status.as_u16().to_string(),
-            message: message.into(),
-        });
-    }
-    response
-        .json()
+async fn send<T: DeserializeOwned + Send + 'static>(
+    request: RequestBuilder,
+) -> Result<T, ClientError> {
+    http_runtime()?
+        .spawn(async move {
+            let response = request.send().await.map_err(|error| {
+                if error.is_timeout() {
+                    ClientError::Timeout("hub HTTP request")
+                } else {
+                    ClientError::Unexpected("could not reach hub HTTP endpoint")
+                }
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let message = match status.as_u16() {
+                    400 | 422 => "invalid request",
+                    401 => "invalid or expired credentials",
+                    404 => "endpoint or device not found",
+                    409 => "device already enrolled; revoke its token first",
+                    429 => "too many attempts; try again shortly",
+                    _ => "request failed",
+                };
+                return Err(ClientError::Hub {
+                    code: status.as_u16().to_string(),
+                    message: message.into(),
+                });
+            }
+            response
+                .json()
+                .await
+                .map_err(|_| ClientError::Unexpected("invalid hub HTTP response"))
+        })
         .await
-        .map_err(|_| ClientError::Unexpected("invalid hub HTTP response"))
+        .map_err(|_| ClientError::Unexpected("hub HTTP request task aborted"))?
 }
 
 /// Sign in with a password and receive the account's client-session token.

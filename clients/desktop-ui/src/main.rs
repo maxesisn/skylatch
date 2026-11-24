@@ -1334,26 +1334,31 @@ impl Proto {
         self.ensure_pump(cx);
     }
 
-    /// Starts the 250 ms loop that applies finished background work (device lists, sign-in,
-    /// pairing codes) to the view. Headless tests call [`Proto::pump_live`] and
-    /// [`Proto::pump_tasks`] by hand instead.
+    /// Starts the loop that applies finished background work (device lists, sign-in, pairing
+    /// codes, layout saves) to the view. Polls faster while an interactive request is in flight.
+    /// Headless tests call [`Proto::pump_live`] and [`Proto::pump_tasks`] by hand instead.
     fn ensure_pump(&mut self, cx: &mut Context<Self>) {
         if self.pump_enabled && !self.pump_running {
             self.pump_running = true;
             cx.spawn(async move |this, cx| {
+                let mut fast = false;
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(250))
-                        .await;
-                    if this
-                        .update(cx, |this, cx| {
-                            this.pump_live(cx);
-                            this.pump_tasks(cx);
-                        })
-                        .is_err()
-                    {
+                    let wait = if fast {
+                        Duration::from_millis(30)
+                    } else {
+                        Duration::from_millis(250)
+                    };
+                    cx.background_executor().timer(wait).await;
+                    let Ok(busy) = this.update(cx, |this, cx| {
+                        this.pump_live(cx);
+                        this.pump_tasks(cx);
+                        this.onb.login.is_some()
+                            || this.pair.pending.is_some()
+                            || this.save.inflight.is_some()
+                    }) else {
                         break;
-                    }
+                    };
+                    fast = busy;
                 }
             })
             .detach();
