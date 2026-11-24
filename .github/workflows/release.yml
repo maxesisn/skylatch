@@ -1,0 +1,239 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 1.2.3 or 1.2.3-rc.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+    steps:
+      - id: metadata
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            requested="$GITHUB_REF_NAME"
+          else
+            requested="$INPUT_VERSION"
+          fi
+          version=${requested#v}
+          number='(0|[1-9][0-9]*)'
+          if [[ ! $version =~ ^$number\.$number\.$number(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo 'Expected a version like 1.2.3 or 1.2.3-rc.1.' >&2
+            exit 1
+          fi
+          prerelease=false
+          if [[ $version == *-* ]]; then prerelease=true; fi
+          printf 'version=%s\ntag=v%s\nprerelease=%s\n' "$version" "$version" "$prerelease" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Keep shell scripts in LF format for MSYS2
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            clients/desktop-ui -> target
+      - name: Build Rust components and desktop launcher
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p skylatch-client-core -p skylatch-agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sdkBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $fxc = Get-ChildItem -Path "$sdkBin\*\x64\fxc.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK shader compiler (fxc.exe) not found.' }
+          $env:GPUI_FXC_PATH = $fxc.FullName
+          cargo build --release --manifest-path clients/desktop-ui/Cargo.toml
+      - name: Build Win32 client
+        shell: cmd
+        run: clients\windows\build.bat --skip-rust
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-libwebsockets
+            mingw-w64-x86_64-zlib
+      - name: Build Win32 host and stage its runtime DLLs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          make -C host
+          bash packaging/windows/stage-runtime.sh host/skylatch-host-engine.exe build/windows/runtime
+          cp host/skylatch-host-engine.exe build/windows/
+      - name: Stage portable bundle and install Inno Setup
+        shell: pwsh
+        run: |
+          $stage = 'build/windows'
+          Copy-Item clients/desktop-ui/target/release/skylatch-ui.exe, target/release/skylatch-agent.exe,
+            clients/windows/skylatch-client.exe, target/release/skylatch_client_core.dll -Destination $stage
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $portable = 'build/Skylatch'
+          New-Item -ItemType Directory -Force $portable | Out-Null
+          Copy-Item "$stage/*.exe", "$stage/*.dll", assets/icon/skylatch.ico,
+            LICENSE-APACHE, LICENSE-GPL-3.0, NOTICE -Destination $portable
+          Get-ChildItem "$stage/runtime" -Filter '*.dll' | Copy-Item -Destination $portable
+          Compress-Archive -Path $portable -DestinationPath "dist/Skylatch-$env:VERSION-windows-x64-portable.zip"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc) -and -not (Get-Command iscc.exe -ErrorAction SilentlyContinue)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Build setup executable
+        shell: cmd
+        run: packaging\windows\build-installer.bat build\windows dist "%VERSION%" "Skylatch-%VERSION%-windows-x64-setup"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: '12.3'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            clients/desktop-ui -> target
+      - name: Build and package Skylatch for Apple silicon
+        run: |
+          test "$(uname -m)" = arm64
+          brew install pkgconf x264 libwebsockets openssl
+          openssl_prefix=$(brew --prefix openssl)
+          export PKG_CONFIG_PATH="$openssl_prefix/lib/pkgconfig"
+          cargo build --locked --release -p skylatch-client-core -p skylatch-agent
+          cargo build --release --manifest-path clients/desktop-ui/Cargo.toml
+          clients/macos/build.sh --skip-rust
+          make -C host
+          mkdir -p build/macos
+          cp clients/desktop-ui/target/release/skylatch-ui target/release/skylatch-agent \
+            clients/macos/skylatch-client host/skylatch-host-engine build/macos/
+          packaging/macos/make-dmg.sh "$VERSION" arm64 build/macos dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config musl-tools dpkg-dev \
+            libx264-dev libwebsockets-dev zlib1g-dev \
+            libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxrandr-dev libxtst-dev \
+            libsdl2-dev libavcodec-dev libavutil-dev libjson-c-dev
+      - name: Build native client and host packages
+        run: |
+          cargo build --locked --release -p skylatch-client-core -p skylatch-agent
+          clients/linux/build.sh --skip-rust
+          make -C host
+          mkdir -p build/linux
+          cp clients/linux/skylatch-client target/release/skylatch-agent host/skylatch-host-engine build/linux/
+          packaging/linux/make-deb.sh "$VERSION" build/linux dist
+      - name: Build static hub archive
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --locked --release -p skylatch-hub --target x86_64-unknown-linux-musl
+          hub=target/x86_64-unknown-linux-musl/release/skylatch-hub
+          headers=$(readelf -l "$hub")
+          if [[ $headers == *INTERP* ]]; then
+            echo 'Expected a static musl executable.' >&2
+            exit 1
+          fi
+          mkdir -p build/hub
+          cp "$hub" LICENSE-APACHE NOTICE build/hub/
+          tar -czf "dist/skylatch-hub-$VERSION-linux-x86_64-musl.tar.gz" -C build/hub .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.version.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify the release tag matches the built commit
+        id: commit
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          commit=$(git rev-parse "HEAD^{commit}")
+          refs=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          existing=$(awk 'NF { if ($2 ~ /\^\{\}$/) { print $1; found=1; exit } plain=$1 } END { if (!found) print plain }' <<< "$refs")
+          if [[ -n $existing && $existing != "$commit" ]]; then
+            echo 'This release tag points to a different commit.' >&2
+            exit 1
+          fi
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum -- *.exe *.zip *.dmg *.deb *.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ steps.commit.outputs.sha }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*

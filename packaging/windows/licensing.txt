@@ -1,0 +1,8 @@
+Skylatch licensing
+
+The Skylatch launcher, native client, client core, and agent are licensed under
+Apache License 2.0. The separately executed host engine is licensed under GNU
+General Public License version 3 and uses the GPL-licensed x264 library.
+
+The installer includes LICENSE-APACHE, LICENSE-GPL-3.0, and NOTICE. See the
+matching release at https://github.com/maxesisn/skylatch/releases for source.

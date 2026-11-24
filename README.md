@@ -52,6 +52,20 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Wire formats: [docs/PROTO
 | macOS client | `clients/macos` | Swift, Metal, VideoToolbox | Apache-2.0 | planned |
 | Linux client | `clients/linux` | GTK4, VAAPI / FFmpeg | Apache-2.0 | planned |
 
+## Installation / Releases
+
+Download packages and `SHA256SUMS` from [GitHub Releases](https://github.com/maxesisn/skylatch/releases).
+
+- **Windows x64:** Run the setup executable, or extract the portable archive and run `skylatch-ui.exe`.
+  To enable host startup at login, select the installer option and run `skylatch-agent.exe join <hub> --code <6-digit>`
+  as the same Windows user before the next login.
+- **macOS (Apple silicon):** Open the disk image and drag **Skylatch** into **Applications**. The release
+  app is ad-hoc signed, not notarized. Hosting requires Screen Recording and Accessibility permissions.
+- **Linux x86-64:** On a compatible Debian/Ubuntu system, run `sudo apt install ./Skylatch-<version>-linux-amd64.deb`.
+  See the [Linux client usage](clients/linux/README.md#connect) for connection arguments. For a host service,
+  run `sudo /usr/share/skylatch/install-agent.sh` and follow the enrollment instructions. The static Linux
+  hub is available as a separate archive.
+
 ## Build and test
 
 Requires a recent stable Rust toolchain.
