@@ -2,12 +2,14 @@
 
 use crate::auth::AuthError;
 use crate::server::{bearer, AppState};
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use skylatch_proto::credentials::direct_ticket;
+use skylatch_proto::layout::WorkspaceLayout;
 use skylatch_proto::onboarding::{
     DirectTicketRequest, DirectTicketResponse, EnrollRequest, LoginRequest,
 };
@@ -140,4 +142,37 @@ pub(crate) async fn direct_session(
         ticket: direct_ticket(&key)?,
         endpoints,
     }))
+}
+
+pub(crate) async fn get_layout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AuthError> {
+    let account = account(&state, &headers)?;
+    Ok(secret(state.auth.layout(&account)))
+}
+
+pub(crate) async fn put_layout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AuthError> {
+    let account = account(&state, &headers)?;
+    let bad = |message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response()
+    };
+    let layout = match serde_json::from_slice::<WorkspaceLayout>(&body) {
+        Ok(layout) => layout,
+        Err(error) => return Ok(bad(format!("invalid layout JSON: {error}"))),
+    };
+    if let Err(message) = layout.validate() {
+        return Ok(bad(message));
+    }
+    let saved = blocking(move || state.auth.set_layout(&account, layout)).await?;
+    Ok(secret(saved).into_response())
 }

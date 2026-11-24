@@ -5,7 +5,7 @@ use crate::auth::{Auth, AuthError};
 use crate::config::HubConfig;
 use crate::registry::{ClientOut, HostCommand, OpenError, Registry, CLIENT_QUEUE, HOST_QUEUE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -21,6 +21,9 @@ use tokio::time::timeout;
 
 /// How long a new socket may take to send its first message.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest accepted `PUT /api/v1/layout` body.
+const LAYOUT_BODY_LIMIT: usize = 256 * 1024;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -58,6 +61,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/enroll", post(api::enroll))
         .route("/api/v1/devices/{device_id}/token", delete(api::revoke))
         .route("/api/v1/direct-sessions", post(api::direct_session))
+        .route(
+            "/api/v1/layout",
+            get(api::get_layout)
+                .put(api::put_layout)
+                .layer(DefaultBodyLimit::max(LAYOUT_BODY_LIMIT)),
+        )
         .route("/healthz", get(healthz))
         .route("/api/v1/devices", get(list_devices))
         .route("/ws/host", get(ws_host))
