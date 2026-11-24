@@ -2,6 +2,7 @@
 
 use crate::cli::Cli;
 use crate::engine::{EngineEvent, EngineSource, LocalLink};
+use crate::hardware::detect_hardware_profile;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::control::{DeviceInfo, HostToHub, HubToHost};
 use std::time::Duration;
@@ -36,12 +37,20 @@ struct Active {
 
 /// Runs until the process is stopped, reconnecting to the hub with capped exponential backoff.
 pub async fn run(cli: Cli) {
+    // Probes can involve native display services or a short-lived child process.
+    let hardware = tokio::task::spawn_blocking(detect_hardware_profile)
+        .await
+        .unwrap_or_default();
     let device = DeviceInfo {
         device_id: cli.resolved_device_id(),
         name: cli.resolved_name(),
         os: std::env::consts::OS.to_string(),
         host_version: env!("CARGO_PKG_VERSION").to_string(),
-        monitors: 1,
+        monitors: hardware.monitor_list.len().max(1) as u32,
+        form_factor: cli.form_factor.resolve(hardware.form_factor),
+        monitor_list: hardware.monitor_list,
+        room: cli.room.clone(),
+        slot: cli.slot,
         direct_endpoints: cli.direct_endpoints.clone(),
     };
     let mut engine = match (&cli.engine_bin, &cli.engine_url) {

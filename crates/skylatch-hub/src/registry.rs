@@ -321,6 +321,10 @@ mod tests {
             host_version: "0.1.0".into(),
             monitors: 1,
             direct_endpoints: vec![],
+            form_factor: Default::default(),
+            monitor_list: vec![],
+            room: None,
+            slot: None,
         }
     }
 

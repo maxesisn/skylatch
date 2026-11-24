@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_hub::{router, AppState, HubConfig};
 use skylatch_proto::control::*;
-use skylatch_proto::nsl1::Message as Nsl1;
+use skylatch_proto::nsl1::{Message as Nsl1, MonitorInfo};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -80,8 +80,33 @@ fn device(id: &str) -> DeviceInfo {
         name: format!("Host {id}"),
         os: "linux".into(),
         host_version: "0.1.0".into(),
-        monitors: 1,
+        monitors: 2,
         direct_endpoints: vec![],
+        form_factor: DeviceFormFactor::Mini,
+        monitor_list: vec![
+            MonitorInfo {
+                id: "landscape".into(),
+                name: "Landscape display".into(),
+                x: 0,
+                y: 0,
+                width: 5120,
+                height: 2880,
+                primary: true,
+                active: true,
+            },
+            MonitorInfo {
+                id: "portrait".into(),
+                name: "Portrait display".into(),
+                x: -1440,
+                y: 120,
+                width: 1440,
+                height: 2560,
+                primary: false,
+                active: true,
+            },
+        ],
+        room: Some("Office".into()),
+        slot: Some(3),
     }
 }
 
@@ -149,9 +174,9 @@ async fn host_registration_is_listed_and_removed() {
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let devices: Vec<DeviceInfo> = serde_json::from_value(v["devices"].clone()).unwrap();
-    assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0].device_id, "box-1");
-    assert_eq!(devices[0].direct_endpoints, vec![endpoint]);
+    let mut expected = device("box-1");
+    expected.direct_endpoints = vec![endpoint];
+    assert_eq!(devices, [expected]);
 
     // Another account sees nothing.
     let (_, body) = http_get(addr, "/api/v1/devices", Some("tok-b")).await;
@@ -202,7 +227,7 @@ async fn client_lists_connects_and_relays_both_ways() {
     );
     send_json(&mut client, &ClientToHub::ListDevices).await;
     match recv_json::<HubToClient>(&mut client).await {
-        HubToClient::Devices { devices } => assert_eq!(devices.len(), 1),
+        HubToClient::Devices { devices } => assert_eq!(devices, [device("box-1")]),
         other => panic!("unexpected {other:?}"),
     }
 

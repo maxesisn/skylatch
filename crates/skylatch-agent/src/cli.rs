@@ -1,9 +1,32 @@
 //! Command line and derived configuration.
 
-use clap::{ArgGroup, Parser};
-use skylatch_proto::control::{DirectEndpoint, EndpointKind};
+use clap::{ArgGroup, Parser, ValueEnum};
+use skylatch_proto::control::{DeviceFormFactor, DirectEndpoint, EndpointKind};
 use std::path::PathBuf;
 use url::Url;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum FormFactorArg {
+    Auto,
+    Desktop,
+    Laptop,
+    Mini,
+    Vm,
+    Server,
+}
+
+impl FormFactorArg {
+    pub fn resolve(self, detected: DeviceFormFactor) -> DeviceFormFactor {
+        match self {
+            Self::Auto => detected,
+            Self::Desktop => DeviceFormFactor::Desktop,
+            Self::Laptop => DeviceFormFactor::Laptop,
+            Self::Mini => DeviceFormFactor::Mini,
+            Self::Vm => DeviceFormFactor::Vm,
+            Self::Server => DeviceFormFactor::Server,
+        }
+    }
+}
 
 /// Skylatch host agent.
 ///
@@ -29,6 +52,18 @@ pub struct Cli {
     /// Display name (default: the hostname).
     #[arg(long, env = "SKYLATCH_DEVICE_NAME")]
     pub name: Option<String>,
+
+    /// Override the detected hardware form factor.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub form_factor: FormFactorArg,
+
+    /// Physical room or workstation group.
+    #[arg(long, value_name = "NAME")]
+    pub room: Option<String>,
+
+    /// Stable desk or rack slot index.
+    #[arg(long, value_name = "N")]
+    pub slot: Option<u32>,
 
     /// Path to `skylatch-host-engine`. The agent starts it on demand, bound to loopback only.
     #[arg(long, env = "SKYLATCH_ENGINE_BIN")]
@@ -158,7 +193,7 @@ fn parse_engine_url(raw: &str) -> Result<Url, String> {
 pub fn parse_endpoint(raw: &str) -> Result<DirectEndpoint, String> {
     let (kind, addr) = raw
         .split_once('=')
-        .ok_or("expected KIND=HOST:PORT, e.g. lan=192.168.1.10:17900")?;
+        .ok_or("expected KIND=HOST:PORT, e.g. lan=192.0.2.10:17900")?;
     let kind = match kind.trim().to_ascii_lowercase().as_str() {
         "lan" => EndpointKind::Lan,
         "overlay" => EndpointKind::Overlay,
@@ -213,21 +248,21 @@ mod tests {
 
     #[test]
     fn endpoints_parse() {
-        let e = parse_endpoint("lan=192.168.1.10:17900").unwrap();
+        let e = parse_endpoint("lan=192.0.2.10:17900").unwrap();
         assert_eq!(e.kind, EndpointKind::Lan);
-        assert_eq!((e.host.as_str(), e.port), ("192.168.1.10", 17900));
-        let e = parse_endpoint("overlay=[fd00::3]:17900").unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("192.0.2.10", 17900));
+        let e = parse_endpoint("overlay=[2001:db8::3]:17900").unwrap();
         assert_eq!(e.kind, EndpointKind::Overlay);
-        assert_eq!(e.host, "fd00::3");
-        assert!(parse_endpoint("wan=1.2.3.4:5").is_err());
-        assert!(parse_endpoint("lan=1.2.3.4").is_err());
-        assert!(parse_endpoint("lan=1.2.3.4:0").is_err());
+        assert_eq!(e.host, "2001:db8::3");
+        assert!(parse_endpoint("wan=192.0.2.4:5").is_err());
+        assert!(parse_endpoint("lan=192.0.2.4").is_err());
+        assert!(parse_endpoint("lan=192.0.2.4:0").is_err());
         assert!(parse_endpoint("lan=:80").is_err());
     }
 
     #[test]
     fn ids_are_sanitised() {
-        assert_eq!(sanitize_id("Max's MacBook Pro"), "max-s-macbook-pro");
+        assert_eq!(sanitize_id("Demo MacBook Pro"), "demo-macbook-pro");
         assert_eq!(sanitize_id("  "), "skylatch-host");
     }
 }
