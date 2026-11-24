@@ -3,15 +3,18 @@ use futures_util::{SinkExt, StreamExt};
 use skylatch_client_core::{
     ffi::{
         skylatch_connect_direct, skylatch_connect_hub, skylatch_destroy, skylatch_free_string,
-        skylatch_list_devices_json, skylatch_proto_version, skylatch_send_ack, skylatch_send_input,
-        SkylatchCallbacks, SkylatchClient, SKYLATCH_ERR_INVALID, SKYLATCH_ERR_NULL, SKYLATCH_OK,
+        skylatch_list_devices_json, skylatch_proto_version, skylatch_select_monitor,
+        skylatch_send_ack, skylatch_send_clipboard, skylatch_send_input,
+        skylatch_set_sl1_callbacks, SkylatchCallbacks, SkylatchClient, SkylatchSl1Callbacks,
+        SKYLATCH_ERR_INVALID, SKYLATCH_ERR_NOT_READY, SKYLATCH_ERR_NULL, SKYLATCH_ERR_TOO_LARGE,
+        SKYLATCH_OK,
     },
     list_devices, ClientError, Event, Frame, SessionClient, TransportMode,
 };
 use skylatch_hub::{router, AppState, HubConfig};
 use skylatch_proto::{
     control::{DeviceInfo, DirectEndpoint, EndpointKind, HostToHub, HubToHost},
-    nsl1::{Cursor, InputEvent, InputRecord, Message},
+    nsl1::{Cursor, InputEvent, InputRecord, Message, MonitorInfo, MAX_CLIPBOARD_DATA},
 };
 use std::{
     ffi::{c_char, c_void, CStr, CString},
@@ -165,6 +168,19 @@ fn video() -> Message {
     }
 }
 
+fn displays() -> Vec<MonitorInfo> {
+    vec![MonitorInfo {
+        id: "output-雪".into(),
+        name: "Écran".into(),
+        x: -640,
+        y: 0,
+        width: 640,
+        height: 360,
+        primary: false,
+        active: true,
+    }]
+}
+
 fn frame() -> Frame {
     Frame {
         generation: GENERATION,
@@ -187,6 +203,16 @@ fn input() -> InputRecord {
     .with_masks(5, 0x81)
 }
 
+async fn assert_wire<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    expected: Message,
+) {
+    assert_eq!(
+        deadline(ws.next()).await.unwrap().unwrap(),
+        WsMessage::Binary(expected.encode().unwrap())
+    );
+}
+
 async fn assert_outbound<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
 ) {
@@ -201,10 +227,7 @@ async fn assert_outbound<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
         record: input(),
     };
     for expected in [ack, input] {
-        assert_eq!(
-            deadline(ws.next()).await.unwrap().unwrap(),
-            WsMessage::Binary(expected.encode().unwrap())
-        );
+        assert_wire(ws, expected).await;
     }
 }
 
@@ -431,6 +454,8 @@ async fn host_session_close_surfaces_reason() {
 #[derive(Debug, PartialEq, Eq)]
 enum NativeEvent {
     Frame(Frame),
+    MonitorList(Vec<u8>),
+    ClipboardData(Vec<u8>),
     Disconnected(Option<String>),
 }
 
@@ -466,6 +491,18 @@ unsafe extern "C" fn native_disconnected(data: *mut c_void, error: *const c_char
             .into_owned()
     });
     let _ = tx.send(NativeEvent::Disconnected(error));
+}
+
+unsafe extern "C" fn native_monitors(data: *mut c_void, json: *const c_char, len: usize) {
+    let tx = unsafe { &*data.cast::<mpsc::UnboundedSender<NativeEvent>>() };
+    let bytes = unsafe { std::slice::from_raw_parts(json.cast::<u8>(), len) };
+    let _ = tx.send(NativeEvent::MonitorList(bytes.to_vec()));
+}
+
+unsafe extern "C" fn native_clipboard(data: *mut c_void, text: *const c_char, len: usize) {
+    let tx = unsafe { &*data.cast::<mpsc::UnboundedSender<NativeEvent>>() };
+    let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) };
+    let _ = tx.send(NativeEvent::ClipboardData(bytes.to_vec()));
 }
 
 const NATIVE_CALLBACKS: SkylatchCallbacks = SkylatchCallbacks {
@@ -633,6 +670,212 @@ async fn hub_c_abi_discovery_connect_send_and_destroy() {
         Some(NativeEvent::Disconnected(None))
     );
     assert_eq!(deadline(rx.recv()).await, None);
+}
+
+#[tokio::test]
+async fn hub_relay_exchanges_sl1_through_separate_c_abi_callbacks() {
+    let hub = Hub::start().await;
+    let mut host = register(&hub, device(vec![])).await;
+    let (legacy_tx, mut legacy) = mpsc::unbounded_channel();
+    let (sl1_tx, mut sl1) = mpsc::unbounded_channel();
+    let (ready, mut waiting) = mpsc::channel(1);
+    let (commands, mut run) = mpsc::channel(1);
+    let url = hub.url.clone();
+    let host_clipboard = "host: café\0雪";
+    let viewer_clipboard = "viewer: 雪\0café";
+    let task = tokio::task::spawn_blocking(move || unsafe {
+        let url = CString::new(url).unwrap();
+        let token = CString::new(HUB_TOKEN).unwrap();
+        let id = CString::new(DEVICE).unwrap();
+        let client = skylatch_connect_hub(
+            url.as_ptr(),
+            token.as_ptr(),
+            id.as_ptr(),
+            false,
+            &NATIVE_CALLBACKS,
+            ptr::from_ref(&legacy_tx).cast_mut().cast(),
+            ptr::null_mut(),
+            0,
+        );
+        assert!(!client.is_null());
+        let _handle = NativeHandle(client);
+        assert_eq!(
+            skylatch_send_clipboard(client, ptr::null(), 0),
+            SKYLATCH_ERR_NOT_READY
+        );
+        ready.blocking_send(()).unwrap();
+        // Register only after the old frame callback, so the test covers initial-list replay.
+        assert_eq!(run.blocking_recv(), Some(()));
+        let mut callbacks = SkylatchSl1Callbacks {
+            on_monitor_list: Some(native_monitors),
+            on_clipboard_data: Some(native_clipboard),
+        };
+        assert_eq!(
+            skylatch_set_sl1_callbacks(
+                client,
+                &callbacks,
+                ptr::from_ref(&sl1_tx).cast_mut().cast()
+            ),
+            SKYLATCH_OK
+        );
+        callbacks.on_clipboard_data = None;
+        std::hint::black_box(callbacks); // Changing the caller's table must not change the copy.
+        assert_eq!(run.blocking_recv(), Some(()));
+        let monitor_id = CString::new("output-雪").unwrap();
+        let bad = [0xffu8, 0];
+        assert_eq!(
+            skylatch_select_monitor(client, bad.as_ptr().cast()),
+            SKYLATCH_ERR_INVALID
+        );
+        assert_eq!(
+            skylatch_select_monitor(client, c"".as_ptr()),
+            SKYLATCH_ERR_INVALID
+        );
+        assert_eq!(
+            skylatch_send_clipboard(client, bad.as_ptr().cast(), 1),
+            SKYLATCH_ERR_INVALID
+        );
+        let oversized = "x".repeat(MAX_CLIPBOARD_DATA + 1);
+        assert_eq!(
+            skylatch_send_clipboard(client, oversized.as_ptr().cast(), oversized.len()),
+            SKYLATCH_ERR_TOO_LARGE
+        );
+        assert_eq!(
+            skylatch_select_monitor(client, monitor_id.as_ptr()),
+            SKYLATCH_OK
+        );
+        assert_eq!(
+            skylatch_send_clipboard(
+                client,
+                viewer_clipboard.as_ptr().cast(),
+                viewer_clipboard.len()
+            ),
+            SKYLATCH_OK
+        );
+        assert_eq!(skylatch_send_clipboard(client, ptr::null(), 0), SKYLATCH_OK);
+        assert_eq!(run.blocking_recv(), Some(()));
+        assert_eq!(
+            skylatch_set_sl1_callbacks(client, ptr::null(), ptr::null_mut()),
+            SKYLATCH_OK
+        );
+    });
+    let id = open_session(&mut host).await;
+    deadline(waiting.recv()).await.unwrap();
+    for msg in [
+        Message::MonitorList {
+            generation: GENERATION,
+            monitors: displays(),
+        },
+        video(),
+    ] {
+        host.send(WsMessage::Binary(msg.encode().unwrap()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        deadline(legacy.recv()).await,
+        Some(NativeEvent::Frame(frame()))
+    );
+    commands.send(()).await.unwrap();
+    let Some(NativeEvent::MonitorList(json)) = deadline(sl1.recv()).await else {
+        panic!("expected the C monitor callback");
+    };
+    assert_eq!(
+        serde_json::from_slice::<Vec<MonitorInfo>>(&json).unwrap(),
+        displays()
+    );
+
+    // The later incoming clipboard packet also advances the generation, which outgoing SL1 uses.
+    let generation = GENERATION + 1;
+    let incoming = Message::ClipboardData {
+        generation,
+        text: host_clipboard.into(),
+    };
+    host.send(WsMessage::Binary(incoming.encode().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        deadline(sl1.recv()).await,
+        Some(NativeEvent::ClipboardData(host_clipboard.as_bytes().into()))
+    );
+    commands.send(()).await.unwrap();
+    for expected in [
+        Message::SelectMonitor {
+            generation,
+            id: "output-雪".into(),
+        },
+        Message::ClipboardData {
+            generation,
+            text: viewer_clipboard.into(),
+        },
+        Message::ClipboardData {
+            generation,
+            text: String::new(),
+        },
+    ] {
+        assert_wire(&mut host, expected).await;
+    }
+    commands.send(()).await.unwrap();
+    assert_relay_closed(&mut host, id).await;
+    deadline(task).await.unwrap();
+    assert_eq!(deadline(sl1.recv()).await, None);
+    assert_eq!(
+        deadline(legacy.recv()).await,
+        Some(NativeEvent::Disconnected(None))
+    );
+}
+
+#[tokio::test]
+async fn direct_session_exchanges_sl1_without_http() {
+    let listener = loopback().await;
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (client, mut host) = tokio::join!(
+        deadline(SessionClient::connect_direct(&url, None, move |event| {
+            let _ = tx.send(event);
+        })),
+        start_direct(listener, None)
+    );
+    let client = client.unwrap();
+    let text = "Copied directly: 雪";
+    for message in [
+        Message::MonitorList {
+            generation: GENERATION,
+            monitors: displays(),
+        },
+        Message::ClipboardData {
+            generation: GENERATION,
+            text: text.into(),
+        },
+    ] {
+        host.send(WsMessage::Binary(message.encode().unwrap()))
+            .await
+            .unwrap();
+    }
+    assert!(
+        matches!(deadline(rx.recv()).await, Some(Event::MonitorList(list)) if list == displays())
+    );
+    assert!(
+        matches!(deadline(rx.recv()).await, Some(Event::ClipboardData(actual)) if actual == text)
+    );
+    client.select_monitor("output-雪").unwrap();
+    client.send_clipboard("viewer reply").unwrap();
+    assert_wire(
+        &mut host,
+        Message::SelectMonitor {
+            generation: GENERATION,
+            id: "output-雪".into(),
+        },
+    )
+    .await;
+    assert_wire(
+        &mut host,
+        Message::ClipboardData {
+            generation: GENERATION,
+            text: "viewer reply".into(),
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

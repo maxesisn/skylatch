@@ -23,6 +23,11 @@ typedef struct SkylatchCallbacks {
     void (*on_disconnected)(void *user_data, const char *error);
 } SkylatchCallbacks;
 
+typedef struct SkylatchSl1Callbacks {
+    void (*on_monitor_list)(void *user_data, const char *json_utf8, size_t len);
+    void (*on_clipboard_data)(void *user_data, const char *text_utf8, size_t len);
+} SkylatchSl1Callbacks;
+
 #define SKYLATCH_OK 0
 #define SKYLATCH_ERR_NULL (-1)
 #define SKYLATCH_ERR_TRUNCATED (-2)
@@ -79,6 +84,21 @@ SkylatchClient *skylatch_connect_direct(const char *ws_url, const char *token_or
 int32_t skylatch_send_ack(SkylatchClient *client, uint32_t generation,
                           uint32_t sequence, uint32_t viewer_wait_us);
 int32_t skylatch_send_input(SkylatchClient *client, const uint8_t record[16]);
+
+/* Register, replace, or clear (callbacks == NULL) the separate SL1 callbacks.
+ * The table is copied; payloads are borrowed, length-delimited UTF-8, not
+ * NUL-terminated. A newly installed monitor callback receives the last known
+ * list (if any) on the worker. Clipboard events are not replayed.
+ * Previous callbacks may already be in flight: keep all registered callback
+ * code and user_data alive until skylatch_destroy returns. */
+int32_t skylatch_set_sl1_callbacks(SkylatchClient *client,
+                                    const SkylatchSl1Callbacks *callbacks, void *user_data);
+
+/* Thread-safe, non-blocking: require a received NSL1 generation. Clipboard
+ * is limited to 1 MiB; len == 0 clears the text and allows utf8 == NULL.
+ * Monitor ID is a NUL-terminated UTF-8 string of 1 to 256 bytes. */
+int32_t skylatch_send_clipboard(SkylatchClient *client, const char *utf8, size_t len);
+int32_t skylatch_select_monitor(SkylatchClient *client, const char *monitor_id);
 
 /* Disconnect and join the worker. No callbacks occur after return. Call once
  * per handle, never from its callbacks or concurrently with other handle calls.

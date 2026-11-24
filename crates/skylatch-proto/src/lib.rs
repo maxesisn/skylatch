@@ -1,6 +1,6 @@
 //! Skylatch wire protocol.
 //!
-//! * [`nsl1`] — the binary data plane (frames, ACKs, input, cursor, clipboard notices).
+//! * [`nsl1`] — the binary data plane (frames, ACKs, input, cursor, monitors, clipboard).
 //! * [`control`] — the JSON control plane between hosts, clients and the hub.
 
 pub mod control;

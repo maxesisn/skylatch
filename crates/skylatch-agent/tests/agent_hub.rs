@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_hub::{router, AppState, HubConfig};
 use skylatch_proto::control::*;
-use skylatch_proto::nsl1::{InputEvent, InputRecord, Message as Nsl1};
+use skylatch_proto::nsl1::{InputEvent, InputRecord, Message as Nsl1, MonitorInfo};
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,6 +58,33 @@ fn input() -> Bytes {
     .unwrap()
 }
 
+fn monitor_list() -> Bytes {
+    Nsl1::MonitorList {
+        generation: 1,
+        monitors: vec![MonitorInfo {
+            id: "display-1".into(),
+            name: "Example display".into(),
+            x: -64,
+            y: 0,
+            width: 64,
+            height: 48,
+            primary: true,
+            active: true,
+        }],
+    }
+    .encode()
+    .unwrap()
+}
+
+fn clipboard(text: &str) -> Bytes {
+    Nsl1::ClipboardData {
+        generation: 1,
+        text: text.into(),
+    }
+    .encode()
+    .unwrap()
+}
+
 /// A local engine stand-in: sends a keyframe on every `/stream` connection and records what it
 /// receives.
 struct MockEngine {
@@ -94,6 +121,12 @@ async fn mock_engine() -> MockEngine {
                 let mut ws = accept_hdr_async(stream, callback).await.unwrap();
                 let n = conns.fetch_add(1, Ordering::SeqCst) as u32 + 1;
                 ws.send(Message::Binary(keyframe(n))).await.unwrap();
+                if n == 1 {
+                    ws.send(Message::Binary(monitor_list())).await.unwrap();
+                    ws.send(Message::Binary(clipboard("Copied on the host: café")))
+                        .await
+                        .unwrap();
+                }
                 while let Some(Ok(msg)) = ws.next().await {
                     match msg {
                         Message::Binary(b) => {
@@ -128,7 +161,7 @@ fn spawn_agent(hub: SocketAddr, engine: SocketAddr) -> Child {
             "Test Box",
         ])
         .args(["--engine-url", &format!("ws://{engine}")])
-        .args(["--direct-endpoint", "lan=192.168.1.10:17900"])
+        .args(["--direct-endpoint", "lan=192.0.2.10:17900"])
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .spawn()
@@ -243,23 +276,37 @@ async fn client_session_is_relayed_through_hub_and_agent() {
         ["/stream?take=1&clipboard=1"]
     );
 
-    // Client -> hub -> engine: ACK and input.
-    client.send(Message::Binary(ack(1))).await.unwrap();
-    client.send(Message::Binary(input())).await.unwrap();
+    assert_eq!(recv_binary(&mut client).await, monitor_list());
     assert_eq!(
-        timeout(WAIT, engine.received.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        ack(1)
+        recv_binary(&mut client).await,
+        clipboard("Copied on the host: café")
     );
-    assert_eq!(
-        timeout(WAIT, engine.received.recv())
+
+    // Client -> hub -> engine: ACK, input, monitor selection and clipboard.
+    let select = Nsl1::SelectMonitor {
+        generation: 1,
+        id: "display-1".into(),
+    }
+    .encode()
+    .unwrap();
+    for expected in [
+        ack(1),
+        input(),
+        select,
+        clipboard("Copied on the viewer: 雪"),
+    ] {
+        client
+            .send(Message::Binary(expected.clone()))
             .await
-            .unwrap()
-            .unwrap(),
-        input()
-    );
+            .unwrap();
+        assert_eq!(
+            timeout(WAIT, engine.received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
 
     // Disconnect: the agent closes the engine socket.
     send_json(&mut client, &ClientToHub::Disconnect).await;
@@ -325,6 +372,11 @@ async fn keyframe_request_close_and_reconnect() {
         }
     );
     assert_eq!(next_binary(&mut host).await, keyframe(1));
+    assert_eq!(next_binary(&mut host).await, monitor_list());
+    assert_eq!(
+        next_binary(&mut host).await,
+        clipboard("Copied on the host: café")
+    );
 
     // Keyframe request: the engine is reconnected and emits a fresh keyframe; hub session stays.
     host.send(text(&HubToHost::RequestKeyframe {
@@ -354,8 +406,8 @@ async fn keyframe_request_close_and_reconnect() {
     .unwrap();
     timeout(WAIT, engine.closed.recv()).await.unwrap().unwrap();
 
-    // Dropping the hub connection makes the agent reconnect and register again.
-    drop(host);
+    // A hub close makes the agent reconnect and register again.
+    host.close(None).await.unwrap();
     let (stream, _) = timeout(WAIT, hub_listener.accept()).await.unwrap().unwrap();
     let mut host = accept_async(stream).await.unwrap();
     let Message::Text(t) = host.next().await.unwrap().unwrap() else {

@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use skylatch_proto::nsl1::SUBPROTOCOL;
+use skylatch_proto::nsl1::{HEADER_SIZE, MAX_PAYLOAD, SUBPROTOCOL};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
@@ -10,13 +10,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use url::Url;
 
 /// How long to wait for a freshly started engine to accept connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
-/// Query used for every session: take over any previous viewer and enable clipboard notices.
+/// Take over the viewer and enable clipboard synchronization on the engine stream.
 const STREAM_PATH: &str = "/stream?take=1&clipboard=1";
 
 #[derive(Debug, thiserror::Error)]
@@ -181,7 +181,13 @@ impl LocalLink {
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static(SUBPROTOCOL),
         );
-        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, None, true)
+        // The engine owns monitor selection and the clipboard; all NSL1 messages, including
+        // SL1, stay on this same socket and retain the engine's wire generation and payload.
+        let limit = HEADER_SIZE + MAX_PAYLOAD;
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(limit))
+            .max_frame_size(Some(limit));
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true)
             .await
             .map_err(|e| e.to_string())?;
         let (mut sink, mut stream) = ws.split();

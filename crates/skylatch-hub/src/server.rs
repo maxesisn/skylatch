@@ -187,7 +187,9 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
                         }
                     },
                     Message::Binary(data) => {
-                        state.registry.relay_from_host(&account, &device_id, conn_id, data);
+                        if !state.registry.relay_from_host(&account, &device_id, conn_id, data).await {
+                            break;
+                        }
                     }
                     Message::Close(_) => break,
                     Message::Ping(_) | Message::Pong(_) => {}
@@ -289,7 +291,9 @@ async fn handle_client(state: AppState, mut socket: WebSocket) {
                     }
                     Message::Binary(data) => {
                         if let Some((dev, sid)) = &current {
-                            state.registry.relay_from_client(&account, dev, sid, data);
+                            if !state.registry.relay_from_client(&account, dev, sid, data).await {
+                                break;
+                            }
                         }
                     }
                     Message::Close(_) => break,

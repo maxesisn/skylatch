@@ -3,7 +3,7 @@
 //! H.264 delta frames depend on their predecessors. When a client cannot keep up the hub must
 //! drop frames, but then every later delta frame is undecodable until the next keyframe. The gate
 //! therefore drops whole runs: after the first dropped frame it discards deltas until a keyframe
-//! arrives while the client has room, and asks the host for a keyframe.
+//! arrives, and asks the host for a keyframe. Keyframes and non-video messages wait for room.
 
 use skylatch_proto::nsl1::{Header, MessageType};
 
@@ -14,6 +14,8 @@ const REREQUEST_AFTER: u32 = 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Forward,
+    /// Forward without dropping, waiting for capacity if needed.
+    ForwardReliable,
     Drop,
     /// Drop, and ask the host for a keyframe.
     DropAndRequestKeyframe,
@@ -44,20 +46,15 @@ impl FrameGate {
         if header.total_len() != message.len() {
             return Verdict::Drop;
         }
+        if header.is_keyframe() {
+            self.waiting_keyframe = false;
+            self.dropped_since_request = 0;
+            return Verdict::ForwardReliable;
+        }
         if header.msg_type != MessageType::Frame {
-            // Cursor and clipboard notices are independent; drop them under pressure.
-            return if congested {
-                Verdict::Drop
-            } else {
-                Verdict::Forward
-            };
+            return Verdict::ForwardReliable;
         }
         if self.waiting_keyframe {
-            if header.is_keyframe() && !congested {
-                self.waiting_keyframe = false;
-                self.dropped_since_request = 0;
-                return Verdict::Forward;
-            }
             self.dropped_since_request += 1;
             if self.dropped_since_request >= REREQUEST_AFTER {
                 self.dropped_since_request = 0;
@@ -97,15 +94,15 @@ mod tests {
     #[test]
     fn forwards_when_not_congested() {
         let mut g = FrameGate::new();
-        assert_eq!(g.decide(&frame(1, true), false), Verdict::Forward);
+        assert_eq!(g.decide(&frame(1, true), false), Verdict::ForwardReliable);
         assert_eq!(g.decide(&frame(2, false), false), Verdict::Forward);
         assert!(!g.waiting_keyframe());
     }
 
     #[test]
-    fn drops_delta_run_until_keyframe_with_room() {
+    fn drops_delta_run_until_keyframe() {
         let mut g = FrameGate::new();
-        assert_eq!(g.decide(&frame(1, true), false), Verdict::Forward);
+        assert_eq!(g.decide(&frame(1, true), false), Verdict::ForwardReliable);
         assert_eq!(
             g.decide(&frame(2, false), true),
             Verdict::DropAndRequestKeyframe
@@ -113,9 +110,8 @@ mod tests {
         assert!(g.waiting_keyframe());
         // Room is back, but a delta frame is still undecodable.
         assert_eq!(g.decide(&frame(3, false), false), Verdict::Drop);
-        // A keyframe while still congested is dropped too.
-        assert_eq!(g.decide(&frame(4, true), true), Verdict::Drop);
-        assert_eq!(g.decide(&frame(5, true), false), Verdict::Forward);
+        // Even when congested, the keyframe is forwarded (the relay waits for room).
+        assert_eq!(g.decide(&frame(4, true), true), Verdict::ForwardReliable);
         assert!(!g.waiting_keyframe());
         assert_eq!(g.decide(&frame(6, false), false), Verdict::Forward);
     }
@@ -137,11 +133,11 @@ mod tests {
     }
 
     #[test]
-    fn non_frame_messages_drop_only_under_pressure() {
+    fn non_frame_messages_are_reliable() {
         let mut g = FrameGate::new();
         let notice = Message::ClipboardNotice { generation: 1 }.encode().unwrap();
-        assert_eq!(g.decide(&notice, false), Verdict::Forward);
-        assert_eq!(g.decide(&notice, true), Verdict::Drop);
+        assert_eq!(g.decide(&notice, false), Verdict::ForwardReliable);
+        assert_eq!(g.decide(&notice, true), Verdict::ForwardReliable);
         assert!(!g.waiting_keyframe());
     }
 

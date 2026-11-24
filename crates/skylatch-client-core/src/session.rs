@@ -3,7 +3,10 @@
 use crate::transport::{self, Socket, WRITE_TIMEOUT};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use skylatch_proto::nsl1::{Cursor, InputRecord, Message, Nsl1Error, INPUT_SIZE};
+use skylatch_proto::nsl1::{
+    Cursor, InputRecord, Message, MonitorInfo, Nsl1Error, INPUT_SIZE, MAX_CLIPBOARD_DATA,
+    MAX_MONITOR_ID,
+};
 use std::{
     future::Future,
     sync::{
@@ -73,6 +76,8 @@ pub enum Event {
     Frame(Frame),
     Cursor(Cursor),
     ClipboardNotice,
+    MonitorList(Vec<MonitorInfo>),
+    ClipboardData(String),
     Disconnected(Result<(), ClientError>),
 }
 
@@ -89,6 +94,8 @@ pub enum SendError {
     InvalidAck,
     #[error("invalid input record: {0}")]
     InvalidInput(Nsl1Error),
+    #[error("invalid SL1 message: {0}")]
+    InvalidSl1(Nsl1Error),
 }
 
 /// A connected session handle. Safe to share between threads. Dropping it requests disconnect.
@@ -154,13 +161,7 @@ impl SessionClient {
 
     /// Sends one validated input record using the latest generation received from the host.
     pub fn send_input(&self, record: [u8; INPUT_SIZE]) -> Result<(), SendError> {
-        let generation = self.generation.load(Ordering::Relaxed);
-        if *self.stop.borrow() || self.outbound.is_closed() {
-            return Err(SendError::Closed);
-        }
-        if generation == 0 {
-            return Err(SendError::NotReady);
-        }
+        let generation = self.current_generation()?;
         let record = InputRecord::decode(&record).map_err(SendError::InvalidInput)?;
         self.enqueue(
             Message::Input {
@@ -171,6 +172,57 @@ impl SessionClient {
             .encode()
             .map_err(SendError::InvalidInput)?,
         )
+    }
+
+    /// Queues UTF-8 clipboard text for the host. Empty text clears the text clipboard.
+    pub fn send_clipboard(&self, text: &str) -> Result<(), SendError> {
+        if text.len() > MAX_CLIPBOARD_DATA {
+            return Err(SendError::InvalidSl1(Nsl1Error::PayloadTooLarge(
+                text.len(),
+            )));
+        }
+        let generation = self.current_generation()?;
+        self.enqueue(
+            Message::ClipboardData {
+                generation,
+                text: text.into(),
+            }
+            .encode()
+            .map_err(SendError::InvalidSl1)?,
+        )
+    }
+
+    /// Queues a request to select a display from the host's latest monitor list.
+    pub fn select_monitor(&self, monitor_id: &str) -> Result<(), SendError> {
+        if monitor_id.len() > MAX_MONITOR_ID {
+            return Err(SendError::InvalidSl1(Nsl1Error::PayloadTooLarge(
+                monitor_id.len(),
+            )));
+        }
+        if monitor_id.is_empty() {
+            return Err(SendError::InvalidSl1(Nsl1Error::InvalidPayload(
+                "select monitor",
+            )));
+        }
+        let generation = self.current_generation()?;
+        self.enqueue(
+            Message::SelectMonitor {
+                generation,
+                id: monitor_id.into(),
+            }
+            .encode()
+            .map_err(SendError::InvalidSl1)?,
+        )
+    }
+
+    fn current_generation(&self) -> Result<u32, SendError> {
+        if *self.stop.borrow() || self.outbound.is_closed() {
+            return Err(SendError::Closed);
+        }
+        match self.generation.load(Ordering::Relaxed) {
+            0 => Err(SendError::NotReady),
+            generation => Ok(generation),
+        }
     }
 
     fn enqueue(&self, bytes: Bytes) -> Result<(), SendError> {
@@ -271,14 +323,7 @@ async fn pump_messages(
         tokio::select! {
             incoming = socket.next() => match incoming {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
-                    let (current, event) = match Message::decode(&bytes)? {
-                        Message::Frame { generation, sequence, width, height, capture_us, keyframe, data } => (
-                            generation, Event::Frame(Frame { generation, sequence, width, height, capture_us, is_keyframe: keyframe, annex_b: data }),
-                        ),
-                        Message::Cursor { generation, cursor } => (generation, Event::Cursor(cursor)),
-                        Message::ClipboardNotice { generation } => (generation, Event::ClipboardNotice),
-                        _ => return Err(ClientError::Unexpected("unexpected NSL1 message from host")),
-                    };
+                    let (current, event) = transport::decode_stream_event(&bytes)?;
                     generation.store(current, Ordering::Relaxed);
                     callback(event);
                     // A socket with many already-buffered frames can remain ready without

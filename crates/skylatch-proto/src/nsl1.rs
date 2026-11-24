@@ -6,7 +6,7 @@
 //! | ---: | ---: | --- |
 //! | 0 | 4 | ASCII `NSL1` |
 //! | 4 | 1 | version (`1`) |
-//! | 5 | 1 | message type (1..=7) |
+//! | 5 | 1 | message type |
 //! | 6 | 2 | flags (frame bit 0 = keyframe, otherwise zero) |
 //! | 8 | 4 | generation (nonzero) |
 //! | 12 | 4 | sequence |
@@ -16,6 +16,7 @@
 //! protocol message.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 
 /// Magic bytes `NSL1`.
 pub const MAGIC: u32 = 0x4e53_4c31;
@@ -37,6 +38,12 @@ pub const MAX_PAYLOAD: usize = MAX_ACCESS_UNIT + FRAME_PREFIX_SIZE;
 pub const MAX_CURSOR_EDGE: u16 = 256;
 /// Maximum number of input records in one batch.
 pub const MAX_INPUT_BATCH: usize = 256;
+/// Maximum UTF-8 JSON size for a monitor list.
+pub const MAX_MONITOR_LIST: usize = 64 * 1024;
+/// Maximum UTF-8 byte length of a monitor selection ID.
+pub const MAX_MONITOR_ID: usize = 256;
+/// Maximum UTF-8 byte length of clipboard text.
+pub const MAX_CLIPBOARD_DATA: usize = 1024 * 1024;
 /// Header flag marking a keyframe (frame messages only).
 pub const FLAG_KEYFRAME: u16 = 1;
 /// WebSocket subprotocol name.
@@ -57,6 +64,8 @@ pub enum Nsl1Error {
     BadFlags(u16),
     #[error("generation must be nonzero")]
     ZeroGeneration,
+    #[error("sequence must be zero for this message type")]
+    NonzeroSequence,
     #[error("payload length {declared} does not match body length {actual}")]
     LengthMismatch { declared: usize, actual: usize },
     #[error("payload of {0} bytes exceeds the limit")]
@@ -78,6 +87,9 @@ pub enum MessageType {
     InputResponse = 5,
     Cursor = 6,
     ClipboardNotice = 7,
+    MonitorList = 17,
+    SelectMonitor = 18,
+    ClipboardData = 19,
 }
 
 impl MessageType {
@@ -90,8 +102,30 @@ impl MessageType {
             5 => Self::InputResponse,
             6 => Self::Cursor,
             7 => Self::ClipboardNotice,
+            17 => Self::MonitorList,
+            18 => Self::SelectMonitor,
+            19 => Self::ClipboardData,
             other => return Err(Nsl1Error::UnknownType(other)),
         })
+    }
+
+    fn sl1_payload_limit(self) -> Option<usize> {
+        match self {
+            Self::MonitorList => Some(MAX_MONITOR_LIST),
+            Self::SelectMonitor => Some(MAX_MONITOR_ID),
+            Self::ClipboardData => Some(MAX_CLIPBOARD_DATA),
+            _ => None,
+        }
+    }
+
+    fn validate_payload_len(self, len: usize) -> Result<(), Nsl1Error> {
+        if len > self.sl1_payload_limit().unwrap_or(MAX_PAYLOAD) {
+            return Err(Nsl1Error::PayloadTooLarge(len));
+        }
+        if self == Self::SelectMonitor && len == 0 {
+            return Err(Nsl1Error::InvalidPayload("select monitor"));
+        }
+        Ok(())
     }
 }
 
@@ -137,9 +171,10 @@ impl Header {
         }
         let sequence = b.get_u32();
         let payload_len = b.get_u32();
-        if payload_len as usize > MAX_PAYLOAD {
-            return Err(Nsl1Error::PayloadTooLarge(payload_len as usize));
+        if msg_type.sl1_payload_limit().is_some() && sequence != 0 {
+            return Err(Nsl1Error::NonzeroSequence);
         }
+        msg_type.validate_payload_len(payload_len as usize)?;
         Ok(Self {
             msg_type,
             flags,
@@ -463,6 +498,28 @@ pub enum Message {
     Cursor { generation: u32, cursor: Cursor },
     /// Type 7: the desktop clipboard changed.
     ClipboardNotice { generation: u32 },
+    /// Type 17: the available displays and current selection.
+    MonitorList {
+        generation: u32,
+        monitors: Vec<MonitorInfo>,
+    },
+    /// Type 18: select a display by its opaque ID.
+    SelectMonitor { generation: u32, id: String },
+    /// Type 19: bidirectional text clipboard data.
+    ClipboardData { generation: u32, text: String },
+}
+
+/// One display as described by the host in a monitor list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub id: String,
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+    pub primary: bool,
+    pub active: bool,
 }
 
 /// Cursor payload.
@@ -490,6 +547,9 @@ impl Message {
             Self::InputResponse { .. } => MessageType::InputResponse,
             Self::Cursor { .. } => MessageType::Cursor,
             Self::ClipboardNotice { .. } => MessageType::ClipboardNotice,
+            Self::MonitorList { .. } => MessageType::MonitorList,
+            Self::SelectMonitor { .. } => MessageType::SelectMonitor,
+            Self::ClipboardData { .. } => MessageType::ClipboardData,
         }
     }
 
@@ -583,6 +643,23 @@ impl Message {
                 (0, *generation, 0, p.freeze())
             }
             Self::ClipboardNotice { generation } => (0, *generation, 0, Bytes::new()),
+            Self::MonitorList {
+                generation,
+                monitors,
+            } => {
+                let payload = serde_json::to_vec(monitors)
+                    .map_err(|_| Nsl1Error::InvalidPayload("monitor list"))?;
+                MessageType::MonitorList.validate_payload_len(payload.len())?;
+                (0, *generation, 0, Bytes::from(payload))
+            }
+            Self::SelectMonitor { generation, id } => {
+                MessageType::SelectMonitor.validate_payload_len(id.len())?;
+                (0, *generation, 0, Bytes::copy_from_slice(id.as_bytes()))
+            }
+            Self::ClipboardData { generation, text } => {
+                MessageType::ClipboardData.validate_payload_len(text.len())?;
+                (0, *generation, 0, Bytes::copy_from_slice(text.as_bytes()))
+            }
         };
         if generation == 0 {
             return Err(Nsl1Error::ZeroGeneration);
@@ -711,6 +788,34 @@ impl Message {
                 }
                 Ok(Self::ClipboardNotice { generation })
             }
+            MessageType::MonitorList => {
+                let invalid = |_| Nsl1Error::InvalidPayload("monitor list");
+                let json = std::str::from_utf8(&payload)
+                    .map_err(|_| Nsl1Error::InvalidPayload("monitor list"))?;
+                // The wire schema calls for JSON objects, not positional arrays.
+                let entries =
+                    serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(json)
+                        .map_err(invalid)?;
+                let monitors = entries
+                    .into_iter()
+                    .map(|entry| serde_json::from_value(serde_json::Value::Object(entry)))
+                    .collect::<Result<_, _>>()
+                    .map_err(invalid)?;
+                Ok(Self::MonitorList {
+                    generation,
+                    monitors,
+                })
+            }
+            MessageType::SelectMonitor => Ok(Self::SelectMonitor {
+                generation,
+                id: String::from_utf8(payload.to_vec())
+                    .map_err(|_| Nsl1Error::InvalidPayload("select monitor"))?,
+            }),
+            MessageType::ClipboardData => Ok(Self::ClipboardData {
+                generation,
+                text: String::from_utf8(payload.to_vec())
+                    .map_err(|_| Nsl1Error::InvalidPayload("clipboard data"))?,
+            }),
         }
     }
 }
@@ -1216,6 +1321,196 @@ mod tests {
         bad[19] = 1;
         bad.push(0); // payload on a notice
         assert!(Message::decode(&Bytes::from(bad)).is_err());
+    }
+
+    fn sl1_wire(msg_type: MessageType, payload: &[u8]) -> Bytes {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(
+            &Header {
+                msg_type,
+                flags: 0,
+                generation: 23,
+                sequence: 0,
+                payload_len: payload.len() as u32,
+            }
+            .encode(),
+        );
+        wire.extend_from_slice(payload);
+        wire.freeze()
+    }
+
+    fn monitor() -> MonitorInfo {
+        MonitorInfo {
+            id: "output-雪".into(),
+            name: "Écran".into(),
+            x: -1920,
+            y: i32::MIN,
+            width: 1920,
+            height: 1080,
+            primary: true,
+            active: false,
+        }
+    }
+
+    #[test]
+    fn sl1_roundtrips_and_wire_layouts() {
+        let list = roundtrip(Message::MonitorList {
+            generation: 23,
+            monitors: vec![monitor()],
+        });
+        let expected = r#"[{"id":"output-雪","name":"Écran","x":-1920,"y":-2147483648,"width":1920,"height":1080,"primary":true,"active":false}]"#;
+        assert_eq!(
+            list,
+            sl1_wire(MessageType::MonitorList, expected.as_bytes())
+        );
+        assert_eq!(&list[..8], b"NSL1\x01\x11\0\0");
+        assert_eq!(&list[8..16], &[0, 0, 0, 23, 0, 0, 0, 0]);
+        let list = roundtrip(Message::MonitorList {
+            generation: 23,
+            monitors: vec![],
+        });
+        assert_eq!(&list[HEADER_SIZE..], b"[]");
+
+        for (message, type_byte, payload) in [
+            (
+                Message::SelectMonitor {
+                    generation: 23,
+                    id: "output-雪".into(),
+                },
+                18,
+                "output-雪",
+            ),
+            (
+                Message::ClipboardData {
+                    generation: 23,
+                    text: "café\0雪\n".into(),
+                },
+                19,
+                "café\0雪\n",
+            ),
+            (
+                Message::ClipboardData {
+                    generation: 23,
+                    text: String::new(),
+                },
+                19,
+                "",
+            ),
+        ] {
+            let wire = roundtrip(message);
+            assert_eq!(&wire[4..8], &[1, type_byte, 0, 0]);
+            assert_eq!(&wire[8..16], &[0, 0, 0, 23, 0, 0, 0, 0]);
+            assert_eq!(&wire[HEADER_SIZE..], payload.as_bytes());
+        }
+    }
+
+    #[test]
+    fn sl1_enforces_byte_limits_on_encode_and_decode() {
+        let list = |monitor| Message::MonitorList {
+            generation: 23,
+            monitors: vec![monitor],
+        };
+        let mut item = monitor();
+        item.name.clear();
+        let overhead = list(item.clone()).encode().unwrap().len() - HEADER_SIZE;
+        item.name = "a".repeat(MAX_MONITOR_LIST - overhead);
+        assert_eq!(
+            roundtrip(list(item.clone())).len(),
+            HEADER_SIZE + MAX_MONITOR_LIST
+        );
+        item.name.push('a');
+        let json = serde_json::to_vec(&[&item]).unwrap();
+        assert_eq!(
+            list(item).encode(),
+            Err(Nsl1Error::PayloadTooLarge(MAX_MONITOR_LIST + 1))
+        );
+
+        let select = |id| Message::SelectMonitor { generation: 23, id };
+        let clip = |text| Message::ClipboardData {
+            generation: 23,
+            text,
+        };
+        roundtrip(select("é".repeat(MAX_MONITOR_ID / 2)));
+        roundtrip(clip("é".repeat(MAX_CLIPBOARD_DATA / 2)));
+        assert_eq!(
+            select(String::new()).encode(),
+            Err(Nsl1Error::InvalidPayload("select monitor"))
+        );
+        assert_eq!(
+            select("a".repeat(MAX_MONITOR_ID + 1)).encode(),
+            Err(Nsl1Error::PayloadTooLarge(MAX_MONITOR_ID + 1))
+        );
+        assert_eq!(
+            clip("a".repeat(MAX_CLIPBOARD_DATA + 1)).encode(),
+            Err(Nsl1Error::PayloadTooLarge(MAX_CLIPBOARD_DATA + 1))
+        );
+
+        for (kind, payload) in [
+            (MessageType::MonitorList, json),
+            (MessageType::SelectMonitor, vec![b'a'; MAX_MONITOR_ID + 1]),
+            (
+                MessageType::ClipboardData,
+                vec![b'a'; MAX_CLIPBOARD_DATA + 1],
+            ),
+        ] {
+            let wire = sl1_wire(kind, &payload);
+            let error = Nsl1Error::PayloadTooLarge(payload.len());
+            assert_eq!(Header::decode(&wire[..HEADER_SIZE]), Err(error.clone()));
+            assert_eq!(Message::decode(&wire), Err(error));
+        }
+    }
+
+    #[test]
+    fn sl1_rejects_nonzero_sequence_or_flags() {
+        for (kind, payload) in [
+            (MessageType::MonitorList, &b"[]"[..]),
+            (MessageType::SelectMonitor, &b"display"[..]),
+            (MessageType::ClipboardData, &b"text"[..]),
+        ] {
+            let wire = sl1_wire(kind, payload);
+            let mut flagged = wire.to_vec();
+            flagged[7] = 1;
+            assert_eq!(
+                Message::decode(&flagged.into()),
+                Err(Nsl1Error::BadFlags(1))
+            );
+            let mut sequenced = wire.to_vec();
+            sequenced[15] = 1;
+            assert_eq!(
+                Message::decode(&sequenced.into()),
+                Err(Nsl1Error::NonzeroSequence)
+            );
+        }
+    }
+
+    #[test]
+    fn sl1_rejects_invalid_utf8_and_monitor_json() {
+        let list = MessageType::MonitorList;
+        for payload in [
+            &b""[..],
+            &b"["[..],
+            &b"{}"[..],
+            &b"[{}]"[..],
+            &b"[[]]"[..],
+            &b"[]true"[..],
+            &b"[\xFF]"[..],
+            &br#"[{"id":"a","name":"a","x":0,"y":0,"width":65536,"height":1,"primary":true,"active":true}]"#[..],
+        ] {
+            assert_eq!(Message::decode(&sl1_wire(list, payload)), Err(Nsl1Error::InvalidPayload("monitor list")));
+        }
+        for (kind, name) in [
+            (MessageType::SelectMonitor, "select monitor"),
+            (MessageType::ClipboardData, "clipboard data"),
+        ] {
+            assert_eq!(
+                Message::decode(&sl1_wire(kind, b"\xc3(")),
+                Err(Nsl1Error::InvalidPayload(name))
+            );
+        }
+        assert_eq!(
+            Message::decode(&sl1_wire(MessageType::SelectMonitor, b"")),
+            Err(Nsl1Error::InvalidPayload("select monitor"))
+        );
     }
 
     #[test]

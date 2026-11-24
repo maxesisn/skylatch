@@ -6,13 +6,15 @@ use skylatch_proto::control::{DeviceInfo, DirectEndpoint, HubToClient, HubToHost
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Queue depth towards a client. When it is full the frame gate starts dropping.
 pub const CLIENT_QUEUE: usize = 32;
 /// Queue depth towards a host.
 pub const HOST_QUEUE: usize = 256;
+/// Bound reliable-queue waits even if a peer is no longer reading.
+const RELAY_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Something to write to a host socket.
 #[derive(Debug)]
@@ -219,42 +221,81 @@ impl Registry {
         }
     }
 
-    /// Relays a binary message from the host to the session's client, dropping under pressure.
-    pub fn relay_from_host(&self, account: &str, device_id: &str, conn_id: u64, data: Bytes) {
-        let mut map = self.lock();
-        let Some(device) = map.get_mut(&(account.to_string(), device_id.to_string())) else {
-            return;
-        };
-        if device.conn_id != conn_id {
-            return;
-        }
-        let Some(session) = device.session.as_mut() else {
-            return;
-        };
-        let congested = session.to_client.capacity() == 0;
-        match session.gate.decide(&data, congested) {
-            Verdict::Forward => {
-                let _ = session.to_client.try_send(ClientOut::Binary(data));
+    /// Relays a binary message from the host. Only delta video is shed under pressure.
+    /// Returns false if the receiver cannot accept a reliable message; end the connection.
+    pub async fn relay_from_host(
+        &self,
+        account: &str,
+        device_id: &str,
+        conn_id: u64,
+        data: Bytes,
+    ) -> bool {
+        let key = (account.to_string(), device_id.to_string());
+        let (sender, session_id) = {
+            let mut map = self.lock();
+            let Some(device) = map.get_mut(&key).filter(|d| d.conn_id == conn_id) else {
+                return true;
+            };
+            let Some(session) = device.session.as_mut() else {
+                return true;
+            };
+            let congested = session.to_client.capacity() == 0;
+            match session.gate.decide(&data, congested) {
+                Verdict::ForwardReliable => (session.to_client.clone(), session.id.clone()),
+                Verdict::Forward => {
+                    let _ = session.to_client.try_send(ClientOut::Binary(data));
+                    return true;
+                }
+                Verdict::Drop => return true,
+                Verdict::DropAndRequestKeyframe => {
+                    let _ = device
+                        .tx
+                        .try_send(HostCommand::Json(HubToHost::RequestKeyframe {
+                            session_id: session.id.clone(),
+                        }));
+                    return true;
+                }
             }
-            Verdict::Drop => {}
-            Verdict::DropAndRequestKeyframe => {
-                let _ = device
-                    .tx
-                    .try_send(HostCommand::Json(HubToHost::RequestKeyframe {
-                        session_id: session.id.clone(),
-                    }));
-            }
+        };
+        let permit = tokio::time::timeout(RELAY_QUEUE_TIMEOUT, sender.reserve()).await;
+        // The target may have closed or changed sessions while waiting for room.
+        let map = self.lock();
+        let current = map.get(&key).and_then(|d| d.session.as_ref());
+        if current.is_some_and(|s| s.id == session_id) {
+            let Ok(Ok(permit)) = permit else { return false };
+            permit.send(ClientOut::Binary(data));
         }
+        true
     }
 
-    /// Relays a binary message (input, ACK) from the client to the host.
-    pub fn relay_from_client(&self, account: &str, device_id: &str, session_id: &str, data: Bytes) {
-        let map = self.lock();
-        if let Some(device) = map.get(&(account.to_string(), device_id.to_string())) {
-            if device.session.as_ref().map(|s| s.id.as_str()) == Some(session_id) {
-                let _ = device.tx.try_send(HostCommand::Binary(data));
+    /// Relays a binary message from the client to the host, without a video drop gate.
+    /// Returns false if the receiver cannot accept the message; end the connection.
+    pub async fn relay_from_client(
+        &self,
+        account: &str,
+        device_id: &str,
+        session_id: &str,
+        data: Bytes,
+    ) -> bool {
+        let key = (account.to_string(), device_id.to_string());
+        let sender = {
+            let map = self.lock();
+            let Some(device) = map.get(&key) else {
+                return true;
+            };
+            if device.session.as_ref().map(|s| s.id.as_str()) != Some(session_id) {
+                return true;
             }
+            device.tx.clone()
+        };
+        let permit = tokio::time::timeout(RELAY_QUEUE_TIMEOUT, sender.reserve()).await;
+        let map = self.lock();
+        let current = map.get(&key).and_then(|d| d.session.as_ref());
+        if current.is_some_and(|s| s.id == session_id) {
+            let Ok(Ok(permit)) = permit else { return false };
+            permit.send(HostCommand::Binary(data));
         }
+        true
     }
 }
 
@@ -350,32 +391,120 @@ mod tests {
         assert!(reg.open_session("a", "d", ctx).is_ok());
     }
 
-    #[test]
-    fn slow_client_loses_frames_and_host_is_asked_for_keyframe() {
+    #[tokio::test]
+    async fn slow_client_loses_frames_and_host_is_asked_for_keyframe() {
         let reg = Registry::new();
         let (htx, mut hrx) = mpsc::channel(HOST_QUEUE);
         let conn = reg.register("a", info("d"), htx);
         let (ctx, mut crx) = mpsc::channel(2);
         reg.open_session("a", "d", ctx).unwrap();
         let _open = hrx.try_recv().unwrap();
-        reg.relay_from_host("a", "d", conn, frame(1, true));
-        reg.relay_from_host("a", "d", conn, frame(2, false));
+        reg.relay_from_host("a", "d", conn, frame(1, true)).await;
+        reg.relay_from_host("a", "d", conn, frame(2, false)).await;
         // Queue is full now.
-        reg.relay_from_host("a", "d", conn, frame(3, false));
+        reg.relay_from_host("a", "d", conn, frame(3, false)).await;
         assert!(matches!(
             hrx.try_recv().unwrap(),
             HostCommand::Json(HubToHost::RequestKeyframe { .. })
         ));
         // Further deltas are dropped silently.
-        reg.relay_from_host("a", "d", conn, frame(4, false));
+        reg.relay_from_host("a", "d", conn, frame(4, false)).await;
         assert!(hrx.try_recv().is_err());
         // Client drains; a keyframe flows again.
         assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(_)));
         assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(_)));
-        reg.relay_from_host("a", "d", conn, frame(5, false));
+        reg.relay_from_host("a", "d", conn, frame(5, false)).await;
         assert!(crx.try_recv().is_err());
-        reg.relay_from_host("a", "d", conn, frame(6, true));
+        reg.relay_from_host("a", "d", conn, frame(6, true)).await;
         assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(_)));
+    }
+
+    #[tokio::test]
+    async fn sl1_and_keyframes_survive_a_full_video_queue() {
+        let reg = Registry::new();
+        let (htx, mut hrx) = mpsc::channel(HOST_QUEUE);
+        let conn = reg.register("a", info("d"), htx);
+        let (ctx, mut crx) = mpsc::channel(1);
+        reg.open_session("a", "d", ctx).unwrap();
+        let _open = hrx.try_recv().unwrap();
+        let first = frame(1, true);
+        assert!(reg.relay_from_host("a", "d", conn, first.clone()).await);
+        assert!(reg.relay_from_host("a", "d", conn, frame(2, false)).await);
+        assert!(matches!(
+            hrx.try_recv().unwrap(),
+            HostCommand::Json(HubToHost::RequestKeyframe { .. })
+        ));
+
+        let list = Message::MonitorList {
+            generation: 1,
+            monitors: vec![],
+        }
+        .encode()
+        .unwrap();
+        let clip = Message::ClipboardData {
+            generation: 1,
+            text: "copied: café\0雪".into(),
+        }
+        .encode()
+        .unwrap();
+        let key = frame(5, true);
+        let final_delta = frame(6, false);
+        for (expected, queued) in [
+            (list.clone(), first),
+            (clip.clone(), list),
+            (key.clone(), clip),
+        ] {
+            let relay = reg.relay_from_host("a", "d", conn, expected);
+            tokio::pin!(relay);
+            assert!(
+                futures_util::poll!(&mut relay).is_pending(),
+                "reliable send must wait for room"
+            );
+            assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(data) if data == queued));
+            assert!(relay.await);
+        }
+        assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(data) if data == key));
+        assert!(
+            reg.relay_from_host("a", "d", conn, final_delta.clone())
+                .await
+        );
+        assert!(matches!(crx.try_recv().unwrap(), ClientOut::Binary(data) if data == final_delta));
+        assert!(crx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn viewer_sl1_waits_for_host_queue_without_dropping() {
+        let reg = Registry::new();
+        let (htx, mut hrx) = mpsc::channel(1);
+        reg.register("a", info("d"), htx);
+        let (ctx, _crx) = mpsc::channel(1);
+        let (sid, _) = reg.open_session("a", "d", ctx).unwrap();
+        let list = Message::SelectMonitor {
+            generation: 1,
+            id: "display".into(),
+        }
+        .encode()
+        .unwrap();
+        let clip = Message::ClipboardData {
+            generation: 1,
+            text: "viewer".into(),
+        }
+        .encode()
+        .unwrap();
+        let select = reg.relay_from_client("a", "d", &sid, list.clone());
+        tokio::pin!(select);
+        assert!(futures_util::poll!(&mut select).is_pending());
+        assert!(matches!(
+            hrx.try_recv().unwrap(),
+            HostCommand::Json(HubToHost::OpenSession { .. })
+        ));
+        assert!(select.await);
+        let copy = reg.relay_from_client("a", "d", &sid, clip.clone());
+        tokio::pin!(copy);
+        assert!(futures_util::poll!(&mut copy).is_pending());
+        assert!(matches!(hrx.try_recv().unwrap(), HostCommand::Binary(data) if data == list));
+        assert!(copy.await);
+        assert!(matches!(hrx.try_recv().unwrap(), HostCommand::Binary(data) if data == clip));
     }
 
     #[test]
@@ -392,17 +521,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn client_input_reaches_host_only_for_its_session() {
+    #[tokio::test]
+    async fn client_input_reaches_host_only_for_its_session() {
         let reg = Registry::new();
         let (htx, mut hrx) = mpsc::channel(8);
         reg.register("a", info("d"), htx);
         let (ctx, _crx) = mpsc::channel(4);
         let (sid, _) = reg.open_session("a", "d", ctx).unwrap();
         let _open = hrx.try_recv().unwrap();
-        reg.relay_from_client("a", "d", "other", Bytes::from_static(b"x"));
+        reg.relay_from_client("a", "d", "other", Bytes::from_static(b"x"))
+            .await;
         assert!(hrx.try_recv().is_err());
-        reg.relay_from_client("a", "d", &sid, Bytes::from_static(b"x"));
+        reg.relay_from_client("a", "d", &sid, Bytes::from_static(b"x"))
+            .await;
         assert!(matches!(hrx.try_recv().unwrap(), HostCommand::Binary(_)));
     }
 }
