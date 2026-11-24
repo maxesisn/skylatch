@@ -43,7 +43,7 @@ pub enum EngineSource {
         bin: PathBuf,
         port: Option<u16>,
         args: Vec<String>,
-        running: Option<(Child, u16)>,
+        running: Option<Box<(Child, u16)>>,
     },
 }
 
@@ -73,8 +73,8 @@ impl EngineSource {
                 args,
                 running,
             } => {
-                if let Some((child, _)) = running {
-                    if let Ok(Some(status)) = child.try_wait() {
+                if let Some(boxed) = running {
+                    if let Ok(Some(status)) = boxed.0.try_wait() {
                         tracing::warn!(%status, "engine exited; restarting");
                         *running = None;
                     }
@@ -97,9 +97,9 @@ impl EngineSource {
                             source,
                         })?;
                     tracing::info!(port = chosen, "started engine");
-                    *running = Some((child, chosen));
+                    *running = Some(Box::new((child, chosen)));
                 }
-                let port = running.as_ref().map(|(_, p)| *p).unwrap_or_default();
+                let port = running.as_deref().map(|(_, p)| *p).unwrap_or_default();
                 stream_url("127.0.0.1", Some(port))
             }
         }
@@ -118,11 +118,11 @@ impl EngineSource {
                 Ok(link) => return Ok(link),
                 Err(err) => {
                     if let Self::Spawn {
-                        running: Some((child, _)),
+                        running: Some(boxed),
                         ..
                     } = self
                     {
-                        if let Ok(Some(status)) = child.try_wait() {
+                        if let Ok(Some(status)) = boxed.0.try_wait() {
                             return Err(EngineError::Exited(status.to_string()));
                         }
                     }
