@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Skylatch">
+  <title>Skylatch</title>
+  <!-- Paper tile -->
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#FCFBF8" stroke="#1A1A18" stroke-width="3"/>
+  <!-- Square housing (outer 14..50, inner 18..46) -->
+  <path fill="#1A1A18" fill-rule="evenodd" d="M14 14h36v36H14z M18 18v28h28V18z"/>
+  <!-- Cobalt bolt sliding into the right wall -->
+  <rect x="24" y="29" width="24" height="6" fill="#2563EB"/>
+  <!-- Vertical latch handle -->
+  <rect x="20" y="24" width="4" height="16" fill="#1A1A18"/>
+</svg>

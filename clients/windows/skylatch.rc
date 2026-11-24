@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: Apache-2.0
+// Lock-Bolt application icon (multi-resolution PNG-in-ICO); id 101 is loaded by client.cpp.
+101 ICON "..\\..\\assets\\icon\\skylatch.ico"
