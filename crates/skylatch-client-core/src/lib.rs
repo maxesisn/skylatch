@@ -1,8 +1,10 @@
 //! Shared core for Skylatch native clients.
 //!
-//! Native shells (Win32, Swift, GTK) own windowing, decoding and rendering. This crate owns
-//! the hub and direct transports, `NSL1` parsing, and the C ABI ([`ffi`]).
+//! Native shells (Win32, Swift, GTK) own windowing, video decoding, rendering and audio output.
+//! This crate owns the hub and direct transports, `NSL1` parsing, Opus audio decoding, and the
+//! C ABI ([`ffi`]).
 
+mod audio;
 pub mod config;
 pub mod ffi;
 mod http;
@@ -10,6 +12,7 @@ pub mod parser;
 mod session;
 mod transport;
 
+pub use audio::AudioPcm;
 pub use config::{ConfigError, ConnectionConfig};
 pub use parser::{FrameParser, ParseError};
 pub use session::{ClientError, Event, Frame, SendError, SessionClient, TransportMode};

@@ -25,6 +25,12 @@ typedef struct SkylatchCallbacks {
      * sends after the first host message: ACCEPTED enables input type 9, anything else means
      * the host scrolls only by type 6 notches. Older hosts never answer. */
     void (*on_input_response)(void *user_data, uint32_t sequence, uint8_t status);
+    /* Decoded host audio: samples_per_channel frames of interleaved signed 16-bit PCM
+     * (48000 Hz stereo from current hosts), captured at capture_us on the host clock.
+     * Non-NULL asks hosts that answered the smooth-wheel query with ACCEPTED for audio;
+     * older hosts are never asked and stay silent. NULL never requests audio. */
+    void (*on_audio_pcm)(void *user_data, uint64_t capture_us, uint32_t sample_rate,
+                         uint8_t channels, const int16_t *pcm, size_t samples_per_channel);
 } SkylatchCallbacks;
 
 typedef struct SkylatchSl1Callbacks {
@@ -110,6 +116,11 @@ int32_t skylatch_set_sl1_callbacks(SkylatchClient *client,
  * Monitor ID is a NUL-terminated UTF-8 string of 1 to 256 bytes. */
 int32_t skylatch_send_clipboard(SkylatchClient *client, const char *utf8, size_t len);
 int32_t skylatch_select_monitor(SkylatchClient *client, const char *monitor_id);
+
+/* Thread-safe, non-blocking: enabled == 0 mutes host audio and stops the host
+ * sending it; nonzero resumes it. Requires on_audio_pcm in the connect callbacks,
+ * else enabling returns SKYLATCH_ERR_UNSUPPORTED. */
+int32_t skylatch_set_audio_enabled(SkylatchClient *client, int enabled);
 
 /* Disconnect and join the worker. No callbacks occur after return. Call once
  * per handle, never from its callbacks or concurrently with other handle calls.

@@ -535,6 +535,7 @@ const NATIVE_CALLBACKS: SkylatchCallbacks = SkylatchCallbacks {
     on_clipboard_notice: None,
     on_disconnected: Some(native_disconnected),
     on_input_response: Some(native_input_response),
+    on_audio_pcm: None,
 };
 
 struct NativeHandle(*mut SkylatchClient);

@@ -114,6 +114,8 @@ pub struct SkylatchCallbacks {
     pub on_clipboard_notice: Option<unsafe extern "C" fn(*mut c_void)>,
     pub on_disconnected: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
     pub on_input_response: Option<unsafe extern "C" fn(*mut c_void, u32, u8)>,
+    /// Interleaved 16-bit PCM: capture time, sample rate, channels, samples, samples per channel.
+    pub on_audio_pcm: Option<unsafe extern "C" fn(*mut c_void, u64, u32, u8, *const i16, usize)>,
 }
 
 /// Optional SL1 callbacks, registered independently of the original callback table.
@@ -261,6 +263,18 @@ impl ForeignCallbacks {
                         f(user, sequence, status as u8);
                     }
                 }
+                Event::Audio(pcm) => {
+                    if let Some(f) = self.table.on_audio_pcm {
+                        f(
+                            user,
+                            pcm.capture_us,
+                            pcm.sample_rate,
+                            pcm.channels,
+                            pcm.samples.as_ptr(),
+                            pcm.samples_per_channel(),
+                        );
+                    }
+                }
                 Event::Disconnected(result) => {
                     if let Some(f) = self.table.on_disconnected {
                         let error = result.err().map(|err| c_error(&err.to_string()));
@@ -277,6 +291,7 @@ pub struct SkylatchClient {
     session: SessionClient,
     worker: JoinHandle<()>,
     sl1: Arc<Sl1Dispatch>,
+    audio_callback: bool,
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -289,6 +304,7 @@ fn start_worker(
     open: impl Future<Output = Result<Connection, ClientError>> + Send + 'static,
     callbacks: ForeignCallbacks,
 ) -> Result<SkylatchClient, String> {
+    let audio_callback = callbacks.table.on_audio_pcm.is_some();
     let (ready, status) = mpsc::sync_channel::<Result<SessionClient, String>>(0);
     let sl1 = Arc::new(Sl1Dispatch::default());
     let worker_sl1 = sl1.clone();
@@ -306,8 +322,9 @@ fn start_worker(
                 match open.await {
                     Ok(connection) => {
                         let dispatch = worker_sl1.clone();
-                        let (client, pump) =
-                            connection.start(move |event| callbacks.dispatch(event, &dispatch));
+                        let (client, pump) = connection.start(audio_callback, move |event| {
+                            callbacks.dispatch(event, &dispatch)
+                        });
                         if ready.send(Ok(client)).is_ok() {
                             tokio::pin!(pump);
                             loop {
@@ -333,6 +350,7 @@ fn start_worker(
                 session,
                 worker,
                 sl1,
+                audio_callback,
             })
         }
         Ok(Err(error)) => error,
@@ -635,6 +653,26 @@ pub unsafe extern "C" fn skylatch_select_monitor(
         return SKYLATCH_ERR_INVALID;
     };
     send_code(client.session.select_monitor(id))
+}
+
+/// Mute (`enabled == 0`) or resume host audio. Audio is on after connecting whenever the
+/// callback table has `on_audio_pcm`; without it, enabling returns [`SKYLATCH_ERR_UNSUPPORTED`].
+///
+/// # Safety
+/// `client` must be null or a live handle not concurrently being destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn skylatch_set_audio_enabled(
+    client: *mut SkylatchClient,
+    enabled: c_int,
+) -> i32 {
+    let Some(client) = (unsafe { client.as_ref() }) else {
+        return SKYLATCH_ERR_NULL;
+    };
+    if enabled != 0 && !client.audio_callback {
+        return SKYLATCH_ERR_UNSUPPORTED;
+    }
+    client.session.set_audio_enabled(enabled != 0);
+    SKYLATCH_OK
 }
 
 /// Disconnect, wait for the worker to stop, and free the handle.
