@@ -11,9 +11,11 @@
 #include <wmcodecdsp.h>
 #include <codecapi.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <mutex>
 
 namespace skylatch {
 using Microsoft::WRL::ComPtr;
@@ -34,8 +36,10 @@ struct MfRuntime {
 inline RECT letterbox(LONG w, LONG h, unsigned vw, unsigned vh) {
     if (!vw || !vh || w <= 0 || h <= 0) return {};
     LONG ww = w, hh = h;
-    if (int64_t(w) * vh > int64_t(h) * vw) ww = std::max<LONG>(1, LONG(int64_t(h) * vw / vh));
-    else hh = std::max<LONG>(1, LONG(int64_t(w) * vh / vw));
+    const int64_t scaledW = int64_t(w) * vh, scaledH = int64_t(h) * vw;
+    // Don't add a border if the client already matches at integer-pixel precision.
+    if (scaledW - scaledH > std::max(vw, vh) / 2) ww = std::max<LONG>(1, LONG((scaledH + vh / 2) / vh));
+    if (scaledH - scaledW > std::max(vw, vh) / 2) hh = std::max<LONG>(1, LONG((scaledW + vw / 2) / vw));
     LONG x = (w - ww) / 2, y = (h - hh) / 2;
     return {x, y, x + ww, y + hh};
 }
@@ -48,6 +52,8 @@ struct VideoFormat { unsigned width{}, height{}; LONG stride{}; RECT aperture{};
 
 class Renderer {
     HWND hwnd;
+    std::mutex renderLock;
+    std::atomic<bool> repaintPending{false};
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGISwapChain1> swap;
     ComPtr<ID3D11VideoDevice> video;
@@ -55,8 +61,12 @@ class Renderer {
     ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
     ComPtr<ID3D11VideoProcessor> processor;
     ComPtr<ID3D11VideoProcessorOutputView> target;
-    ComPtr<ID3D11Texture2D> upload;
+    ComPtr<ID3D11Texture2D> upload, cachedNv12;
     UINT outW{}, outH{}, inW{}, inH{}, uploadW{}, uploadH{};
+    UINT cachedW{}, cachedH{};
+    VideoFormat cachedFmt{};
+    unsigned cachedFrameW{}, cachedFrameH{};
+    bool hasCachedFrame{};
     void setup(UINT tw, UINT th, UINT w, UINT h) {
         const bool resize = w != outW || h != outH;
         if (resize) {
@@ -64,7 +74,7 @@ class Renderer {
             hrcheck(swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers");
             outW = w; outH = h;
         }
-        if (!processor || resize || tw != inW || th != inH) {
+        if (!target || resize || tw != inW || th != inH) {
             target.Reset(); processor.Reset(); enumerator.Reset(); inW = tw; inH = th;
             D3D11_VIDEO_PROCESSOR_CONTENT_DESC d{};
             d.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -116,6 +126,34 @@ class Renderer {
             context->UpdateSubresource(upload.Get(), 0, nullptr, pixels, UINT(pitch), 0);
         }
     }
+    bool presentSurface(ID3D11Texture2D* surface, UINT sub, const VideoFormat& fmt, unsigned frameW, unsigned frameH) {
+        RECT rc{};
+        if (IsIconic(hwnd) || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return false;
+        D3D11_TEXTURE2D_DESC d{}; surface->GetDesc(&d);
+        setup(d.Width, d.Height, UINT(rc.right), UINT(rc.bottom));
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{}; iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        iv.Texture2D.MipSlice = sub % d.MipLevels; iv.Texture2D.ArraySlice = sub / d.MipLevels;
+        ComPtr<ID3D11VideoProcessorInputView> source;
+        hrcheck(video->CreateVideoProcessorInputView(surface, enumerator.Get(), &iv, &source), "CreateVideoProcessorInputView");
+        RECT src = fmt.aperture;
+        if (src.right <= src.left || src.bottom <= src.top || src.left < 0 || src.top < 0 ||
+            src.right > LONG(d.Width) || src.bottom > LONG(d.Height)) {
+            src = {0, 0, LONG(std::min(d.Width, frameW)), LONG(std::min(d.Height, frameH))};
+        }
+        const RECT dst = letterbox(rc.right, rc.bottom, frameW, frameH);
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs{};
+        cs.YCbCr_Matrix = fmt.bt709 ? 1 : 0;
+        cs.Nominal_Range = fmt.limited ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+        vctx->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &cs);
+        vctx->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &rc);
+        vctx->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &src);
+        vctx->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &dst);
+        D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable = TRUE; stream.pInputSurface = source.Get();
+        hrcheck(vctx->VideoProcessorBlt(processor.Get(), target.Get(), 0, 1, &stream), "VideoProcessorBlt");
+        const HRESULT p = swap->Present(0, 0);
+        hrcheck(p, "Present(0, 0)");
+        return p != DXGI_STATUS_OCCLUDED;
+    }
 public:
     ComPtr<ID3D11Device> device;
     explicit Renderer(HWND window) : hwnd(window) {
@@ -131,21 +169,20 @@ public:
         RECT rc{}; GetClientRect(hwnd, &rc);
         DXGI_SWAP_CHAIN_DESC1 d{}; d.Width = outW = UINT(std::max<LONG>(1, rc.right)); d.Height = outH = UINT(std::max<LONG>(1, rc.bottom));
         d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1; d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        d.BufferCount = 2; d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        d.BufferCount = 2; d.Scaling = DXGI_SCALING_NONE; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         hrcheck(factory->CreateSwapChainForHwnd(device.Get(), hwnd, &d, nullptr, nullptr, &swap), "CreateSwapChainForHwnd");
         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
         ComPtr<IDXGIDevice1> dxgi1; if (SUCCEEDED(dxgi.As(&dxgi1))) dxgi1->SetMaximumFrameLatency(1);
     }
     struct Result { bool presented, dxgiBacked; };
-    Result draw(IMFSample* sample, const VideoFormat& fmt, const FrameInfo& frame) {
+    Result draw(IMFSample* sample, const VideoFormat& fmt, const FrameInfo& frame, bool deferPresent) {
+        std::unique_lock lock(renderLock);
         ComPtr<IMFMediaBuffer> buffer;
         hrcheck(sample->GetBufferByIndex(0, &buffer), "decoded sample GetBufferByIndex");
         ComPtr<IMFDXGIBuffer> db;
         ComPtr<ID3D11Texture2D> decoded;
         UINT sub = 0;
         const bool gpu = SUCCEEDED(buffer.As(&db));
-        RECT rc{}; GetClientRect(hwnd, &rc);
-        if (rc.right <= 0 || rc.bottom <= 0 || IsIconic(hwnd)) return {false, gpu};
         if (gpu) {
             hrcheck(db->GetResource(IID_PPV_ARGS(&decoded)), "IMFDXGIBuffer::GetResource");
             hrcheck(db->GetSubresourceIndex(&sub), "IMFDXGIBuffer::GetSubresourceIndex");
@@ -155,30 +192,33 @@ public:
             uploadCpu(contiguous.Get(), fmt); decoded = upload;
         }
         D3D11_TEXTURE2D_DESC d{}; decoded->GetDesc(&d);
-        require(d.Format == DXGI_FORMAT_NV12 && d.MipLevels, "decoder did not return an NV12 texture");
-        setup(d.Width, d.Height, UINT(rc.right), UINT(rc.bottom));
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{}; iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        iv.Texture2D.MipSlice = sub % d.MipLevels; iv.Texture2D.ArraySlice = sub / d.MipLevels;
-        ComPtr<ID3D11VideoProcessorInputView> source;
-        hrcheck(video->CreateVideoProcessorInputView(decoded.Get(), enumerator.Get(), &iv, &source), "CreateVideoProcessorInputView");
-        RECT src = fmt.aperture;
-        if (src.right <= src.left || src.bottom <= src.top || src.left < 0 || src.top < 0 ||
-            src.right > LONG(d.Width) || src.bottom > LONG(d.Height)) {
-            src = {0, 0, LONG(std::min(d.Width, frame.width)), LONG(std::min(d.Height, frame.height))};
+        require(d.Format == DXGI_FORMAT_NV12 && d.SampleDesc.Count == 1 && d.MipLevels &&
+            sub / d.MipLevels < d.ArraySize && sub % d.MipLevels == 0, "invalid NV12 decoder surface");
+        if (!cachedNv12 || cachedW != d.Width || cachedH != d.Height) {
+            D3D11_TEXTURE2D_DESC cache{};
+            cache.Width = d.Width; cache.Height = d.Height; cache.MipLevels = 1; cache.ArraySize = 1;
+            cache.Format = DXGI_FORMAT_NV12; cache.SampleDesc.Count = 1;
+            cache.Usage = D3D11_USAGE_DEFAULT; cache.BindFlags = D3D11_BIND_DECODER;
+            ComPtr<ID3D11Texture2D> nextCache;
+            hrcheck(device->CreateTexture2D(&cache, nullptr, &nextCache), "CreateTexture2D(cached NV12)");
+            cachedNv12.Swap(nextCache);
+            cachedW = d.Width; cachedH = d.Height;
         }
-        const RECT dst = letterbox(rc.right, rc.bottom, frame.width, frame.height);
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs{};
-        cs.YCbCr_Matrix = fmt.bt709 ? 1 : 0;
-        cs.Nominal_Range = fmt.limited ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-        vctx->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &cs);
-        vctx->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &rc);
-        vctx->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &src);
-        vctx->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &dst);
-        D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable = TRUE; stream.pInputSurface = source.Get();
-        hrcheck(vctx->VideoProcessorBlt(processor.Get(), target.Get(), 0, 1, &stream), "VideoProcessorBlt");
-        const HRESULT p = swap->Present(0, 0);
-        hrcheck(p, "Present(0, 0)");
-        return {p != DXGI_STATUS_OCCLUDED, gpu};
+        context->CopySubresourceRegion(cachedNv12.Get(), 0, 0, 0, 0, decoded.Get(), sub, nullptr);
+        cachedFmt = fmt; cachedFrameW = frame.width; cachedFrameH = frame.height; hasCachedFrame = true;
+        const bool presented = !deferPresent && presentSurface(cachedNv12.Get(), 0, cachedFmt, cachedFrameW, cachedFrameH);
+        lock.unlock();
+        // A size message may have arrived after Present sampled the old client rect.
+        if (repaintPending.exchange(false)) InvalidateRect(hwnd, nullptr, FALSE);
+        return {presented, gpu};
+    }
+    void repaint() {
+        // Present can synchronously message the window thread. Never wait for draw here.
+        repaintPending.store(true);
+        std::unique_lock lock(renderLock, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        repaintPending.store(false);
+        if (hasCachedFrame) presentSurface(cachedNv12.Get(), 0, cachedFmt, cachedFrameW, cachedFrameH);
     }
 };
 
