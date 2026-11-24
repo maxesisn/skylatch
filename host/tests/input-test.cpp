@@ -1,5 +1,6 @@
 #include "core/input.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -11,7 +12,7 @@ namespace {
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
 struct Call {
-  enum class Kind { pressKey, releaseKey, typeText, pressButton, releaseButton, move, scroll, resetLocks, flush } kind;
+  enum class Kind { pressKey, releaseKey, typeText, pressButton, releaseButton, move, scroll, smoothScroll, resetLocks, flush } kind;
   uint32_t id = 0;
   int x = 0, y = 0;
 };
@@ -35,6 +36,9 @@ class FakeBackend final : public relay::InputBackend {
   void releaseButton(unsigned button) override { calls.push_back({Call::Kind::releaseButton, button}); }
   void move(int x, int y) override { calls.push_back({Call::Kind::move, 0, x, y}); }
   void scroll(unsigned axis, int notches) override { calls.push_back({Call::Kind::scroll, axis, notches}); }
+  void smoothScroll(unsigned axis, int sixteenths) override {
+    calls.push_back({Call::Kind::smoothScroll, axis, sixteenths});
+  }
   void resetLocks() override { calls.push_back({Call::Kind::resetLocks}); }
   void fence(std::shared_ptr<relay::InputFence> mark) override { fences.push_back(std::move(mark)); }
   size_t pending() const override { return 0; }
@@ -106,6 +110,15 @@ void rejectsInvalidEvents() {
   reject(event(6, 0, -1320), "wheel value below -1200 was accepted");
   reject(event(6, 1, 121), "wheel value that is not a multiple of 120 was accepted");
   reject(event(6, 1, -121), "negative wheel value that is not a multiple of 120 was accepted");
+  reject(event(9, 0, 0), "smooth wheel value 0 was accepted");
+  reject(event(9, 0, relay::max_smooth_wheel + 1), "smooth wheel value above 262144 was accepted");
+  reject(event(9, 1, -relay::max_smooth_wheel - 1), "smooth wheel value below -262144 was accepted");
+  reject(event(9, 1, INT32_MIN), "smooth wheel value INT32_MIN was accepted");
+  reject(event(9, 2, 16), "smooth wheel axis 2 was accepted");
+  reject(event(9, 0, 16, 0, 0, 1), "smooth wheel with a reserved byte was accepted");
+  reject(event(9, 0, 16, 32), "smooth wheel button bits above the mask were accepted");
+  reject(event(9, 0, 16, 0, 256), "smooth wheel modifier bits above the mask were accepted");
+  reject(event(10, 0, 0), "type 10 was accepted");
   require(f.backend.calls.empty(), "an invalid event reached the backend");
 }
 
@@ -113,6 +126,10 @@ void acceptsBoundaryValues() {
   Fixture f;
   require(f.input.apply(event(6, 0, 1200)) == relay::InputStatus::ok, "wheel value 1200 was rejected");
   require(f.input.apply(event(6, 1, -1200)) == relay::InputStatus::ok, "wheel value -1200 was rejected");
+  require(f.input.apply(event(9, 0, relay::max_smooth_wheel)) == relay::InputStatus::ok, "smooth wheel 262144 was rejected");
+  require(f.input.apply(event(9, 1, -relay::max_smooth_wheel)) == relay::InputStatus::ok, "smooth wheel -262144 was rejected");
+  require(f.input.apply(event(9, 0, 1)) == relay::InputStatus::ok, "smooth wheel 1 was rejected");
+  require(f.input.apply(event(9, 1, -1, 31, 255)) == relay::InputStatus::ok, "smooth wheel -1 with full masks was rejected");
   require(f.input.apply(event(1, 231)) == relay::InputStatus::unsupported, "key code 231 was rejected as invalid");
   require(f.input.apply(event(5, 3)) == relay::InputStatus::ok, "release of button 3 was rejected");
 }
@@ -145,6 +162,32 @@ void pointerEventsMoveFirst() {
           f.backend.calls[1].kind == Call::Kind::scroll && f.backend.calls[1].id == 1 &&
           f.backend.calls[1].x == -2,
           "horizontal wheel did not scroll two notches after moving");
+  f.backend.calls.clear();
+  require(f.input.apply(at(9, 65535, 65535, 0, -40)) == relay::InputStatus::ok, "vertical smooth wheel was rejected");
+  require(f.backend.calls.size() == 3 && f.backend.calls[0].kind == Call::Kind::move &&
+          f.backend.calls[0].x == 1279 && f.backend.calls[0].y == 719 &&
+          f.backend.calls[1].kind == Call::Kind::smoothScroll && f.backend.calls[1].id == 0 &&
+          f.backend.calls[1].x == -40 && f.backend.calls[2].kind == Call::Kind::flush,
+          "smooth wheel did not pass its 1/16 pixel delta after moving");
+  f.backend.calls.clear();
+  require(f.input.apply(at(6, 0, 0, 0, 360)) == relay::InputStatus::ok, "vertical wheel was rejected");
+  require(f.backend.calls.size() == 3 && f.backend.calls[1].kind == Call::Kind::scroll &&
+          f.backend.calls[1].id == 0 && f.backend.calls[1].x == 3, "a discrete wheel stopped passing whole notches");
+}
+
+void carriesScrollRemainders() {
+  relay::ScrollCarry pixels;
+  require(pixels.take(0, 8, 16) == 0 && pixels.take(0, 8, 16) == 1, "half pixels did not add up to one");
+  require(pixels.take(1, 40, 16) == 2 && pixels.take(1, 8, 16) == 1, "the horizontal carry was lost or shared");
+  require(pixels.take(0, -24, 16) == -1 && pixels.take(0, -8, 16) == -1, "negative pixels did not carry");
+  relay::ScrollCarry units;
+  require(units.take(0, 16 * 5, 32) == 2 && units.take(0, 16 * 5, 32) == 3, "two pixels were not five wheel units");
+  require(units.take(1, 48 * 16 * 5, 32) == 120, "48 pixels were not one 120-unit notch");
+  relay::ScrollCarry clicks;
+  require(clicks.take(0, 31 * 16, 32 * 16) == 0 && clicks.take(0, 16, 32 * 16) == 1, "32 pixels were not one click");
+  require(clicks.take(1, -65 * 16, 32 * 16) == -2 && clicks.take(1, -31 * 16, 32 * 16) == -1,
+          "the remainder of a backward scroll was dropped");
+  require(clicks.take(0, relay::max_smooth_wheel, 32 * 16) == 512, "the largest smooth delta lost clicks");
 }
 
 void dedupesHeldInput() {
@@ -260,6 +303,10 @@ void countsCancelledRecords() {
   queue.post(relay::InputJob{relay::InputJob::Kind::scroll});
   queue.post(relay::InputJob{relay::InputJob::Kind::flush});
   require(queue.pending() == 1, "a wheel record counted as two queued events");
+  queue.post(relay::InputJob{relay::InputJob::Kind::motion});
+  queue.post(relay::InputJob{relay::InputJob::Kind::smooth_scroll});
+  queue.post(relay::InputJob{relay::InputJob::Kind::flush});
+  require(queue.pending() == 2, "a smooth wheel record was not counted once");
   relay::InputJob release{relay::InputJob::Kind::key};
   release.code = 30;
   queue.post(release);
@@ -271,24 +318,24 @@ void countsCancelledRecords() {
   queue.cancel();
   require(!mark->finished, "cancel completed the fence off the worker");
   require(queue.take().kind == relay::InputJob::Kind::flush, "the cancelled wheel record kept its work");
-  require(queue.pending() == 1, "the cancelled wheel record stayed counted");
+  require(queue.take().kind == relay::InputJob::Kind::flush, "the cancelled smooth wheel record kept its work");
+  require(queue.pending() == 1, "the cancelled wheel records stayed counted");
   require(queue.take().kind == relay::InputJob::Kind::key, "cancel dropped the retained key release");
   queue.take();
   require(!mark->finished, "the fence completed before the retained release was applied");
   queue.take().complete();
-  require(mark->finished && !mark->applied && mark->dropped == 1,
-          "a cancelled wheel record did not report one dropped record");
-  require(1 - mark->dropped == 0, "a cancelled wheel record reported more applied records than it posted");
+  require(mark->finished && !mark->applied && mark->dropped == 2,
+          "the cancelled wheel records did not report two dropped records");
   require(queue.pending() == 0 && queue.empty(), "a cancelled record stayed counted");
 }
 }
 
 int main() {
   try {
-    rejectsInvalidEvents(); acceptsBoundaryValues(); mapsCoordinates(); pointerEventsMoveFirst();
+    rejectsInvalidEvents(); acceptsBoundaryValues(); mapsCoordinates(); pointerEventsMoveFirst(); carriesScrollRemainders();
     dedupesHeldInput(); sharesNativeKey(); releasesAllHeldInput(); resetsLocks(); typesText(); reportsUnsupportedUsage();
     fencesAfterWork(); cancelsQueuedWork(); countsCancelledRecords();
-    std::puts("input: validation, coordinates, dedupe, release-all, locks, text, fences, cancel counting and unsupported usages passed");
+    std::puts("input: validation, coordinates, dedupe, release-all, locks, text, smooth wheel carry, fences, cancel counting and unsupported usages passed");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "input: %s\n", error.what());

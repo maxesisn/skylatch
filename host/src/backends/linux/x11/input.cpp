@@ -24,6 +24,8 @@ constexpr std::chrono::milliseconds spareReuse(50);
 /// Minimum time between two keyboard mapping changes, so clients refresh their keysym cache first.
 constexpr std::chrono::milliseconds spareBind(12);
 using TimePoint = std::chrono::steady_clock::time_point;
+/// Smooth scrolling in 1/16 pixel that makes one wheel button click (32 pixels).
+constexpr int64_t sixteenthsPerClick = 32 * 16;
 KeySym textKeysym(uint32_t codepoint) {
   if (codepoint == '\n') return XK_Return;
   if (codepoint == '\t') return XK_Tab;
@@ -46,6 +48,7 @@ class X11Input final : public InputBackend {
   std::set<KeyCode> modifiers;
   std::vector<Spare> spares;
   std::set<unsigned> held;
+  ScrollCarry clicks;
   TimePoint bound{}, lastTap{};
   mutable std::mutex mutex;
   std::condition_variable wake;
@@ -122,6 +125,11 @@ class X11Input final : public InputBackend {
     job.number = axis; job.notches = notches;
     post(job);
   }
+  void smoothScroll(unsigned axis, int sixteenths) override {
+    InputJob job{InputJob::Kind::smooth_scroll};
+    job.number = axis; job.sixteenths = sixteenths;
+    post(job);
+  }
   void resetLocks() override { post(InputJob{InputJob::Kind::locks}); }
   void fence(std::shared_ptr<InputFence> mark) override {
     InputJob job{InputJob::Kind::fence};
@@ -176,6 +184,7 @@ class X11Input final : public InputBackend {
         break;
       }
       case InputJob::Kind::scroll: wheel(job.number, job.notches); break;
+      case InputJob::Kind::smooth_scroll: wheel(job.number, clicks.take(job.number, job.sixteenths, sixteenthsPerClick)); break;
       case InputJob::Kind::locks: XkbLockModifiers(display, XkbUseCoreKbd, LockMask, 0); break;
       case InputJob::Kind::flush: XFlush(display); break;
       case InputJob::Kind::fence: XSync(display, False); job.complete(); break;

@@ -24,6 +24,8 @@ namespace {
 constexpr CGEventTapLocation eventTap = kCGHIDEventTap;
 /// Sign that turns a positive relay notch into a line step down or right; flip it if the VM scrolls backwards.
 constexpr int scrollSign = -1;
+/// Lines per wheel notch, as a Windows host scrolls by default.
+constexpr int linesPerNotch = 3;
 /// Points of cursor travel still counted as the same click position.
 constexpr double clickSlop = 5;
 /// Modifier flag a held key contributes to every posted event.
@@ -50,6 +52,7 @@ class MacInput final : public InputBackend {
   unsigned clicks = 1, clickButton = 0;
   std::chrono::steady_clock::time_point clickTime{};
   std::chrono::steady_clock::duration clickInterval{};
+  ScrollCarry pixels;
   bool capsLock = false;
   mutable std::mutex mutex;
   std::condition_variable wake;
@@ -102,6 +105,11 @@ class MacInput final : public InputBackend {
   void scroll(unsigned axis, int notches) override {
     InputJob job{InputJob::Kind::scroll};
     job.number = axis; job.notches = notches;
+    post(job);
+  }
+  void smoothScroll(unsigned axis, int sixteenths) override {
+    InputJob job{InputJob::Kind::smooth_scroll};
+    job.number = axis; job.sixteenths = sixteenths;
     post(job);
   }
   void resetLocks() override { post(InputJob{InputJob::Kind::locks}); }
@@ -191,7 +199,12 @@ class MacInput final : public InputBackend {
         send(mouseEvent(motionType(), position, dragButton(), 0, state));
         break;
       }
-      case InputJob::Kind::scroll: applyScroll(job.number, job.notches, state); break;
+      case InputJob::Kind::scroll:
+        applyScroll(kCGScrollEventUnitLine, job.number, job.notches * linesPerNotch, state);
+        break;
+      case InputJob::Kind::smooth_scroll:
+        applyScroll(kCGScrollEventUnitPixel, job.number, pixels.take(job.number, job.sixteenths, 16), state);
+        break;
       case InputJob::Kind::locks: applyLocks(state); break;
       case InputJob::Kind::flush: break;
       case InputJob::Kind::fence:
@@ -241,11 +254,12 @@ class MacInput final : public InputBackend {
                                 : number == 3 ? kCGMouseButtonRight : kCGMouseButtonCenter;
     send(mouseEvent(type, position, button, count, state));
   }
-  void applyScroll(unsigned axis, int notches, CGEventFlags state) {
-    const int32_t amount = scrollSign * notches;
+  void applyScroll(CGScrollEventUnit unit, unsigned axis, int steps, CGEventFlags state) {
+    if (!steps) return;
+    const int32_t amount = scrollSign * steps;
     CGEventRef event = axis == 0
-        ? CGEventCreateScrollWheelEvent2(source, kCGScrollEventUnitLine, 1, amount, 0, 0)
-        : CGEventCreateScrollWheelEvent2(source, kCGScrollEventUnitLine, 2, 0, amount, 0);
+        ? CGEventCreateScrollWheelEvent2(source, unit, 1, amount, 0, 0)
+        : CGEventCreateScrollWheelEvent2(source, unit, 2, 0, amount, 0);
     send(withFlags(event, state));
   }
   void applyLocks(CGEventFlags state) {
