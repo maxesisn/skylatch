@@ -1,13 +1,13 @@
 //! C ABI for native viewers. See `include/skylatch_client_core.h` for the public contract.
 
-use crate::{session::Connection, ClientError, Event, SendError, SessionClient};
+use crate::{session::Connection, ClientError, Event, MonitorInfo, SendError, SessionClient};
 use skylatch_proto::nsl1::{self, Cursor, Header, Nsl1Error, INPUT_SIZE};
 use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr,
-    sync::mpsc,
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
 };
 
@@ -94,7 +94,8 @@ fn error_code(e: &Nsl1Error) -> c_int {
         Nsl1Error::UnknownType(_) => SKYLATCH_ERR_UNKNOWN_TYPE,
         Nsl1Error::BadFlags(_) => SKYLATCH_ERR_BAD_FLAGS,
         Nsl1Error::ZeroGeneration => SKYLATCH_ERR_ZERO_GENERATION,
-        _ => SKYLATCH_ERR_TOO_LARGE,
+        Nsl1Error::PayloadTooLarge(_) => SKYLATCH_ERR_TOO_LARGE,
+        _ => SKYLATCH_ERR_INVALID,
     }
 }
 
@@ -109,6 +110,92 @@ pub struct SkylatchCallbacks {
     pub on_disconnected: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
 }
 
+/// Optional SL1 callbacks, registered independently of the original callback table.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SkylatchSl1Callbacks {
+    pub on_monitor_list: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
+    pub on_clipboard_data: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct ForeignSl1Callbacks {
+    table: SkylatchSl1Callbacks,
+    user_data: *mut c_void,
+}
+
+// SAFETY: registration requires callback code and user_data to remain valid for the worker.
+unsafe impl Send for ForeignSl1Callbacks {}
+
+#[derive(Default)]
+struct Sl1State {
+    callbacks: Option<ForeignSl1Callbacks>,
+    latest_monitors: Option<Arc<[u8]>>,
+    replay_monitors: bool,
+}
+
+#[derive(Default)]
+struct Sl1Dispatch {
+    state: Mutex<Sl1State>,
+    changed: tokio::sync::Notify,
+}
+
+impl Sl1Dispatch {
+    fn set(&self, callbacks: Option<ForeignSl1Callbacks>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.callbacks = callbacks;
+            state.replay_monitors = callbacks.is_some_and(|cb| cb.table.on_monitor_list.is_some());
+        }
+        self.changed.notify_one();
+    }
+
+    fn dispatch_monitor_list(&self, monitors: &[MonitorInfo]) {
+        let json: Arc<[u8]> = serde_json::to_vec(monitors)
+            .expect("serializable monitor list")
+            .into();
+        let callbacks = {
+            let mut state = self.state.lock().unwrap();
+            state.latest_monitors = Some(json.clone());
+            state.replay_monitors = false;
+            state.callbacks
+        };
+        Self::call_monitors(callbacks, &json);
+    }
+
+    fn replay_monitor_list(&self) {
+        let (callbacks, json) = {
+            let mut state = self.state.lock().unwrap();
+            if !std::mem::take(&mut state.replay_monitors) {
+                return;
+            }
+            (state.callbacks, state.latest_monitors.clone())
+        };
+        if let Some(json) = json {
+            Self::call_monitors(callbacks, &json);
+        }
+    }
+
+    fn call_monitors(callbacks: Option<ForeignSl1Callbacks>, json: &[u8]) {
+        if let Some(callbacks) = callbacks {
+            if let Some(f) = callbacks.table.on_monitor_list {
+                // SAFETY: registration keeps callback code and user_data alive until destroy.
+                unsafe { f(callbacks.user_data, json.as_ptr().cast(), json.len()) };
+            }
+        }
+    }
+
+    fn dispatch_clipboard(&self, text: &str) {
+        let callbacks = self.state.lock().unwrap().callbacks;
+        if let Some(callbacks) = callbacks {
+            if let Some(f) = callbacks.table.on_clipboard_data {
+                // SAFETY: registration keeps callback code and user_data alive until destroy.
+                unsafe { f(callbacks.user_data, text.as_ptr().cast(), text.len()) };
+            }
+        }
+    }
+}
+
 struct ForeignCallbacks {
     table: SkylatchCallbacks,
     user_data: *mut c_void,
@@ -119,7 +206,7 @@ struct ForeignCallbacks {
 unsafe impl Send for ForeignCallbacks {}
 
 impl ForeignCallbacks {
-    fn dispatch(&self, event: Event) {
+    fn dispatch(&self, event: Event, sl1: &Sl1Dispatch) {
         let user = self.user_data;
         // SAFETY: function pointers and user_data are valid until the worker has stopped. Each
         // payload is owned here and stays live throughout its respective callback.
@@ -161,6 +248,8 @@ impl ForeignCallbacks {
                         f(user);
                     }
                 }
+                Event::MonitorList(monitors) => sl1.dispatch_monitor_list(&monitors),
+                Event::ClipboardData(text) => sl1.dispatch_clipboard(&text),
                 Event::Disconnected(result) => {
                     if let Some(f) = self.table.on_disconnected {
                         let error = result.err().map(|err| c_error(&err.to_string()));
@@ -176,6 +265,7 @@ impl ForeignCallbacks {
 pub struct SkylatchClient {
     session: SessionClient,
     worker: JoinHandle<()>,
+    sl1: Arc<Sl1Dispatch>,
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -189,6 +279,8 @@ fn start_worker(
     callbacks: ForeignCallbacks,
 ) -> Result<SkylatchClient, String> {
     let (ready, status) = mpsc::sync_channel::<Result<SessionClient, String>>(0);
+    let sl1 = Arc::new(Sl1Dispatch::default());
+    let worker_sl1 = sl1.clone();
     let worker = thread::Builder::new()
         .name("skylatch-client".into())
         .spawn(move || {
@@ -202,10 +294,17 @@ fn start_worker(
             rt.block_on(async move {
                 match open.await {
                     Ok(connection) => {
+                        let dispatch = worker_sl1.clone();
                         let (client, pump) =
-                            connection.start(move |event| callbacks.dispatch(event));
+                            connection.start(move |event| callbacks.dispatch(event, &dispatch));
                         if ready.send(Ok(client)).is_ok() {
-                            pump.await;
+                            tokio::pin!(pump);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut pump => break,
+                                    _ = worker_sl1.changed.notified() => worker_sl1.replay_monitor_list(),
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -218,7 +317,13 @@ fn start_worker(
         })
         .map_err(|e| e.to_string())?;
     let error = match status.recv() {
-        Ok(Ok(session)) => return Ok(SkylatchClient { session, worker }),
+        Ok(Ok(session)) => {
+            return Ok(SkylatchClient {
+                session,
+                worker,
+                sl1,
+            })
+        }
         Ok(Err(error)) => error,
         Err(_) => "client worker stopped during handshake".into(),
     };
@@ -391,7 +496,10 @@ fn send_code(result: Result<(), SendError>) -> i32 {
         Err(SendError::Closed) => SKYLATCH_ERR_CLOSED,
         Err(SendError::QueueFull) => SKYLATCH_ERR_QUEUE_FULL,
         Err(SendError::NotReady) => SKYLATCH_ERR_NOT_READY,
-        Err(SendError::InvalidAck | SendError::InvalidInput(_)) => SKYLATCH_ERR_INVALID,
+        Err(SendError::InvalidSl1(Nsl1Error::PayloadTooLarge(_))) => SKYLATCH_ERR_TOO_LARGE,
+        Err(SendError::InvalidAck | SendError::InvalidInput(_) | SendError::InvalidSl1(_)) => {
+            SKYLATCH_ERR_INVALID
+        }
     }
 }
 
@@ -440,6 +548,83 @@ pub unsafe extern "C" fn skylatch_send_input(
     )
 }
 
+/// Register or clear the separate SL1 callback table. The table, if provided, is copied.
+///
+/// # Safety
+/// `client` must be null or a live handle not concurrently being destroyed. `callbacks` must
+/// be null or a readable callback table. Keep callback code and `user_data` valid until destroy,
+/// including those from previous registrations, since a callback may already be in flight.
+#[no_mangle]
+pub unsafe extern "C" fn skylatch_set_sl1_callbacks(
+    client: *mut SkylatchClient,
+    callbacks: *const SkylatchSl1Callbacks,
+    user_data: *mut c_void,
+) -> i32 {
+    let Some(client) = (unsafe { client.as_ref() }) else {
+        return SKYLATCH_ERR_NULL;
+    };
+    let callbacks = unsafe { callbacks.as_ref() }.map(|table| ForeignSl1Callbacks {
+        table: *table,
+        user_data,
+    });
+    client.sl1.set(callbacks);
+    SKYLATCH_OK
+}
+
+/// Queue UTF-8 clipboard bytes without waiting for the network. Length zero clears the text.
+///
+/// # Safety
+/// `client` must be null or a live handle not concurrently being destroyed; `utf8` must point
+/// to `len` readable bytes. A null `utf8` is allowed only with zero length.
+#[no_mangle]
+pub unsafe extern "C" fn skylatch_send_clipboard(
+    client: *mut SkylatchClient,
+    utf8: *const c_char,
+    len: usize,
+) -> i32 {
+    let Some(client) = (unsafe { client.as_ref() }) else {
+        return SKYLATCH_ERR_NULL;
+    };
+    if utf8.is_null() && len != 0 {
+        return SKYLATCH_ERR_NULL;
+    }
+    if len > nsl1::MAX_CLIPBOARD_DATA {
+        return SKYLATCH_ERR_TOO_LARGE;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: caller provides `len` readable bytes.
+        unsafe { std::slice::from_raw_parts(utf8.cast::<u8>(), len) }
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return SKYLATCH_ERR_INVALID;
+    };
+    send_code(client.session.send_clipboard(text))
+}
+
+/// Queue a monitor selection without waiting for the network.
+///
+/// # Safety
+/// `client` must be null or a live handle not concurrently being destroyed; `monitor_id` must
+/// be null or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn skylatch_select_monitor(
+    client: *mut SkylatchClient,
+    monitor_id: *const c_char,
+) -> i32 {
+    let Some(client) = (unsafe { client.as_ref() }) else {
+        return SKYLATCH_ERR_NULL;
+    };
+    if monitor_id.is_null() {
+        return SKYLATCH_ERR_NULL;
+    }
+    let Ok(id) = (unsafe { CStr::from_ptr(monitor_id) }).to_str() else {
+        return SKYLATCH_ERR_INVALID;
+    };
+    send_code(client.session.select_monitor(id))
+}
+
 /// Disconnect, wait for the worker to stop, and free the handle.
 ///
 /// # Safety
@@ -456,7 +641,9 @@ pub unsafe extern "C" fn skylatch_destroy(client: *mut SkylatchClient) {
         return;
     }
     // SAFETY: the caller transfers the handle back exactly once.
-    let SkylatchClient { session, worker } = *unsafe { Box::from_raw(client) };
+    let SkylatchClient {
+        session, worker, ..
+    } = *unsafe { Box::from_raw(client) };
     drop(session);
     let _ = worker.join();
 }

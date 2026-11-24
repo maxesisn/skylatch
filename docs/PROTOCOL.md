@@ -2,7 +2,7 @@
 
 Skylatch uses two planes over WebSocket (and, for the direct path, the same framing over TCP):
 
-- **Data plane** — binary `NSL1` messages: video, ACKs, input, cursor, clipboard notices.
+- **Data plane** — binary `NSL1` messages: video, ACKs, input, cursor, monitor selection, and bidirectional clipboard data.
 - **Control plane** — JSON text messages between host/client and the hub.
 
 The WebSocket subprotocol for the data plane is `nsl1`. One WebSocket message carries exactly one
@@ -50,8 +50,8 @@ flow-control credit. Hosts allow at most 3 seconds of frames at the configured f
 **Cursor.** At most 256 × 256 pixels, straight-alpha RGBA row by row, hotspot inside the image.
 Eight zero bytes restore the local arrow; a fully transparent image hides the cursor. No ACK.
 
-**Clipboard notice.** The remote clipboard changed. The text itself is fetched out of band (see
-[SL1 extensions](#planned-sl1-extensions)). No ACK.
+**Clipboard notice.** Legacy notification that the remote clipboard changed; it carries no text.
+SL1 peers use [`ClipboardData`](#sl1-extensions) for text synchronization. No ACK.
 
 **Counters.** Reconnect when the frame sequence reaches 4294967295.
 
@@ -80,18 +80,42 @@ Eight zero bytes restore the local arrow; a fully transparent image hides the cu
 Masks do not press or release anything; send explicit down and up events. Held keys and buttons
 are released when the connection loses input.
 
-### Planned SL1 extensions
+### SL1 extensions
 
-`SL1` extends `NSL1` with message types at 16 and above. They are a draft: names and layouts may
-change before they are implemented, and an endpoint must not send them unless the peer advertised
-support.
+SL1 extends the NSL1 framing with implemented v0.1 message types. They use the same 20-byte
+header, with version `1`, sequence `0`, and flags `0`. A peer may send these messages whenever the
+session is established; they are valid over both Hub Relay and Direct paths. Payload lengths below
+are byte lengths, not character counts. Receivers reject an invalid length, invalid UTF-8, or
+invalid JSON.
 
-| Type | Name | Purpose |
-| ---: | --- | --- |
-| 16 | Resize | Viewer asks the host to change the desktop size; host replies with a keyframe at the new size |
-| 17 | Monitor list | Host announces displays: id, geometry, primary flag |
-| 18 | Select monitor | Viewer selects the display to stream |
-| 19 | Clipboard data | Bidirectional UTF-8 text clipboard transfer |
+| Type | Name | Direction | Payload |
+| ---: | --- | --- | --- |
+| 16 | Resize | viewer → host | Reserved for a future implementation |
+| 17 | `MonitorList` | host → viewer | UTF-8 JSON encoding of `MonitorInfo[]`, at most 64 KiB |
+| 18 | `SelectMonitor` | viewer → host | Non-empty UTF-8 monitor ID, at most 256 bytes |
+| 19 | `ClipboardData` | host ↔ viewer | UTF-8 text, at most 1 MiB (1,048,576 bytes) |
+
+`MonitorInfo` is a JSON object with the following required fields (member order is not significant):
+
+```json
+{
+  "id": "opaque monitor identifier",
+  "name": "display name",
+  "x": -1920,
+  "y": 0,
+  "width": 1920,
+  "height": 1080,
+  "primary": true,
+  "active": true
+}
+```
+
+`x` and `y` are signed 32-bit pixel coordinates. `width` and `height` are unsigned 16-bit pixel
+sizes. `primary` identifies the host's primary display and `active` indicates the currently selected
+display. The `SelectMonitor` payload is the raw UTF-8 bytes of the selected `id`; it
+has no JSON or NUL terminator. `ClipboardData` is the raw UTF-8 text bytes, including an empty
+payload to clear the text clipboard. Type 19 is used in both directions and replaces the HTTP-only
+clipboard transfer for an active session. None of Types 17–19 carries an ACK.
 
 ## Control plane: JSON over WSS
 
@@ -137,8 +161,10 @@ Hub to host:
 | `request_keyframe` | `session_id` | The hub dropped frames for a slow client; emit a keyframe |
 | `error` | `code`, `message` | Rejection, for example `unauthorized` or `invalid` |
 
-Binary messages from the host are `NSL1` frames, cursors and notices for the active session;
-binary messages to the host are ACKs and input.
+For the active session, the hub relays `NSL1` frames, cursors, monitor lists, and clipboard messages
+from the host, and ACKs, input, monitor selections, and clipboard data from the viewer. Only delta
+video frames may be dropped under backpressure; a stalled peer that cannot accept a reliable message
+within the relay's queue deadline can be disconnected.
 
 ### Client ↔ hub (`/ws/client`)
 

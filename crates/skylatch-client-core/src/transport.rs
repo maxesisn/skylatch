@@ -1,9 +1,10 @@
 //! WebSocket handshakes and hub control-plane exchanges.
 
-use crate::ClientError;
+use crate::{ClientError, Event, Frame};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::control::{ClientToHub, DeviceInfo, DirectEndpoint, HubToClient};
-use skylatch_proto::nsl1::{HEADER_SIZE, MAX_PAYLOAD, SUBPROTOCOL};
+use skylatch_proto::nsl1::{Message as Nsl1, HEADER_SIZE, MAX_PAYLOAD, SUBPROTOCOL};
 use std::{net::Ipv6Addr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, task::JoinSet, time::timeout};
 use tokio_tungstenite::{
@@ -34,6 +35,40 @@ fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(limit))
         .max_frame_size(Some(limit))
+}
+
+/// Direct and relay share the same host-to-viewer NSL1 message types.
+pub(crate) fn decode_stream_event(bytes: &Bytes) -> Result<(u32, Event), ClientError> {
+    Ok(match Nsl1::decode(bytes)? {
+        Nsl1::Frame {
+            generation,
+            sequence,
+            width,
+            height,
+            capture_us,
+            keyframe,
+            data,
+        } => (
+            generation,
+            Event::Frame(Frame {
+                generation,
+                sequence,
+                width,
+                height,
+                capture_us,
+                is_keyframe: keyframe,
+                annex_b: data,
+            }),
+        ),
+        Nsl1::Cursor { generation, cursor } => (generation, Event::Cursor(cursor)),
+        Nsl1::ClipboardNotice { generation } => (generation, Event::ClipboardNotice),
+        Nsl1::MonitorList {
+            generation,
+            monitors,
+        } => (generation, Event::MonitorList(monitors)),
+        Nsl1::ClipboardData { generation, text } => (generation, Event::ClipboardData(text)),
+        _ => return Err(ClientError::Unexpected("unexpected NSL1 message from host")),
+    })
 }
 
 async fn connect_socket(request: Request) -> Result<(Socket, Response), ClientError> {
