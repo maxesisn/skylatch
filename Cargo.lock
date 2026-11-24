@@ -1291,6 +1291,7 @@ dependencies = [
  "skylatch-client-core",
  "skylatch-hub",
  "skylatch-proto",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-tungstenite 0.28.0",

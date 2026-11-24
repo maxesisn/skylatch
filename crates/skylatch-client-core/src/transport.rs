@@ -358,3 +358,67 @@ async fn tcp_probe(request: Request) -> Option<(Request, TcpStream)> {
     stream.set_nodelay(true).ok()?;
     Some((request, stream))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skylatch_proto::control::EndpointKind;
+
+    fn endpoint(host: &str) -> DirectEndpoint {
+        DirectEndpoint {
+            kind: EndpointKind::Lan,
+            host: host.into(),
+            port: 17915,
+        }
+    }
+
+    fn uri_of(host: &str) -> Option<String> {
+        endpoint_request(&endpoint(host), None).map(|r| {
+            let uri = r.uri();
+            format!(
+                "{}:{}{}",
+                uri.host().unwrap(),
+                uri.port_u16().unwrap(),
+                uri.path()
+            )
+        })
+    }
+
+    #[test]
+    fn brackets_ipv6_literals_once() {
+        for host in ["2001:db8::1", "[2001:db8::1]", "2001:0db8:0:0:0:0:0:1"] {
+            assert_eq!(
+                uri_of(host).as_deref(),
+                Some("[2001:db8::1]:17915/stream"),
+                "{host}"
+            );
+        }
+        assert_eq!(uri_of("fd00::5").as_deref(), Some("[fd00::5]:17915/stream"));
+    }
+
+    #[test]
+    fn keeps_ipv4_and_names_unbracketed() {
+        assert_eq!(
+            uri_of("10.50.2.86").as_deref(),
+            Some("10.50.2.86:17915/stream")
+        );
+        assert_eq!(
+            uri_of("host-1.lan").as_deref(),
+            Some("host-1.lan:17915/stream")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_hosts() {
+        for host in ["", "2001:db8::zz", "a b", "evil/path", "a@b"] {
+            assert_eq!(uri_of(host), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn direct_url_accepts_bracketed_ipv6() {
+        let request = direct_request("ws://[2001:db8::1]:17915/stream", None).unwrap();
+        assert_eq!(request.uri().host(), Some("[2001:db8::1]"));
+        assert_eq!(request.uri().port_u16(), Some(17915));
+    }
+}

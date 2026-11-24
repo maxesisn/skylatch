@@ -7,8 +7,7 @@ use crate::hardware::detect_hardware_profile;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::control::{DeviceInfo, HostToHub, HubToHost};
 use skylatch_proto::credentials::random_token;
-use std::{io, net::Ipv4Addr, sync::Arc, time::Duration};
-use tokio::net::TcpListener;
+use std::{io, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
@@ -54,7 +53,7 @@ pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("the direct listener requires a loopback engine URL".into());
     }
     let listener = if direct_enabled {
-        Some(TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.direct_port)).await?)
+        Some(direct::bind(cli.direct_port).await?)
     } else {
         None
     };

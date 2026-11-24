@@ -140,6 +140,37 @@ fn ioreg_product_name() -> Option<String> {
     parse_ioreg_property(&String::from_utf8_lossy(&output.stdout), "product-name")
 }
 
+/// Apple Silicon identifiers whose screen size is fixed by the model; the chip comes from the CPU.
+const SIZED: &[(&str, &str, &str)] = &[
+    ("Mac14,2", "MacBook Air", "13-inch"),
+    ("Mac14,15", "MacBook Air", "15-inch"),
+    ("Mac15,12", "MacBook Air", "13-inch"),
+    ("Mac15,13", "MacBook Air", "15-inch"),
+    ("Mac16,12", "MacBook Air", "13-inch"),
+    ("Mac16,13", "MacBook Air", "15-inch"),
+    ("Mac14,7", "MacBook Pro", "13-inch"),
+    ("Mac14,5", "MacBook Pro", "14-inch"),
+    ("Mac14,9", "MacBook Pro", "14-inch"),
+    ("Mac14,6", "MacBook Pro", "16-inch"),
+    ("Mac14,10", "MacBook Pro", "16-inch"),
+    ("Mac15,3", "MacBook Pro", "14-inch"),
+    ("Mac15,6", "MacBook Pro", "14-inch"),
+    ("Mac15,8", "MacBook Pro", "14-inch"),
+    ("Mac15,10", "MacBook Pro", "14-inch"),
+    ("Mac15,7", "MacBook Pro", "16-inch"),
+    ("Mac15,9", "MacBook Pro", "16-inch"),
+    ("Mac15,11", "MacBook Pro", "16-inch"),
+    ("Mac16,1", "MacBook Pro", "14-inch"),
+    ("Mac16,6", "MacBook Pro", "14-inch"),
+    ("Mac16,8", "MacBook Pro", "14-inch"),
+    ("Mac16,5", "MacBook Pro", "16-inch"),
+    ("Mac16,7", "MacBook Pro", "16-inch"),
+    ("Mac15,4", "iMac", "24-inch"),
+    ("Mac15,5", "iMac", "24-inch"),
+    ("Mac16,2", "iMac", "24-inch"),
+    ("Mac16,3", "iMac", "24-inch"),
+];
+
 /// Marketing family for a `hw.model` identifier, for Macs whose IORegistry has no `product-name`.
 fn family_from_identifier(identifier: &str) -> Option<&'static str> {
     const PREFIXES: &[(&str, &str)] = &[
@@ -164,6 +195,7 @@ fn family_from_identifier(identifier: &str) -> Option<&'static str> {
         ("Mac14,14", "Mac Studio"),
         ("Mac15,14", "Mac Studio"),
         ("Mac16,9", "Mac Studio"),
+        ("Mac14,8", "Mac Pro"),
     ];
     EXACT
         .iter()
@@ -184,6 +216,12 @@ fn format_mac_model(product_name: &str, identifier: &str, chip: &str) -> Option<
         clean_text(identifier),
         clean_text(chip),
     );
+    if let Some((_, family, size)) = SIZED.iter().find(|(id, ..)| *id == identifier) {
+        return Some(match chip.strip_prefix("Apple ") {
+            Some(chip) => format!("{family} ({size}, {chip})"),
+            None => format!("{family} ({size})"),
+        });
+    }
     let name = if !product_name.is_empty() {
         product_name
     } else if let Some(family) = family_from_identifier(&identifier) {
@@ -274,8 +312,28 @@ mod tests {
     #[test]
     fn formats_mac_models() {
         assert_eq!(
-            format_mac_model("MacBook Pro", "Mac16,1", "Apple M4 Pro").as_deref(),
-            Some("MacBook Pro (Apple M4 Pro)")
+            format_mac_model("MacBook Pro", "Mac16,1", "Apple M4").as_deref(),
+            Some("MacBook Pro (14-inch, M4)")
+        );
+        assert_eq!(
+            format_mac_model("MacBook Pro", "Mac16,5", "Apple M4 Max").as_deref(),
+            Some("MacBook Pro (16-inch, M4 Max)")
+        );
+        assert_eq!(
+            format_mac_model("", "Mac16,12", "Apple M4").as_deref(),
+            Some("MacBook Air (13-inch, M4)")
+        );
+        assert_eq!(
+            format_mac_model("MacBook Air", "Mac16,13", "Apple M4").as_deref(),
+            Some("MacBook Air (15-inch, M4)")
+        );
+        assert_eq!(
+            format_mac_model("", "Mac16,3", "Apple M4").as_deref(),
+            Some("iMac (24-inch, M4)")
+        );
+        assert_eq!(
+            format_mac_model("", "Mac15,14", "Apple M3 Ultra").as_deref(),
+            Some("Mac Studio (Apple M3 Ultra)")
         );
         assert_eq!(
             format_mac_model("", "Mac16,10", "Apple M4").as_deref(),

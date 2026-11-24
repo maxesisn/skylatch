@@ -619,7 +619,7 @@ async fn join_saves_config_and_direct_listener_authenticates_and_streams() {
         for endpoint in &device.direct_endpoints {
             assert!(endpoint
                 .host
-                .parse::<std::net::Ipv4Addr>()
+                .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| !ip.is_loopback()));
             assert_eq!(endpoint.port, device.direct_endpoints[0].port);
         }
