@@ -8,27 +8,31 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod config;
+mod host_mgr;
 mod iso;
 mod live;
 mod onboard;
 mod onboard_view;
 mod scene;
 mod theme;
+mod tray;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, FocusHandle, FontWeight,
-    Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
-    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions, canvas, div, fill, point, px, size,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, FocusHandle,
+    FontWeight, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    PathBuilder, Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions, canvas, div, fill, point, px, size,
 };
 use skylatch_proto::control::DeviceInfo;
 
 use config::{Config, Effective};
+use host_mgr::{HostManager, HostStatus};
 use iso::*;
 use live::{HubTarget, LiveHandle};
 use onboard::{Code, HubSubmit, Onboarding, Pairing, Tab};
@@ -36,6 +40,9 @@ use scene::*;
 use theme::{Pal, Rgb};
 
 pub const DOT_STEP: f32 = 22.0;
+
+/// Set when the user chose "退出 Skylatch": from then on closing the window really closes it.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 const HELP: &str = "\
 Skylatch desktop launcher — isometric corner desks, a VM mini rack and a shelf (GPUI)
@@ -57,6 +64,14 @@ same settings can be typed into the in-window Hub drawer (click the Hub pill, or
 Without them the first-run screen offers to sign in to a hub (password or account token) or
 to connect to one host directly, and shows an empty L-shaped desk until a device appears.
 While signed in, `+ Add device` shows a one-time pairing code for `skylatch-agent join`.
+
+THIS MACHINE
+    While signed in to a hub, the launcher can also let other devices take over this machine:
+    it enrolls the machine (a per-device token, never your password) and keeps a local
+    skylatch-agent running. Switch it with the checkbox of the sign-in card, the chip in the
+    top bar or the tray menu. Closing the window hides it to the system tray; \"退出 Skylatch\"
+    in the tray menu stops the agent and exits. Needs skylatch-agent and skylatch-host-engine
+    next to this program (or in a source checkout's target/release and host folders).
 
 KEYS
     Left / Right / Tab   cycle screens (Shift+Tab reverses)
@@ -597,6 +612,22 @@ struct Proto {
     drawer: Drawer,
     onb: Onboarding,
     pair: Pairing,
+    /// Keeps the local agent running so other devices can take this machine over.
+    host: Option<Arc<HostManager>>,
+    /// Last host status painted (and announced); the pump repaints when it changes.
+    host_seen: HostStatus,
+    /// A tray icon exists: closing the window hides it instead of quitting.
+    tray_active: bool,
+}
+
+/// What the shell around the view has to do after a tray action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shell {
+    Nothing,
+    /// Show and focus the window.
+    Show,
+    /// Stop the agent and exit.
+    Quit,
 }
 
 impl Proto {
@@ -661,6 +692,9 @@ impl Proto {
             pump_running: false,
             onb: Onboarding::new(),
             pair: Pairing::new(),
+            host: None,
+            host_seen: HostStatus::Off,
+            tray_active: false,
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -677,6 +711,88 @@ impl Proto {
         self.ensure_pump(cx);
         if self.eff.live() {
             self.live_connect(cx);
+        }
+        self.sync_host();
+    }
+
+    // ───────────── hosting this machine, tray ─────────────
+
+    /// Connects the view to the local-agent supervisor (and says whether a tray icon exists).
+    fn attach_host(&mut self, host: Option<Arc<HostManager>>, tray_active: bool) {
+        self.host = host;
+        self.tray_active = tray_active;
+    }
+
+    /// Tells the supervisor what should run: host this machine for the signed-in hub, or nothing.
+    fn sync_host(&mut self) {
+        let Some(host) = &self.host else { return };
+        let hub = self.eff.live().then(|| self.live_target());
+        host.configure(self.stored.host_enabled, hub);
+    }
+
+    fn host_status(&self) -> HostStatus {
+        self.host.as_ref().map(|h| h.status()).unwrap_or_default()
+    }
+
+    /// Text of the tray's hosting item.
+    fn host_menu_text(&self) -> String {
+        tray::host_label(self.stored.host_enabled, &self.host_status())
+    }
+
+    /// Switches hosting this machine on or off and remembers the choice.
+    fn set_host_enabled(&mut self, on: bool) {
+        self.stored.host_enabled = on;
+        self.save_config();
+        self.sync_host();
+        let text = match (on, self.eff.live()) {
+            (true, true) => "已允许远端接管本机",
+            (true, false) => "已允许远端接管本机 · 登录 Hub 后生效",
+            (false, _) => "已暂停本机被控 · 其他设备无法再连接本机",
+        };
+        self.say(text, false);
+        self.kick();
+    }
+
+    /// Stops the local agent now (quit, or the window closes for good).
+    fn shutdown_host(&self) {
+        if let Some(host) = &self.host {
+            host.shutdown();
+        }
+    }
+
+    /// Closing the window keeps the process (and the agent) alive in the tray, but only while
+    /// there is something to keep alive: a signed-in hub, a tray icon, and no `--demo`.
+    fn close_to_tray(&self) -> bool {
+        self.tray_active && !self.eff.demo && self.eff.live()
+    }
+
+    /// The window's close button: hide to the tray, or stop the agent and close.
+    fn request_close(&mut self, window: &mut Window, cx: &mut App) {
+        if self.close_to_tray() && tray::hide_main_window(window, cx) {
+            return;
+        }
+        self.shutdown_host();
+        window.remove_window();
+    }
+
+    /// Applies one tray action to the view state; the shell shows the window or quits.
+    fn on_tray_action(&mut self, action: tray::Action) -> Shell {
+        match action {
+            tray::Action::Open => Shell::Show,
+            tray::Action::ToggleHost => {
+                self.set_host_enabled(!self.stored.host_enabled);
+                Shell::Nothing
+            }
+            tray::Action::AddDevice => {
+                if self.eff.live() {
+                    self.open_pair_modal();
+                } else {
+                    self.say("请先登录 Hub，再添加设备", false);
+                    self.kick();
+                }
+                Shell::Show
+            }
+            tray::Action::Quit => Shell::Quit,
         }
     }
 
@@ -1093,6 +1209,7 @@ impl Proto {
         self.devices.clear();
         self.install_scenes(build_scene(&[]));
         self.live_connect(cx);
+        self.sync_host();
     }
 
     /// Forgets the hub (and `--demo`): back to the first-run onboarding.
@@ -1114,6 +1231,7 @@ impl Proto {
         self.pair.reset();
         self.onb = Onboarding::new();
         self.install_scenes(build_scene(&[]));
+        self.sync_host();
         self.say("已退出 · 已清除保存的 Hub 地址与 Token", false);
     }
 
@@ -1161,6 +1279,7 @@ impl Proto {
             Tab::Hub => match self.onb.hub_submit() {
                 Err(e) => self.onb.error = Some(e),
                 Ok(HubSubmit::Token { url, token }) => {
+                    self.stored.host_enabled = self.onb.host_enabled;
                     self.onb = Onboarding::new();
                     self.adopt_hub(url, token, cx);
                     self.say("正在连接 Hub…", false);
@@ -1282,6 +1401,7 @@ impl Proto {
                 let (url, _) = self.onb.login.take().expect("login in flight");
                 match outcome {
                     Ok(token) => {
+                        self.stored.host_enabled = self.onb.host_enabled;
                         self.onb = Onboarding::new();
                         self.adopt_hub(url, token, cx);
                         self.say("已登录 · 正在加载设备…", false);
@@ -1332,6 +1452,22 @@ impl Proto {
                 }
             }
             Some((_, Err(TryRecvError::Empty))) | None => {}
+        }
+
+        // local agent: repaint the chip and tell the user about problems once per change
+        let host_now = self.host_status();
+        if host_now != self.host_seen {
+            match &host_now {
+                HostStatus::Missing(why) | HostStatus::Retrying(why) => {
+                    self.say(why.clone(), matches!(host_now, HostStatus::Retrying(_)));
+                }
+                HostStatus::Running if self.stored.host_enabled => {
+                    self.say("本机已就绪 · 可被其他设备连接", false);
+                }
+                _ => {}
+            }
+            self.host_seen = host_now;
+            changed = true;
         }
 
         // the countdown only repaints when the visible minute (or the expiry) changes
@@ -1560,6 +1696,7 @@ impl Proto {
         glyph: &'static str,
         area: WindowControlArea,
         pal: &Pal,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let close = area == WindowControlArea::Close;
         let hover_bg = if close {
@@ -1583,12 +1720,14 @@ impl Proto {
             .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
             .text_color(rgba(pal.ink, 1.0))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(move |_, window, _| match area {
-                WindowControlArea::Min => window.minimize_window(),
-                WindowControlArea::Max => Self::toggle_maximize(window),
-                WindowControlArea::Close => window.remove_window(),
-                _ => {}
-            })
+            .on_click(
+                cx.listener(move |this, _e: &ClickEvent, window, cx| match area {
+                    WindowControlArea::Min => window.minimize_window(),
+                    WindowControlArea::Max => Self::toggle_maximize(window),
+                    WindowControlArea::Close => this.request_close(window, cx),
+                    _ => {}
+                }),
+            )
             .child(
                 div()
                     .font_family("Segoe MDL2 Assets")
@@ -2013,6 +2152,11 @@ impl Render for Proto {
                     }),
             )
             .children(live_mode.then(|| self.add_device_button(&pal, cx)))
+            .children(
+                live_mode
+                    .then(|| self.host_chip(&pal, f(vp.width) >= 1100.0, cx))
+                    .flatten(),
+            )
             .child(
                 div()
                     .w(px(22.0))
@@ -2112,7 +2256,7 @@ impl Render for Proto {
                     .window_control_area(WindowControlArea::Drag),
             )
             .when(cfg!(windows), |d| {
-                d.child(self.win_btn("w-min", "\u{E921}", WindowControlArea::Min, &pal))
+                d.child(self.win_btn("w-min", "\u{E921}", WindowControlArea::Min, &pal, cx))
                     .child(self.win_btn(
                         "w-max",
                         if window.is_maximized() {
@@ -2122,8 +2266,9 @@ impl Render for Proto {
                         },
                         WindowControlArea::Max,
                         &pal,
+                        cx,
                     ))
-                    .child(self.win_btn("w-close", "\u{E8BB}", WindowControlArea::Close, &pal))
+                    .child(self.win_btn("w-close", "\u{E8BB}", WindowControlArea::Close, &pal, cx))
             });
 
         // ── stage overlays ──
@@ -2826,7 +2971,23 @@ fn main() {
     };
     let eff = config::resolve(&stored, &cli, &config::process_env);
 
+    // `--demo` shows a fake fleet and hosts nothing: no agent, no tray icon
+    let host = (!eff.demo).then(|| Arc::new(HostManager::spawn()));
+
     Application::new().run(move |cx| {
+        let tray = if eff.demo {
+            None
+        } else {
+            match tray::Tray::new(&tray::host_label(stored.host_enabled, &HostStatus::Off)) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("skylatch-ui: no tray icon: {e}");
+                    None
+                }
+            }
+        };
+        let tray_active = tray.is_some();
+
         let bounds = Bounds::centered(None, size(px(1360.0), px(860.0)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2838,24 +2999,99 @@ fn main() {
             window_min_size: Some(size(px(960.0), px(640.0))),
             ..Default::default()
         };
-        cx.open_window(opts, |window, cx| {
-            let view = cx.new(|cx| {
-                let mut p = Proto::new(cx, stored, eff, config_path);
-                p.start(cx);
-                p
-            });
-            window.focus(&view.read(cx).focus);
-            view
-        })
-        .expect("open window");
+        let host_for_window = host.clone();
+        let window = cx
+            .open_window(opts, move |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut p = Proto::new(cx, stored, eff, config_path);
+                    p.attach_host(host_for_window, tray_active);
+                    p.start(cx);
+                    p
+                });
+                // Alt+F4 and the macOS close button: hide to the tray, or let the window go
+                // after the agent is stopped
+                let closing = view.clone();
+                window.on_window_should_close(cx, move |window, cx| {
+                    if QUITTING.load(Ordering::SeqCst) {
+                        return true;
+                    }
+                    let (to_tray, host) = {
+                        let p = closing.read(cx);
+                        (p.close_to_tray(), p.host.clone())
+                    };
+                    if to_tray && tray::hide_main_window(window, cx) {
+                        return false;
+                    }
+                    if let Some(host) = host {
+                        host.shutdown();
+                    }
+                    true
+                });
+                window.focus(&view.read(cx).focus);
+                view
+            })
+            .expect("open window");
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
+        if let Some(host) = host.clone() {
+            // whichever way the app ends, no agent is left behind
+            cx.on_app_quit(move |_| {
+                host.shutdown();
+                async {}
+            })
+            .detach();
+        }
+        if let Some(tray) = tray {
+            run_tray(cx, window, tray, host.clone());
+        }
         cx.activate(true);
     });
+}
+
+/// Applies tray clicks and menu choices to the window, keeps the hosting item's text current,
+/// and on "退出 Skylatch" stops the agent, removes the icon and quits.
+fn run_tray(
+    cx: &mut App,
+    window: gpui::WindowHandle<Proto>,
+    tray: tray::Tray,
+    host: Option<Arc<HostManager>>,
+) {
+    cx.spawn(async move |cx| {
+        let mut tray = tray;
+        'pump: loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            for action in tray.drain() {
+                let shell = window.update(cx, |p, window, cx| {
+                    let shell = p.on_tray_action(action);
+                    if shell == Shell::Show {
+                        tray::show_main_window(window, cx);
+                    }
+                    shell
+                });
+                // an error means the window is gone: the app is on its way out
+                if matches!(shell, Ok(Shell::Quit) | Err(_)) {
+                    break 'pump;
+                }
+            }
+            match window.update(cx, |p, _, _| p.host_menu_text()) {
+                Ok(text) => tray.set_host_text(&text),
+                Err(_) => break,
+            }
+        }
+        QUITTING.store(true, Ordering::SeqCst);
+        if let Some(host) = host {
+            host.shutdown();
+        }
+        drop(tray);
+        cx.update(|cx| cx.quit()).ok();
+    })
+    .detach();
 }
 
 // ───────────────────────────── headless UI tests (no OS window) ─────────────────────────────
@@ -3751,7 +3987,10 @@ mod ui_tests {
         assert_eq!(view.read_with(cx, |v, _| v.onb.token.clone()), "abc");
 
         // Direct Connect needs a ws:// or wss:// URL ...
-        view.update(cx, |v, _| v.onb.set_tab(Tab::Direct));
+        view.update(cx, |v, cx| {
+            v.onb.set_tab(Tab::Direct);
+            cx.notify();
+        });
         draw(cx);
         cx.simulate_keystrokes("enter");
         assert!(view.read_with(cx, |v, _| {
@@ -4058,5 +4297,212 @@ mod ui_tests {
         cx.simulate_click(point(px(6.0), px(HEADER_H + 6.0)), Modifiers::none());
         assert!(focused(&view, cx));
         drop(other);
+    }
+
+    // ───────────── hosting this machine, tray ─────────────
+
+    use crate::host_mgr::testing::{FAST, Fake, wait_until};
+
+    /// A signed-in view whose host supervisor runs against a scripted machine.
+    fn hosted_view<'a>(
+        cx: &'a mut TestAppContext,
+        hub: &FakeHub,
+        fake: &Fake,
+        tray_active: bool,
+    ) -> (gpui::Entity<Proto>, &'a mut VisualTestContext) {
+        let host = Arc::new(HostManager::with_backend(fake.backend(), FAST));
+        let (view, cx) = live_view(cx, hub);
+        view.update(cx, |v, _| {
+            v.attach_host(Some(host), tray_active);
+            v.sync_host();
+        });
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn the_sign_in_card_offers_hosting_and_remembers_the_choice(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-host-opt-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (view, cx) = onboarding_view(cx, Some(path.clone()));
+        assert!(has_sel(cx, "onb-host"), "the checkbox is on the Hub tab");
+        assert!(
+            view.read_with(cx, |v, _| v.onb.host_enabled),
+            "checked by default"
+        );
+        click_sel(cx, "onb-host");
+        assert!(!view.read_with(cx, |v, _| v.onb.host_enabled));
+        click_sel(cx, "onb-host");
+        assert!(view.read_with(cx, |v, _| v.onb.host_enabled));
+        click_sel(cx, "onb-host");
+
+        // the direct-connect tab has no hosting option and does not touch it
+        view.update(cx, |v, cx| {
+            v.onb.set_tab(Tab::Direct);
+            cx.notify();
+        });
+        assert!(has_sel(cx, "onb-direct-url"), "the direct tab is showing");
+        assert!(!view.read_with(cx, |v, _| v.onb.host_enabled));
+        view.update(cx, |v, cx| {
+            v.onb.set_tab(Tab::Hub);
+            cx.notify();
+        });
+
+        let url = hub.http_url();
+        view.update(cx, |v, _| {
+            v.onb.hub_url = url;
+            v.onb.username = "alice".into();
+            v.onb.password = "pw".into();
+        });
+        cx.simulate_keystrokes("enter");
+        pump_until(&view, cx, "the login", |v| v.eff.live());
+        assert!(!view.read_with(cx, |v, _| v.stored.host_enabled));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"host_enabled\": false"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn the_header_chip_shows_and_toggles_local_hosting(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        fake.0.lock().unwrap().enrolled = true;
+        let (view, cx) = hosted_view(cx, &hub, &fake, true);
+        wait_until("the agent", || fake.running() == 1);
+        pump_until(&view, cx, "the running status", |v| {
+            v.host_seen == HostStatus::Running
+        });
+        assert!(has_sel(cx, "host-chip"));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.host_menu_text()),
+            "本机被控：运行中"
+        );
+
+        click_sel(cx, "host-chip");
+        assert!(!view.read_with(cx, |v, _| v.stored.host_enabled));
+        wait_until("the agent to stop", || fake.running() == 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.host_menu_text()),
+            "本机被控：已暂停"
+        );
+
+        click_sel(cx, "host-chip");
+        assert!(view.read_with(cx, |v, _| v.stored.host_enabled));
+        wait_until("the agent again", || fake.running() == 1);
+        assert_eq!(fake.0.lock().unwrap().enroll_calls, 0, "already enrolled");
+    }
+
+    #[gpui::test]
+    fn missing_host_components_are_reported_without_a_crash(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::default();
+        let (view, cx) = hosted_view(cx, &hub, &fake, true);
+        pump_until(&view, cx, "the missing notice", |v| {
+            matches!(v.host_seen, HostStatus::Missing(_))
+        });
+        let banner = view.read_with(cx, |v, _| v.banner.as_ref().map(|b| b.text.clone()));
+        assert!(
+            banner.is_some_and(|t| t.starts_with(host_mgr::MISSING_TEXT)),
+            "the banner names the problem"
+        );
+        assert!(has_sel(cx, "host-chip"), "the window still works");
+        assert_eq!(fake.0.lock().unwrap().starts, 0);
+    }
+
+    #[gpui::test]
+    fn tray_actions_drive_the_view(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        fake.0.lock().unwrap().enrolled = true;
+        let (view, cx) = hosted_view(cx, &hub, &fake, true);
+
+        assert_eq!(
+            view.update(cx, |v, _| v.on_tray_action(tray::Action::Open)),
+            Shell::Show
+        );
+        assert!(
+            !view.read_with(cx, |v, _| v.pair.open),
+            "open only shows the window"
+        );
+
+        assert_eq!(
+            view.update(cx, |v, _| v.on_tray_action(tray::Action::AddDevice)),
+            Shell::Show
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.pair.open),
+            "add device brings up the pairing dialog"
+        );
+
+        assert_eq!(
+            view.update(cx, |v, _| v.on_tray_action(tray::Action::ToggleHost)),
+            Shell::Nothing
+        );
+        assert!(!view.read_with(cx, |v, _| v.stored.host_enabled));
+        wait_until("hosting to pause", || fake.running() == 0);
+        view.update(cx, |v, _| v.on_tray_action(tray::Action::ToggleHost));
+        assert!(view.read_with(cx, |v, _| v.stored.host_enabled));
+        wait_until("hosting to resume", || fake.running() == 1);
+
+        assert_eq!(
+            view.update(cx, |v, _| v.on_tray_action(tray::Action::Quit)),
+            Shell::Quit
+        );
+    }
+
+    #[gpui::test]
+    fn adding_a_device_from_the_tray_needs_a_hub(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        let shell = view.update(cx, |v, _| v.on_tray_action(tray::Action::AddDevice));
+        assert_eq!(shell, Shell::Show);
+        assert!(!view.read_with(cx, |v, _| v.pair.open));
+        let banner = view.read_with(cx, |v, _| v.banner.as_ref().map(|b| b.text.clone()));
+        assert!(banner.is_some_and(|t| t.contains("登录")));
+        // hosting can still be switched; it applies after sign-in
+        view.update(cx, |v, _| v.on_tray_action(tray::Action::ToggleHost));
+        assert!(!view.read_with(cx, |v, _| v.stored.host_enabled));
+    }
+
+    #[gpui::test]
+    fn the_window_only_hides_to_the_tray_while_there_is_something_to_keep(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        let (view, cx) = hosted_view(cx, &hub, &fake, false);
+        let to_tray = |view: &gpui::Entity<Proto>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, _| v.close_to_tray())
+        };
+        assert!(!to_tray(&view, cx), "no tray icon: closing quits");
+        view.update(cx, |v, _| v.tray_active = true);
+        assert!(to_tray(&view, cx), "signed in with a tray icon: hide");
+        view.update(cx, |v, _| v.eff.demo = true);
+        assert!(!to_tray(&view, cx), "--demo hosts nothing");
+        view.update(cx, |v, _| {
+            v.eff.demo = false;
+            v.sign_out();
+        });
+        assert!(!to_tray(&view, cx), "not signed in: nothing to keep alive");
+    }
+
+    #[gpui::test]
+    fn closing_for_good_stops_the_agent(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        fake.0.lock().unwrap().enrolled = true;
+        let (view, cx) = hosted_view(cx, &hub, &fake, false);
+        wait_until("the agent", || fake.running() == 1);
+        view.update_in(cx, |v, window, cx| v.request_close(window, cx));
+        assert_eq!(fake.running(), 0, "no agent outlives the window");
+    }
+
+    #[gpui::test]
+    fn signing_out_stops_hosting_for_that_hub(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        fake.0.lock().unwrap().enrolled = true;
+        let (view, cx) = hosted_view(cx, &hub, &fake, true);
+        wait_until("the agent", || fake.running() == 1);
+        view.update(cx, |v, _| v.sign_out());
+        wait_until("the agent to stop", || fake.running() == 0);
     }
 }

@@ -62,6 +62,8 @@ pub struct Onboarding {
     pub token: String,
     pub direct_url: String,
     pub direct_token: String,
+    /// Hub tab: also let other devices take over this machine (default on).
+    pub host_enabled: bool,
     pub busy: bool,
     pub error: Option<String>,
     /// Pending background sign-in, with the hub URL it was started for.
@@ -80,6 +82,7 @@ impl Onboarding {
             token: String::new(),
             direct_url: String::new(),
             direct_token: String::new(),
+            host_enabled: true,
             busy: false,
             error: None,
             login: None,
@@ -299,6 +302,12 @@ pub fn describe_pairing_error(e: &ClientError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosting_this_machine_is_on_by_default() {
+        let o = Onboarding::new();
+        assert!(o.host_enabled);
+    }
 
     fn filled() -> Onboarding {
         let mut o = Onboarding::new();

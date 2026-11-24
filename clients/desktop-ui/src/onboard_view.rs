@@ -4,6 +4,7 @@
 //! device" card, the `+ 添加设备` header button and the pairing modal. State and validation
 //! live in [`crate::onboard`]; the actions are methods of [`Proto`] in `main.rs`.
 
+use crate::host_mgr::{ChipKind, chip_look};
 use crate::onboard::{self, OnbField, Tab};
 use crate::scene::HEADER_H;
 use crate::theme::Pal;
@@ -312,6 +313,42 @@ impl Proto {
                 }))
         });
 
+        // Hub sign-in also decides whether this machine can be taken over by the others
+        let host_opt = (o.tab == Tab::Hub).then(|| {
+            let on = o.host_enabled;
+            let on_accent = rgba(pal.on_accent, 1.0);
+            div()
+                .id("onb-host")
+                .debug_selector(|| "onb-host".to_string())
+                .flex()
+                .items_start()
+                .gap(px(9.0))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .mt(px(1.0))
+                        .size(px(15.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.5))
+                        .border_1()
+                        .border_color(if on { accent } else { rgba(pal.hair, 1.0) })
+                        .bg(if on { accent } else { rgba(pal.canvas, 1.0) })
+                        .when(on, |d| d.child(txt("✓", 10.5, on_accent))),
+                )
+                .child(div().flex_1().min_w(px(0.0)).child(txt(
+                    "允许远端接管本机（开机/常驻托盘可被其他设备连接）",
+                    11.5,
+                    ink,
+                )))
+                .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                    this.onb.host_enabled = !this.onb.host_enabled;
+                    cx.notify();
+                }))
+        });
+
         let (status, status_col) = match (&o.error, o.busy) {
             (Some(e), _) => (clip(e, 56), rgba(pal.warn, 1.0)),
             (None, true) => ("正在登录…".to_string(), rgba(pal.blue, 1.0)),
@@ -358,6 +395,7 @@ impl Proto {
                 .child(div().flex().child(tabs))
                 .children(form)
                 .children(toggle)
+                .children(host_opt)
                 .child(
                     div()
                         .h(px(18.0))
@@ -408,6 +446,59 @@ impl Proto {
                 cx.notify();
             }))
             .into_any_element()
+    }
+
+    /// Header chip showing whether this machine can be taken over; a click switches it. Narrow
+    /// windows keep only the dot.
+    pub(crate) fn host_chip(
+        &self,
+        pal: &Pal,
+        wide: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let host = self.host.as_ref()?;
+        let (kind, label) = chip_look(self.stored.host_enabled, &host.status());
+        let (dot, hollow) = match kind {
+            ChipKind::Shared => (rgba(pal.green, 1.0), false),
+            ChipKind::Starting => (rgba(pal.blue, 1.0), true),
+            ChipKind::Problem => (rgba(pal.warn, 1.0), false),
+            ChipKind::Off => (rgba(pal.muted, 0.8), true),
+        };
+        let wash = rgba(pal.wash, 1.0);
+        Some(
+            div()
+                .id("host-chip")
+                .debug_selector(|| "host-chip".to_string())
+                .ml(px(8.0))
+                .h(px(26.0))
+                .px(px(10.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(7.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgba(pal.hair, 1.0))
+                .bg(rgba(pal.canvas, 1.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(wash))
+                .child(if hollow {
+                    div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(dot)
+                } else {
+                    div().size(px(6.0)).rounded_full().bg(dot)
+                })
+                .when(wide, |d| d.child(mtxt(label, 11.0, rgba(pal.muted, 1.0))))
+                .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.set_host_enabled(!this.stored.host_enabled);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Big code, validity badge, copyable command and the regenerate button; shared by the
