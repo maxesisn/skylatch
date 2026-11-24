@@ -10,6 +10,67 @@ final class InputTests: XCTestCase {
         XCTAssertEqual(InputRecord.encode(type: 7), [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
 
+    func testSmoothWheelRecordKeepsPositionAndMasks() {
+        let r = InputRecord.encode(type: InputType.smoothWheel, code: 0, value: UInt32(bitPattern: Int32(-40)),
+                                   x: 0x1234, y: 0xabcd, buttons: 1, modifiers: 2)
+        XCTAssertEqual(r, [9, 0, 0, 0, 0xff, 0xff, 0xff, 0xd8, 0x12, 0x34, 0xab, 0xcd, 0, 1, 0, 2])
+        XCTAssertTrue(InputType.hasPosition(InputType.smoothWheel))
+        XCTAssertFalse(InputType.isBare(InputType.smoothWheel))
+        XCTAssertTrue(InputType.isBare(InputType.releaseAll) && InputType.isBare(InputType.text))
+        XCTAssertFalse(InputType.hasPosition(InputType.keyDown))
+    }
+
+    func testTrackpadSendsSixteenthsOfAPointWhenTheHostAccepts() {
+        var scroll = ScrollEncoder()
+        // Content moving up (negative AppKit delta) scrolls down: positive on the wire.
+        XCTAssertEqual(scroll.records(deltaX: 1.25, deltaY: -2.5, precise: true, smooth: true), [
+            WheelRecord(type: 9, axis: 0, value: 40),
+            WheelRecord(type: 9, axis: 1, value: -20),
+        ])
+        // Fractions of 1/16 point carry into the next event instead of being dropped.
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: -0.04, precise: true, smooth: true), [])
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: -0.04, precise: true, smooth: true),
+                       [WheelRecord(type: 9, axis: 0, value: 1)])
+        scroll.reset()
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: 20000, precise: true, smooth: true), [
+            WheelRecord(type: 9, axis: 0, value: -262144),
+            WheelRecord(type: 9, axis: 0, value: -57856),
+        ])
+    }
+
+    func testLineWheelSendsNotchesEvenWhenSmoothIsAccepted() {
+        var scroll = ScrollEncoder()
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: -1, precise: false, smooth: true),
+                       [WheelRecord(type: 6, axis: 0, value: 120)])
+        XCTAssertEqual(scroll.records(deltaX: 2, deltaY: 0, precise: false, smooth: true),
+                       [WheelRecord(type: 6, axis: 1, value: -240)])
+    }
+
+    func testUnsupportedHostFoldsTrackpadIntoNotches() {
+        var support = SmoothWheelSupport()
+        XCTAssertFalse(support.enabled)
+        support.hostAnswered(sequence: 0, status: 2)
+        XCTAssertFalse(support.enabled)
+        var scroll = ScrollEncoder()
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: -40, precise: true, smooth: support.enabled), [])
+        XCTAssertEqual(scroll.records(deltaX: 0, deltaY: -40, precise: true, smooth: support.enabled),
+                       [WheelRecord(type: 6, axis: 0, value: 120)])
+        XCTAssertEqual(scroll.records(deltaX: -116, deltaY: 0, precise: true, smooth: support.enabled),
+                       [WheelRecord(type: 6, axis: 1, value: 240)])
+    }
+
+    func testOnlyTheQueryAnswerSwitchesSmoothWheel() {
+        var support = SmoothWheelSupport()
+        support.hostAnswered(sequence: 7, status: 0)
+        XCTAssertFalse(support.enabled)
+        support.hostAnswered(sequence: 0, status: 0)
+        XCTAssertTrue(support.enabled)
+        support.hostAnswered(sequence: 3, status: 2)
+        XCTAssertTrue(support.enabled)
+        support.hostAnswered(sequence: 0, status: 2)
+        XCTAssertFalse(support.enabled)
+    }
+
     func testTextScalarValidity() {
         XCTAssertTrue(InputRecord.isValidTextScalar(0x4f60))
         XCTAssertTrue(InputRecord.isValidTextScalar(0x1f600))

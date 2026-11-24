@@ -58,9 +58,28 @@ Point mapPointer(Rect viewport, int x, int y, int windowWidth, int windowHeight,
                  int drawableWidth, int drawableHeight);
 
 using InputRecord = std::array<uint8_t, 16>;
-enum class Input : uint8_t { keyDown = 1, keyUp, move, buttonDown, buttonUp, wheel, releaseAll, text };
+enum class Input : uint8_t { keyDown = 1, keyUp, move, buttonDown, buttonUp, wheel, releaseAll, text, smoothWheel };
 InputRecord inputRecord(Input type, uint16_t code = 0, int32_t value = 0, Point point = {},
                         uint16_t buttons = 0, uint16_t modifiers = 0);
+
+struct WheelStep {
+    Input type{};
+    uint16_t axis{};
+    int32_t value{};
+    bool operator==(const WheelStep&) const = default;
+};
+// Turns SDL precise wheel deltas (notches, positive up and right) into wheel records. Whole notches
+// go out as type 6; fractions from touchpads and high-resolution wheels go out as type 9 at 48
+// pixels per notch when the host accepted it, and fold into type 6 notches otherwise.
+class WheelEncoder {
+public:
+    static constexpr double pixelsPerNotch = 48;
+    std::vector<WheelStep> encode(float preciseX, float preciseY, bool smooth);
+    void reset() { *this = {}; }
+
+private:
+    std::array<double, 2> notches{}, sixteenths{};
+};
 
 struct PlaneSize {
     int rowBytes{}, rows{};

@@ -85,8 +85,9 @@ networks. Avoid putting real tokens in scripts or shell history.
   shortcuts go to the host instead of the local menu.
 - Text typed through an input method (IME) is sent as committed Unicode text. Characters that need
   the local layout (for example Option-key symbols) are also sent as text instead of a key press.
-- Pointer: movement, left, middle and right buttons, and vertical and horizontal scrolling (a trackpad
-  swipe counts 58 points per wheel notch). Pointer positions are mapped through the letterboxed video area to the host desktop.
+- Pointer: movement, left, middle and right buttons, and vertical and horizontal scrolling. Trackpad
+  scrolling goes out point for point (input type 9) when the host accepts it; older hosts receive wheel
+  notches, 58 points each. Pointer positions are mapped through the letterboxed video area to the host desktop.
 - The host's cursor shape is shown over the video, including hidden cursors.
 - Losing keyboard focus releases every held key and button on the host.
 - Plain text clipboard changes are synchronized in both directions using SL1 Type 19 (UTF-8, up to

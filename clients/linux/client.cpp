@@ -11,6 +11,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <charconv>
 #include <chrono>
@@ -130,6 +131,7 @@ class Mailbox {
     size_t queuedBytes{};
     bool failed{};
     const bool display;
+    std::atomic<bool> smooth{};
 
     template<class Fn> void receive(size_t size, Fn fn) noexcept {
         std::lock_guard lock(mutex);
@@ -167,6 +169,10 @@ public:
         auto& self = *static_cast<Mailbox*>(user);
         self.receive(size, [&] { self.queue.emplace_back(std::string(data ? data : "", size)); });
     }
+    static void inputResponse(void* user, uint32_t sequence, uint8_t status) noexcept {
+        if (!sequence) static_cast<Mailbox*>(user)->smooth = status == SKYLATCH_INPUT_ACCEPTED;
+    }
+    bool smoothWheel() const { return smooth; }
     static void disconnected(void* user, const char* why) noexcept {
         auto& self = *static_cast<Mailbox*>(user);
         self.receive(0, [&] { self.queue.emplace_back(End{why ? terminalText(why) : ""}); });
@@ -187,7 +193,8 @@ public:
 
 ClientPtr connect(const Config& config, Mailbox& mailbox) {
     char error[512]{};
-    const SkylatchCallbacks callbacks{Mailbox::frame, Mailbox::cursor, nullptr, Mailbox::disconnected};
+    const SkylatchCallbacks callbacks{Mailbox::frame, Mailbox::cursor, nullptr, Mailbox::disconnected,
+                                      Mailbox::inputResponse};
     ClientPtr client(config.hub.empty()
         ? skylatch_connect_direct(config.direct.c_str(), config.token.empty() ? nullptr : config.token.c_str(),
                                   &callbacks, &mailbox, error, sizeof(error))
@@ -230,7 +237,9 @@ class Viewer {
     std::unique_ptr<SDL_Cursor, SdlFree<SDL_Cursor, SDL_FreeCursor>> cursorImage;
     std::array<std::vector<uint8_t>, 3> scratch;
     SkylatchClient* client;
+    const Mailbox& mailbox;
     const bool clipboardEnabled;
+    WheelEncoder wheels;
     int width{}, height{};
     Uint32 textureFormat{};
     bool fullscreen{}, grabbed{}, focused{}, composing{}, commitFromComposition{}, grabKey{};
@@ -244,7 +253,7 @@ class Viewer {
         for (int attempt = 0; ; ++attempt) {
             const auto rc = skylatch_send_input(client, bytes.data());
             if (rc == SKYLATCH_OK) return true;
-            if (rc == SKYLATCH_ERR_NOT_READY || rc == SKYLATCH_ERR_CLOSED) return false;
+            if (rc == SKYLATCH_ERR_NOT_READY || rc == SKYLATCH_ERR_CLOSED || rc == SKYLATCH_ERR_UNSUPPORTED) return false;
             if (rc != SKYLATCH_ERR_QUEUE_FULL || (!droppable && attempt == 20))
                 throw std::runtime_error("could not send input");
             if (droppable) return false;
@@ -332,17 +341,9 @@ class Viewer {
         int x{}, y{};
         SDL_GetMouseState(&x, &y);
         const auto point = pointer(x, y);
-        const int sign = e.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1;
-        const auto axis = [&](uint16_t code, int amount) {
-            int64_t ticks = int64_t(sign) * amount;
-            while (ticks) {
-                const auto part = std::clamp<int64_t>(ticks, -10, 10);
-                if (!send(inputRecord(Input::wheel, code, int32_t(120 * part), point, buttons, modifiers))) break;
-                ticks -= part;
-            }
-        };
-        axis(0, e.y);
-        axis(1, e.x);
+        const float sign = e.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1;
+        for (const auto& step : wheels.encode(sign * e.preciseX, sign * e.preciseY, mailbox.smoothWheel()))
+            if (!send(inputRecord(step.type, step.axis, step.value, point, buttons, modifiers))) break;
     }
     void localClipboard() {
         if (!clipboardEnabled) return;
@@ -365,7 +366,8 @@ class Viewer {
     }
 
 public:
-    Viewer(SkylatchClient* active, bool clipboard) : client(active), clipboardEnabled(clipboard) {
+    Viewer(SkylatchClient* active, const Mailbox& updates, bool clipboard)
+        : client(active), mailbox(updates), clipboardEnabled(clipboard) {
         window.reset(SDL_CreateWindow("Skylatch", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
                      SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI));
         sdlCheck(bool(window), "create window");
@@ -387,6 +389,7 @@ public:
         composing = commitFromComposition = grabKey = false;
         held.fill(false);
         buttons = modifiers = 0;
+        wheels.reset();
         send(inputRecord(Input::releaseAll));
     }
     bool event(const SDL_Event& e) {
@@ -564,7 +567,7 @@ int run(Config config) {
     Mailbox mailbox(!smoke);
     auto client = connect(config, mailbox);
     std::optional<Viewer> viewer;
-    if (!smoke) viewer.emplace(client.get(), !config.noClipboard);
+    if (!smoke) viewer.emplace(client.get(), mailbox, !config.noClipboard);
     Stream stream(client.get(), viewer ? &*viewer : nullptr);
     const auto connected = Clock::now();
     for (;;) {

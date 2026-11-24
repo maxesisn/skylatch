@@ -11,6 +11,15 @@ public enum InputType {
     public static let wheel: UInt8 = 6
     public static let releaseAll: UInt8 = 7
     public static let text: UInt8 = 8
+    public static let smoothWheel: UInt8 = 9
+
+    /// Types that carry the pointer position.
+    public static func hasPosition(_ type: UInt8) -> Bool {
+        (pointerMove...wheel).contains(type) || type == smoothWheel
+    }
+
+    /// Types whose button and modifier masks must be zero.
+    public static func isBare(_ type: UInt8) -> Bool { type == releaseAll || type == text }
 }
 
 public enum InputRecord {
@@ -119,6 +128,79 @@ public struct WheelAccumulator {
             left -= part
         }
         return out
+    }
+}
+
+/// Whether the session's host accepted smooth-wheel records (type 9). The core asks once per stream;
+/// until the host answers, and for hosts that decline or never answer, scrolling uses type 6 notches.
+public struct SmoothWheelSupport {
+    public private(set) var enabled = false
+
+    public init() {}
+
+    /// Applies an input response with its `SKYLATCH_INPUT_*` status; sequence 0 answers the query.
+    public mutating func hostAnswered(sequence: UInt32, status: UInt8) {
+        if sequence == 0 { enabled = status == 0 }
+    }
+}
+
+/// One wheel record: type 6 with a multiple of 120, or type 9 with 1/16 pixels.
+public struct WheelRecord: Equatable {
+    public var type: UInt8
+    public var axis: UInt16
+    public var value: Int32
+
+    public init(type: UInt8, axis: UInt16, value: Int32) {
+        self.type = type; self.axis = axis; self.value = value
+    }
+}
+
+/// Turns AppKit scroll deltas into wheel records. Precise (trackpad) deltas go out pixel for pixel as
+/// type 9 when the host accepts it and fold into type 6 notches otherwise; line-based wheels always send notches.
+public struct ScrollEncoder {
+    /// Largest type 9 magnitude, 16384 pixels in 1/16 pixel.
+    public static let maxSixteenths: Int32 = 16384 * 16
+    private var notches = [WheelAccumulator(), WheelAccumulator()]
+    private var sixteenths = [0.0, 0.0]
+
+    public init() {}
+
+    public mutating func reset() {
+        notches = [WheelAccumulator(), WheelAccumulator()]
+        sixteenths = [0, 0]
+    }
+
+    /// `deltaX` and `deltaY` are `NSEvent.scrollingDelta` values in content direction; the wire is
+    /// positive for down/right, so both are negated. Vertical records come first.
+    public mutating func records(deltaX: Double, deltaY: Double, precise: Bool, smooth: Bool) -> [WheelRecord] {
+        var out: [WheelRecord] = []
+        for (axis, delta) in [(0, deltaY), (1, deltaX)] where delta != 0 && delta.isFinite {
+            if precise && smooth {
+                for part in smoothParts(axis: axis, wire: -delta * 16) {
+                    out.append(WheelRecord(type: InputType.smoothWheel, axis: UInt16(axis), value: part))
+                }
+            } else {
+                let steps = notches[axis].wireNotches(scrollingDelta: delta, precise: precise)
+                for part in WheelAccumulator.chunks(steps) {
+                    out.append(WheelRecord(type: InputType.wheel, axis: UInt16(axis), value: part))
+                }
+            }
+        }
+        return out
+    }
+
+    private mutating func smoothParts(axis: Int, wire: Double) -> [Int32] {
+        let total = sixteenths[axis] + wire
+        let whole = total.rounded(.towardZero)
+        sixteenths[axis] = total - whole
+        var left = Int64(whole)
+        var parts: [Int32] = []
+        while left != 0 {
+            let part = max(-Int64(Self.maxSixteenths), min(Int64(Self.maxSixteenths), left))
+            parts.append(Int32(part))
+            left -= part
+        }
+        return parts
     }
 }
 

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -151,6 +152,34 @@ InputRecord inputRecord(Input type, uint16_t code, int32_t value, Point point,
     be16(12, buttons);
     be16(14, modifiers);
     return bytes;
+}
+
+std::vector<WheelStep> WheelEncoder::encode(float preciseX, float preciseY, bool smooth) {
+    std::vector<WheelStep> steps;
+    const auto emit = [&](Input type, uint16_t axis, double& rest, int64_t limit, int32_t unit) {
+        const double whole = std::trunc(rest);
+        rest -= whole;
+        for (auto left = int64_t(whole); left;) {
+            const auto part = std::clamp(left, -limit, limit);
+            steps.push_back({type, axis, int32_t(part * unit)});
+            left -= part;
+        }
+    };
+    // The wire is positive down and right; SDL is positive up and right.
+    const std::array<double, 2> wire{-double(preciseY), double(preciseX)};
+    for (uint16_t axis = 0; axis < 2; ++axis) {
+        if (!std::isfinite(wire[axis]) || wire[axis] == 0) continue;
+        const double delta = std::clamp(wire[axis], -1000.0, 1000.0);
+        if (smooth && std::trunc(delta) != delta) {
+            sixteenths[axis] += delta * pixelsPerNotch * 16;
+            emit(Input::smoothWheel, axis, sixteenths[axis], 16384 * 16, 1);
+        } else {
+            if (notches[axis] * delta < 0) notches[axis] = 0;
+            notches[axis] += delta;
+            emit(Input::wheel, axis, notches[axis], 10, 120);
+        }
+    }
+    return steps;
 }
 
 std::array<PlaneSize, 3> planeSizes(PixelLayout layout, int width, int height) {

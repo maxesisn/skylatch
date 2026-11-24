@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -77,6 +78,32 @@ void keyboardAndWire() {
     CHECK(terminalText("a\x1b\x7f\xc2\x9b\xe2\x80\xa8\n世") == "a     世");
 }
 
+void wheels() {
+    using Steps = std::vector<WheelStep>;
+    CHECK(inputRecord(Input::smoothWheel, 0, -40, {0x1234, 0xabcd}, 1, 2) ==
+          InputRecord{9, 0, 0, 0, 0xff, 0xff, 0xff, 0xd8, 0x12, 0x34, 0xab, 0xcd, 0, 1, 0, 2});
+    WheelEncoder wheel;
+    // SDL is positive up; the wire is positive down. Horizontal is positive right in both.
+    CHECK(wheel.encode(0, 1, true) == Steps{{Input::wheel, 0, -120}});
+    CHECK(wheel.encode(-2, 0, true) == Steps{{Input::wheel, 1, -240}});
+    CHECK(wheel.encode(0, -25, false) == Steps{{Input::wheel, 0, 1200}, {Input::wheel, 0, 1200}, {Input::wheel, 0, 600}});
+    // Touchpad fractions: a quarter notch is 12 pixels, 192 sixteenths.
+    CHECK(wheel.encode(0.5f, -0.25f, true) == Steps{{Input::smoothWheel, 0, 192}, {Input::smoothWheel, 1, 384}});
+    CHECK(wheel.encode(0, 0.001f, true).empty());
+    CHECK(wheel.encode(0, 0.001f, true) == Steps{{Input::smoothWheel, 0, -1}});
+    wheel.reset();
+    CHECK(wheel.encode(0, 1000, true) == Steps(100, {Input::wheel, 0, -1200}));
+    CHECK(wheel.encode(0, -500.5f, true) == Steps{{Input::smoothWheel, 0, 262144}, {Input::smoothWheel, 0, 122240}});
+    // Without the host's acceptance, fractions fold into whole notches and a reversal drops the remainder.
+    WheelEncoder legacy;
+    CHECK(legacy.encode(0, -0.5f, false).empty());
+    CHECK(legacy.encode(0, -0.5f, false) == Steps{{Input::wheel, 0, 120}});
+    CHECK(legacy.encode(0, 0.75f, false).empty());
+    CHECK(legacy.encode(0, -0.75f, false).empty());
+    CHECK(legacy.encode(0, -0.25f, false) == Steps{{Input::wheel, 0, 120}});
+    CHECK(legacy.encode(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), true).empty());
+}
+
 void geometry() {
     CHECK(letterbox(1920, 1200, 1920, 1080) == Rect{0, 60, 1920, 1080});
     CHECK(letterbox(2000, 1000, 1000, 1000) == Rect{500, 0, 1000, 1000});
@@ -111,6 +138,6 @@ void planes() {
 }
 
 int main() {
-    cli(); keyboardAndWire(); geometry(); planes();
-    std::cout << "Linux client logic: CLI, HID, input wire, UTF-8, letterbox and YUV planes passed\n";
+    cli(); keyboardAndWire(); wheels(); geometry(); planes();
+    std::cout << "Linux client logic: CLI, HID, input wire, wheels, UTF-8, letterbox and YUV planes passed\n";
 }

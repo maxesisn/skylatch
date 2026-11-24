@@ -100,6 +100,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         view.videoSize = { [weak renderer] in renderer?.videoSize ?? (0, 0) }
         view.onResize = { [weak renderer] in renderer?.redraw() }
         view.sendRecord = { [weak self] record in self?.session?.sendInput(record) }
+        view.smoothWheel = { [weak self] in self?.session?.smoothWheelEnabled ?? false }
         view.onToggleCapture = { [weak self] in self?.toggleCapture() }
         view.onEscapeHold = { [weak self] in self?.window?.toggleFullScreen(nil) }
         let hud = HudOverlay(frame: view.bounds)
