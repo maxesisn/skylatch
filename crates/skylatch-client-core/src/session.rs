@@ -4,13 +4,13 @@ use crate::transport::{self, Socket, WRITE_TIMEOUT};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::nsl1::{
-    Cursor, InputRecord, Message, MonitorInfo, Nsl1Error, INPUT_SIZE, MAX_CLIPBOARD_DATA,
-    MAX_MONITOR_ID,
+    Cursor, InputEvent, InputRecord, InputStatus, Message, MonitorInfo, Nsl1Error, INPUT_SIZE,
+    MAX_CLIPBOARD_DATA, MAX_MONITOR_ID,
 };
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
 };
@@ -78,6 +78,12 @@ pub enum Event {
     ClipboardNotice,
     MonitorList(Vec<MonitorInfo>),
     ClipboardData(String),
+    /// The host answered an input request. Sequence 0 answers the smooth-wheel query the session
+    /// sends after the first host message; `Accepted` there enables smooth-wheel records.
+    InputResponse {
+        sequence: u32,
+        status: InputStatus,
+    },
     Disconnected(Result<(), ClientError>),
 }
 
@@ -96,6 +102,8 @@ pub enum SendError {
     InvalidInput(Nsl1Error),
     #[error("invalid SL1 message: {0}")]
     InvalidSl1(Nsl1Error),
+    #[error("the host has not accepted smooth-wheel input")]
+    Unsupported,
 }
 
 /// A connected session handle. Safe to share between threads. Dropping it requests disconnect.
@@ -104,6 +112,7 @@ pub struct SessionClient {
     outbound: mpsc::Sender<Bytes>,
     stop: watch::Sender<bool>,
     generation: Arc<AtomicU32>,
+    smooth_wheel: Arc<AtomicBool>,
 }
 
 impl SessionClient {
@@ -139,6 +148,11 @@ impl SessionClient {
         self.mode
     }
 
+    /// True once the host accepted the smooth-wheel query; until then smooth-wheel sends fail.
+    pub fn smooth_wheel(&self) -> bool {
+        self.smooth_wheel.load(Ordering::Relaxed)
+    }
+
     pub fn send_ack(
         &self,
         generation: u32,
@@ -160,9 +174,14 @@ impl SessionClient {
     }
 
     /// Sends one validated input record using the latest generation received from the host.
+    /// Smooth-wheel records fail with [`SendError::Unsupported`] until the host accepts them,
+    /// because hosts without them close the stream.
     pub fn send_input(&self, record: [u8; INPUT_SIZE]) -> Result<(), SendError> {
         let generation = self.current_generation()?;
         let record = InputRecord::decode(&record).map_err(SendError::InvalidInput)?;
+        if matches!(record.event, InputEvent::SmoothWheel { .. }) && !self.smooth_wheel() {
+            return Err(SendError::Unsupported);
+        }
         self.enqueue(
             Message::Input {
                 generation,
@@ -305,18 +324,20 @@ impl Connection {
         let (outbound, mut queue) = mpsc::channel(OUTBOUND_CAPACITY);
         let (stop, mut stopped) = watch::channel(false);
         let generation = Arc::new(AtomicU32::new(0));
+        let smooth_wheel = Arc::new(AtomicBool::new(false));
         let client = SessionClient {
             mode,
             outbound,
             stop,
             generation: generation.clone(),
+            smooth_wheel: smooth_wheel.clone(),
         };
         let pump = async move {
             let relay = mode == TransportMode::Relay;
             let result = tokio::select! {
                 biased;
                 _ = stopped.changed() => Ok(()),
-                result = pump_messages(&mut socket, &mut queue, &generation, relay, &mut callback) => result,
+                result = pump_messages(&mut socket, &mut queue, &generation, &smooth_wheel, relay, &mut callback) => result,
             };
             queue.close();
             transport::close(&mut socket, relay).await;
@@ -326,10 +347,28 @@ impl Connection {
     }
 }
 
+/// Asks whether the host accepts smooth-wheel records. Older hosts ignore an ACK of sequence 0.
+async fn send_smooth_wheel_query(socket: &mut Socket, generation: u32) -> Result<(), ClientError> {
+    let query = Message::Ack {
+        generation,
+        sequence: 0,
+        viewer_wait_us: None,
+    }
+    .encode()?;
+    timeout(
+        WRITE_TIMEOUT,
+        socket.send(tungstenite::Message::Binary(query)),
+    )
+    .await
+    .map_err(|_| ClientError::Timeout("WebSocket write"))??;
+    Ok(())
+}
+
 async fn pump_messages(
     socket: &mut Socket,
     queue: &mut mpsc::Receiver<Bytes>,
     generation: &AtomicU32,
+    smooth_wheel: &AtomicBool,
     relay: bool,
     callback: &mut (impl FnMut(Event) + Send),
 ) -> Result<(), ClientError> {
@@ -338,7 +377,12 @@ async fn pump_messages(
             incoming = socket.next() => match incoming {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
                     let (current, event) = transport::decode_stream_event(&bytes)?;
-                    generation.store(current, Ordering::Relaxed);
+                    if generation.swap(current, Ordering::Relaxed) == 0 {
+                        send_smooth_wheel_query(socket, current).await?;
+                    }
+                    if let Event::InputResponse { sequence: 0, status } = event {
+                        smooth_wheel.store(status == InputStatus::Accepted, Ordering::Relaxed);
+                    }
                     callback(event);
                     // A socket with many already-buffered frames can remain ready without
                     // touching Tokio I/O. Cooperate so the enclosing cancel select is polled.

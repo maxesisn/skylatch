@@ -67,6 +67,11 @@ pub(crate) fn decode_stream_event(bytes: &Bytes) -> Result<(u32, Event), ClientE
             monitors,
         } => (generation, Event::MonitorList(monitors)),
         Nsl1::ClipboardData { generation, text } => (generation, Event::ClipboardData(text)),
+        Nsl1::InputResponse {
+            generation,
+            sequence,
+            status,
+        } => (generation, Event::InputResponse { sequence, status }),
         _ => return Err(ClientError::Unexpected("unexpected NSL1 message from host")),
     })
 }

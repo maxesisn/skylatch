@@ -21,6 +21,10 @@ typedef struct SkylatchCallbacks {
     void (*on_clipboard_notice)(void *user_data);
     /* Last callback. error is NULL on a clean close, otherwise a UTF-8 description. */
     void (*on_disconnected)(void *user_data, const char *error);
+    /* status is a SKYLATCH_INPUT_* value. Sequence 0 answers the smooth-wheel query the core
+     * sends after the first host message: ACCEPTED enables input type 9, anything else means
+     * the host scrolls only by type 6 notches. Older hosts never answer. */
+    void (*on_input_response)(void *user_data, uint32_t sequence, uint8_t status);
 } SkylatchCallbacks;
 
 typedef struct SkylatchSl1Callbacks {
@@ -41,6 +45,11 @@ typedef struct SkylatchSl1Callbacks {
 #define SKYLATCH_ERR_QUEUE_FULL (-10)
 #define SKYLATCH_ERR_NOT_READY (-11)
 #define SKYLATCH_ERR_INVALID (-12)
+#define SKYLATCH_ERR_UNSUPPORTED (-13)
+
+#define SKYLATCH_INPUT_ACCEPTED 0
+#define SKYLATCH_INPUT_INVALID 1
+#define SKYLATCH_INPUT_UNSUPPORTED 2
 
 /* Numeric NSL1 wire version. The separate library version string is static. */
 uint32_t skylatch_proto_version(void);
@@ -80,7 +89,9 @@ SkylatchClient *skylatch_connect_direct(const char *ws_url, const char *token_or
                                        void *user_data, char *err_buf, size_t err_buf_len);
 
 /* Thread-safe, non-blocking queue operations. SKYLATCH_OK means queued, not
- * delivered. Input requires an NSL1 generation to have been received first. */
+ * delivered. Input requires an NSL1 generation to have been received first.
+ * A type 9 (smooth wheel) record returns SKYLATCH_ERR_UNSUPPORTED until the host
+ * has accepted the smooth-wheel query, since older hosts close the stream on it. */
 int32_t skylatch_send_ack(SkylatchClient *client, uint32_t generation,
                           uint32_t sequence, uint32_t viewer_wait_us);
 int32_t skylatch_send_input(SkylatchClient *client, const uint8_t record[16]);

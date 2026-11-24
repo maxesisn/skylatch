@@ -7,14 +7,16 @@ use skylatch_client_core::{
         skylatch_send_ack, skylatch_send_clipboard, skylatch_send_input,
         skylatch_set_sl1_callbacks, SkylatchCallbacks, SkylatchClient, SkylatchSl1Callbacks,
         SKYLATCH_ERR_INVALID, SKYLATCH_ERR_NOT_READY, SKYLATCH_ERR_NULL, SKYLATCH_ERR_TOO_LARGE,
-        SKYLATCH_OK,
+        SKYLATCH_ERR_UNSUPPORTED, SKYLATCH_INPUT_UNSUPPORTED, SKYLATCH_OK,
     },
     list_devices, ClientError, Event, Frame, SessionClient, TransportMode,
 };
 use skylatch_hub::{router, AppState, HubConfig};
 use skylatch_proto::{
     control::{DeviceInfo, DirectEndpoint, EndpointKind, HostToHub, HubToHost},
-    nsl1::{Cursor, InputEvent, InputRecord, Message, MonitorInfo, MAX_CLIPBOARD_DATA},
+    nsl1::{
+        Cursor, InputEvent, InputRecord, InputStatus, Message, MonitorInfo, MAX_CLIPBOARD_DATA,
+    },
 };
 use std::{
     ffi::{c_char, c_void, CStr, CString},
@@ -233,8 +235,16 @@ async fn assert_outbound<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
         sequence: 0,
         record: input(),
     };
-    for expected in [ack, input] {
+    for expected in [smooth_wheel_query(), ack, input] {
         assert_wire(ws, expected).await;
+    }
+}
+
+fn smooth_wheel_query() -> Message {
+    Message::Ack {
+        generation: GENERATION,
+        sequence: 0,
+        viewer_wait_us: None,
     }
 }
 
@@ -388,6 +398,7 @@ async fn failed_direct_tcp_and_upgrade_keep_relay_usable() {
         .await
         .unwrap();
     assert_frame(&mut rx).await;
+    assert_wire(&mut host, smooth_wheel_query()).await;
     drop(client);
     assert_relay_closed(&mut host, id).await;
 }
@@ -463,6 +474,7 @@ enum NativeEvent {
     Frame(Frame),
     MonitorList(Vec<u8>),
     ClipboardData(Vec<u8>),
+    InputResponse(u32, u8),
     Disconnected(Option<String>),
 }
 
@@ -500,6 +512,11 @@ unsafe extern "C" fn native_disconnected(data: *mut c_void, error: *const c_char
     let _ = tx.send(NativeEvent::Disconnected(error));
 }
 
+unsafe extern "C" fn native_input_response(data: *mut c_void, sequence: u32, status: u8) {
+    let tx = unsafe { &*data.cast::<mpsc::UnboundedSender<NativeEvent>>() };
+    let _ = tx.send(NativeEvent::InputResponse(sequence, status));
+}
+
 unsafe extern "C" fn native_monitors(data: *mut c_void, json: *const c_char, len: usize) {
     let tx = unsafe { &*data.cast::<mpsc::UnboundedSender<NativeEvent>>() };
     let bytes = unsafe { std::slice::from_raw_parts(json.cast::<u8>(), len) };
@@ -517,6 +534,7 @@ const NATIVE_CALLBACKS: SkylatchCallbacks = SkylatchCallbacks {
     on_cursor: None,
     on_clipboard_notice: None,
     on_disconnected: Some(native_disconnected),
+    on_input_response: Some(native_input_response),
 };
 
 struct NativeHandle(*mut SkylatchClient);
@@ -577,6 +595,10 @@ fn c_transaction(
                 skylatch_send_input(client, input().encode().unwrap().as_ptr()),
                 SKYLATCH_OK
             );
+            assert_eq!(
+                skylatch_send_input(client, smooth_wheel(16).encode().unwrap().as_ptr()),
+                SKYLATCH_ERR_UNSUPPORTED
+            );
             // Wait for the server to actually see the queued packets before destroying.
             assert_eq!(destroy.blocking_recv(), Some(()));
             drop(handle);
@@ -602,6 +624,18 @@ async fn direct_only_c_abi_uses_standalone_path_and_bearer_subprotocol() {
     assert_eq!(deadline(rx.recv()).await, Some(NativeEvent::Frame(frame())));
     action.send(()).await.unwrap();
     assert_outbound(&mut ws).await;
+    let declined = Message::InputResponse {
+        generation: GENERATION,
+        sequence: 0,
+        status: InputStatus::Unsupported,
+    };
+    ws.send(WsMessage::Binary(declined.encode().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        deadline(rx.recv()).await,
+        Some(NativeEvent::InputResponse(0, SKYLATCH_INPUT_UNSUPPORTED))
+    );
     action.send(()).await.unwrap();
     assert!(matches!(
         deadline(ws.next()).await,
@@ -808,6 +842,7 @@ async fn hub_relay_exchanges_sl1_through_separate_c_abi_callbacks() {
     );
     commands.send(()).await.unwrap();
     for expected in [
+        smooth_wheel_query(),
         Message::SelectMonitor {
             generation,
             id: "output-雪".into(),
@@ -868,6 +903,7 @@ async fn direct_session_exchanges_sl1_without_http() {
     );
     client.select_monitor("output-雪").unwrap();
     client.send_clipboard("viewer reply").unwrap();
+    assert_wire(&mut host, smooth_wheel_query()).await;
     assert_wire(
         &mut host,
         Message::SelectMonitor {
@@ -881,6 +917,119 @@ async fn direct_session_exchanges_sl1_without_http() {
         Message::ClipboardData {
             generation: GENERATION,
             text: "viewer reply".into(),
+        },
+    )
+    .await;
+}
+
+fn smooth_wheel(delta: i32) -> InputRecord {
+    InputRecord::new(InputEvent::SmoothWheel {
+        axis: skylatch_proto::nsl1::WheelAxis::Vertical,
+        delta,
+        x: 1,
+        y: 2,
+    })
+}
+
+async fn direct_session() -> (
+    SessionClient,
+    WebSocketStream<TcpStream>,
+    mpsc::UnboundedReceiver<Event>,
+) {
+    let listener = loopback().await;
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (client, host) = tokio::join!(
+        deadline(SessionClient::connect_direct(&url, None, move |event| {
+            let _ = tx.send(event);
+        })),
+        start_direct(listener, None)
+    );
+    (client.unwrap(), host, rx)
+}
+
+#[tokio::test]
+async fn smooth_wheel_waits_for_the_host_to_accept_the_query() {
+    let (client, mut host, mut rx) = direct_session().await;
+    host.send(WsMessage::Binary(video().encode().unwrap()))
+        .await
+        .unwrap();
+    assert_frame(&mut rx).await;
+    assert_wire(&mut host, smooth_wheel_query()).await;
+    assert!(!client.smooth_wheel());
+    assert_eq!(
+        client.send_input(smooth_wheel(-40).encode().unwrap()),
+        Err(skylatch_client_core::SendError::Unsupported)
+    );
+    let accepted = Message::InputResponse {
+        generation: GENERATION,
+        sequence: 0,
+        status: InputStatus::Accepted,
+    };
+    host.send(WsMessage::Binary(accepted.encode().unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        deadline(rx.recv()).await,
+        Some(Event::InputResponse {
+            sequence: 0,
+            status: InputStatus::Accepted
+        })
+    ));
+    assert!(client.smooth_wheel());
+    client
+        .send_input(smooth_wheel(-40).encode().unwrap())
+        .unwrap();
+    assert_wire(
+        &mut host,
+        Message::Input {
+            generation: GENERATION,
+            sequence: 0,
+            record: smooth_wheel(-40),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn smooth_wheel_stays_off_when_the_host_declines_or_stays_silent() {
+    let (client, mut host, mut rx) = direct_session().await;
+    host.send(WsMessage::Binary(video().encode().unwrap()))
+        .await
+        .unwrap();
+    assert_frame(&mut rx).await;
+    assert_wire(&mut host, smooth_wheel_query()).await;
+    host.send(WsMessage::Binary(video().encode().unwrap()))
+        .await
+        .unwrap();
+    assert_frame(&mut rx).await;
+    assert!(!client.smooth_wheel());
+    let declined = Message::InputResponse {
+        generation: GENERATION,
+        sequence: 0,
+        status: InputStatus::Unsupported,
+    };
+    host.send(WsMessage::Binary(declined.encode().unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        deadline(rx.recv()).await,
+        Some(Event::InputResponse {
+            sequence: 0,
+            status: InputStatus::Unsupported
+        })
+    ));
+    assert_eq!(
+        client.send_input(smooth_wheel(16).encode().unwrap()),
+        Err(skylatch_client_core::SendError::Unsupported)
+    );
+    client.send_input(input().encode().unwrap()).unwrap();
+    assert_wire(
+        &mut host,
+        Message::Input {
+            generation: GENERATION,
+            sequence: 0,
+            record: input(),
         },
     )
     .await;
