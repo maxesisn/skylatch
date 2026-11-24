@@ -3,6 +3,8 @@
 #include "discovery.hpp"
 #include <imm.h>
 #include <windowsx.h>
+#include <fcntl.h>
+#include <io.h>
 #include <atomic>
 #include <charconv>
 #include <condition_variable>
@@ -14,25 +16,50 @@
 
 namespace skylatch {
 namespace {
+constexpr WORD appIconId = 101;
+
 struct Config {
     std::string hub, direct, token, device;
     unsigned smoke{};
+    int swapCmdCtrl{-1}; // -1 = automatic (on for macOS hosts reached through a hub), 0 = off, 1 = on
     bool list{}, noDirect{}, noClipboard{}, help{};
 };
+
+// The viewer is a GUI-subsystem program, so it never owns a console window. For command-line output,
+// borrow the parent terminal's console when stdout/stderr are not already redirected.
+void ensureConsole() {
+    static bool attempted = false;
+    if (std::exchange(attempted, true)) return;
+    const auto detached = [](DWORD id) { return GetFileType(GetStdHandle(id)) == FILE_TYPE_UNKNOWN; };
+    const bool out = detached(STD_OUTPUT_HANDLE), err = detached(STD_ERROR_HANDLE);
+    if ((!out && !err) || !AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    const auto reopen = [](FILE* stream, DWORD id) {
+        FILE* file = nullptr;
+        if (freopen_s(&file, "CONOUT$", "w", stream) == 0)
+            SetStdHandle(id, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stream))));
+    };
+    if (out) reopen(stdout, STD_OUTPUT_HANDLE);
+    if (err) reopen(stderr, STD_ERROR_HANDLE);
+}
 
 void usage() {
     std::puts("Usage:\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> --list\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]\n"
-              "                  [--no-direct] [--no-clipboard] [--smoke-seconds N]\n"
+              "                  [--no-direct] [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]\n"
+              "                  [--smoke-seconds N]\n"
               "  skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]\n"
-              "                  [--no-clipboard] [--smoke-seconds N]\n"
+              "                  [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]\n"
               "  skylatch-client --help\n\n"
               "Without --device, hub mode selects the sole device or opens a picker.\n"
               "--no-direct forces the hub relay. --no-clipboard disables text clipboard sync.\n"
+              "--swap-cmd-ctrl / --no-swap-cmd-ctrl force the Ctrl<->Cmd swap on or off; by default it\n"
+              "is on for macOS devices reached through a hub.\n"
               "--smoke-seconds runs hidden without input or clipboard sync;\n"
               "specify --device if the hub has multiple devices.\n"
-              "F11: toggle borderless fullscreen. Ctrl+Alt+G: toggle system key capture.");
+              "F11: toggle borderless fullscreen (system keys are captured while fullscreen).\n"
+              "Double-tap Right Ctrl (or Ctrl+Alt+G): toggle system key capture.\n"
+              "Hold Esc for 1.2 s in fullscreen: leave fullscreen.");
 }
 
 bool websocketUrl(std::string_view url) {
@@ -51,6 +78,11 @@ Config parseArgs(int argc, wchar_t** argv) {
     }
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view option(argv[i]);
+        if (option == L"--swap-cmd-ctrl" || option == L"--no-swap-cmd-ctrl") {
+            require(c.swapCmdCtrl < 0, "duplicate or conflicting Cmd/Ctrl swap option; see --help");
+            c.swapCmdCtrl = option == L"--swap-cmd-ctrl" ? 1 : 0;
+            continue;
+        }
         if (option == L"--list" || option == L"--no-direct" || option == L"--no-clipboard") {
             auto& flag = option == L"--list" ? c.list : option == L"--no-direct" ? c.noDirect : c.noClipboard;
             require(!flag, "duplicate option; see --help");
@@ -78,7 +110,7 @@ Config parseArgs(int argc, wchar_t** argv) {
     require(websocketUrl(c.hub.empty() ? c.direct : c.hub), "endpoint must be a ws:// or wss:// URL without user information");
     if (!c.hub.empty()) {
         require(!c.token.empty(), "--hub requires --token");
-        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.smoke),
+        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.smoke && c.swapCmdCtrl < 0),
             "--list cannot be used with session options");
     } else {
         require(!c.list && c.device.empty() && !c.noDirect, "--list, --device and --no-direct require --hub");
@@ -89,8 +121,11 @@ Config parseArgs(int argc, wchar_t** argv) {
 }
 
 constexpr UINT msgDevices = WM_APP + 1, msgConnected = WM_APP + 2, msgCursor = WM_APP + 3, msgEnded = WM_APP + 4;
-constexpr UINT msgClipboard = WM_APP + 5, msgFirstFrame = WM_APP + 6;
-constexpr UINT_PTR statusTimer = 1;
+constexpr UINT msgClipboard = WM_APP + 5, msgFirstFrame = WM_APP + 6, msgMonitors = WM_APP + 7, msgResumed = WM_APP + 8;
+constexpr UINT_PTR statusTimer = 1, hudTimer = 2, escTimer = 3;
+constexpr auto doubleTapWindow = std::chrono::milliseconds(400);
+constexpr UINT escHoldMs = 1200;
+constexpr uint8_t hidEscape = 41, hidLCtrl = 224, hidLGui = 227, hidRCtrl = 228, hidRGui = 231;
 constexpr size_t maxClipboardBytes = 1024 * 1024;
 
 struct ClipboardClose { ~ClipboardClose() { CloseClipboard(); } };
@@ -104,16 +139,20 @@ struct Stats {
 struct QueuedFrame { FrameInfo info; bool key; Bytes annexB; };
 struct Cursor { unsigned width, height, xhot, yhot; Bytes rgba; };
 struct EndStatus { bool ended{}, clean{}; char message[1024]{}; };
+struct Monitor { std::string id; std::wstring name; bool active{}; };
 
 class Client {
     Config config;
     HWND wnd{};
-    bool shown{}, disconnected{}, paintingVideo{};
+    std::atomic<bool> shown{false};
+    bool disconnected{}, paintingVideo{};
     std::atomic<bool> stopping{false};
+    std::atomic<bool> resumePending{false}; // Set while a reconnect waits for its first presented frame.
     std::atomic<SkylatchClient*> client{nullptr};
     std::atomic<std::shared_ptr<Renderer>> activeRenderer{};
+    std::shared_ptr<Hud> hud; // Null in smoke mode: no HUD, no Direct2D.
     std::thread worker;
-    std::mutex videoLock, statsLock, cursorLock, endLock, clipboardLock;
+    std::mutex videoLock, statsLock, cursorLock, endLock, clipboardLock, monitorLock;
     std::condition_variable videoReady;
     bool initialWindowReady{}; // Protected by videoLock.
     std::deque<QueuedFrame> videoQ;
@@ -122,14 +161,21 @@ class Client {
     EndStatus endStatus;
     std::optional<Cursor> cursorIncoming;
     std::optional<std::string> clipboardIncoming;
+    std::optional<std::vector<Monitor>> monitorsIncoming; // Protected by monitorLock.
+    std::vector<Monitor> monitors;
     bool clipboardListening{};
     std::optional<DWORD> lastAppliedClipSeq;
     std::wstring lastSyncedClipboard;
     std::vector<Device> devices;
+    std::wstring deviceName;
     Stats prevStats;
     Clock::time_point connectedAt{}, prevTitle{};
     HCURSOR customCursor{};
-    bool hiddenCursor{}, composing{}, fullscreen{}, captureKeys{}, systemTab{}, localG{};
+    bool hiddenCursor{}, composing{}, fullscreen{}, captureKeys{}, windowedCapture{}, systemTab{}, localG{};
+    bool swapCmdCtrl{}, userDisconnected{}, rctrlArmed{}, mouseTracking{}, overHud{};
+    Clock::time_point rctrlAt{};
+    HudAction hudPress{HudAction::None};
+    unsigned hudSwallow{}; // Mouse buttons (1 left, 2 right, 4 middle) pressed on the HUD; their releases stay local.
     HHOOK hook{};
     WINDOWPLACEMENT placement{sizeof placement};
     DWORD windowStyle{};
@@ -219,6 +265,31 @@ class Client {
         }
     }
 
+    static void onMonitorList(void* ctx, const char* json, size_t len) noexcept {
+        auto& self = *static_cast<Client*>(ctx);
+        if (self.stopping || self.config.smoke || !json) return;
+        try {
+            using winrt::Windows::Data::Json::JsonArray;
+            std::vector<Monitor> list;
+            winrt::init_apartment();
+            struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
+            const auto array = JsonArray::Parse(winrt::hstring(fromUtf8(std::string_view(json, len))));
+            for (const auto& value : array) {
+                const auto obj = value.GetObject();
+                list.push_back({winrt::to_string(obj.GetNamedString(L"id")), displayText(obj.GetNamedString(L"name")),
+                    obj.HasKey(L"active") && obj.GetNamedBoolean(L"active")});
+            }
+            {
+                std::lock_guard lock(self.monitorLock);
+                self.monitorsIncoming = std::move(list);
+            }
+            PostMessageW(self.wnd, msgMonitors, 0, 0);
+        } catch (const std::exception&) {
+            // The monitor button is a convenience; a malformed list must not end the session.
+        } catch (const winrt::hresult_error&) {
+        }
+    }
+
     bool clipboardEnabled() const { return !config.smoke && !config.noClipboard; }
     void applyClipboard() {
         std::optional<std::string> incoming;
@@ -275,7 +346,8 @@ class Client {
     }
 
     void repaint() {
-        if (config.smoke || stopping || paintingVideo) return;
+        // After a disconnect the kept renderer still repaints the last frame under the reconnect card.
+        if (config.smoke || (stopping && !disconnected) || paintingVideo) return;
         if (const auto render = activeRenderer.load()) {
             // DXGI may re-enter the window procedure on this thread during a repaint.
             paintingVideo = true;
@@ -318,12 +390,12 @@ class Client {
         try {
             ComRuntime com;
             MfRuntime mf;
-            const auto render = std::make_shared<Renderer>(wnd);
-            struct Unpublish {
-                std::atomic<std::shared_ptr<Renderer>>& slot;
-                ~Unpublish() { slot.store(nullptr); }
-            } unpublish{activeRenderer};
-            activeRenderer.store(render);
+            // The renderer outlives a session so the last frame stays on screen under the reconnect card.
+            auto render = activeRenderer.load();
+            if (!render) {
+                render = std::make_shared<Renderer>(wnd, hud);
+                activeRenderer.store(render);
+            }
             const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected};
             char err[1024]{};
             auto active = config.hub.empty()
@@ -335,10 +407,10 @@ class Client {
             // Callbacks can queue video before connect returns. Publish before any input or ACK.
             client.store(active);
             if (stopping) return;
-            if (clipboardEnabled()) {
-                const SkylatchSl1Callbacks sl1Callbacks{nullptr, onClipboardData};
+            if (!config.smoke) {
+                const SkylatchSl1Callbacks sl1Callbacks{onMonitorList, clipboardEnabled() ? onClipboardData : nullptr};
                 require(skylatch_set_sl1_callbacks(active, &sl1Callbacks, this) == SKYLATCH_OK,
-                    "could not register clipboard callback");
+                    "could not register SL1 callbacks");
             }
             PostMessageW(wnd, msgConnected, 0, 0);
 
@@ -351,7 +423,7 @@ class Client {
             std::unique_ptr<Decoder> decode;
             uint32_t currentGeneration = 0;
             unsigned currentWidth = 0, currentHeight = 0;
-            bool awaitingInitialFit = !config.smoke;
+            bool awaitingInitialFit = !config.smoke && !shown;
             while (!stopping) {
                 QueuedFrame q;
                 {
@@ -386,6 +458,7 @@ class Client {
                             ++stats.presented; stats.waitUs += wait;
                         }
                     }
+                    if (resumePending.exchange(false)) PostMessageW(wnd, msgResumed, 0, 0);
                     if (awaitingInitialFit) {
                         require(PostMessageW(wnd, msgFirstFrame, f.width, f.height) != FALSE, "could not queue viewer window sizing");
                         // Let the UI fit and present the first cached frame before drawing any more frames.
@@ -417,23 +490,165 @@ class Client {
             devices = discover(config.hub, config.token);
             // Joining this worker on msgDevices synchronizes ownership of the vector.
             if (!stopping) PostMessageW(wnd, msgDevices, 0, 0);
-        } catch (const std::exception& e) { report(e.what()); }
+        } catch (const std::exception& e) {
+            if (config.device.empty()) { report(e.what()); return; }
+            // The device is already known; the listing only supplies its name and OS for the viewer UI.
+            devices.clear();
+            if (!stopping) PostMessageW(wnd, msgDevices, 0, 0);
+        }
     }
     void choose() {
         worker.join();
-        require(!devices.empty(), "No devices are online on this hub");
-        size_t index = 0;
-        if (devices.size() > 1) {
-            require(!config.smoke, "multiple devices are online; specify --device for smoke mode");
-            const auto picked = pickDevice(wnd, devices);
-            if (!picked) { PostQuitMessage(0); return; }
-            index = *picked;
+        const Device* chosen = nullptr;
+        if (config.device.empty()) {
+            require(!devices.empty(), "No devices are online on this hub");
+            size_t index = 0;
+            if (devices.size() > 1) {
+                require(!config.smoke, "multiple devices are online; specify --device for smoke mode");
+                const auto picked = pickDevice(wnd, devices);
+                if (!picked) { PostQuitMessage(0); return; }
+                index = *picked;
+            }
+            chosen = &devices.at(index);
+            config.device = chosen->id;
+        } else {
+            const auto found = std::find_if(devices.begin(), devices.end(), [&](const Device& d) { return d.id == config.device; });
+            if (found != devices.end()) chosen = &*found;
         }
-        config.device = devices.at(index).id;
+        deviceName = chosen ? chosen->name : fromUtf8(config.device);
+        swapCmdCtrl = config.swapCmdCtrl >= 0 ? config.swapCmdCtrl == 1
+            : chosen && _wcsicmp(chosen->os.c_str(), L"macos") == 0;
+        if (hud) { hud->setDevice(deviceName); syncHud(); }
         worker = std::thread(&Client::stream, this);
     }
 
-    void applyCursor() { SetCursor(hiddenCursor ? nullptr : customCursor ? customCursor : LoadCursorW(nullptr, IDC_ARROW)); }
+    void applyCursor() {
+        SetCursor(overHud ? LoadCursorW(nullptr, IDC_ARROW) : hiddenCursor ? nullptr :
+            customCursor ? customCursor : LoadCursorW(nullptr, IDC_ARROW));
+    }
+
+    // --- HUD glue (UI thread) ---
+    void syncHud() {
+        if (hud) hud->setFlags(captureKeys, swapCmdCtrl, fullscreen);
+    }
+    void hudTick(bool repaintNow = false) {
+        if (!hud) return;
+        const auto next = hud->step(Clock::now());
+        if (next.repaint || repaintNow) repaint();
+        if (next.nextMs) SetTimer(wnd, hudTimer, next.nextMs, nullptr);
+        else KillTimer(wnd, hudTimer);
+    }
+    void toast(const wchar_t* text) {
+        if (!hud) return;
+        hud->toast(text, Clock::now());
+        hudTick(true);
+    }
+    void applyMonitors() {
+        std::optional<std::vector<Monitor>> incoming;
+        { std::lock_guard lock(monitorLock); incoming = std::exchange(monitorsIncoming, std::nullopt); }
+        if (!incoming || stopping) return;
+        monitors = std::move(*incoming);
+        const auto active = std::find_if(monitors.begin(), monitors.end(), [](const Monitor& m) { return m.active; });
+        if (hud) { hud->setMonitors(active == monitors.end() ? 0 : unsigned(active - monitors.begin()), monitors.size()); hudTick(true); }
+    }
+    void cycleMonitor() {
+        const auto active = client.load();
+        if (!active || disconnected || monitors.size() < 2) return;
+        const auto current = std::find_if(monitors.begin(), monitors.end(), [](const Monitor& m) { return m.active; });
+        const size_t next = ((current == monitors.end() ? 0 : size_t(current - monitors.begin())) + 1) % monitors.size();
+        skylatch_select_monitor(active, monitors[next].id.c_str());
+    }
+    void toggleSwap() {
+        releaseAll();
+        swapCmdCtrl = !swapCmdCtrl;
+        syncHud();
+        toast(swapCmdCtrl ? hudText().swapOn : hudText().swapOff);
+    }
+    void userDisconnect() {
+        if (disconnected || config.smoke) return;
+        userDisconnected = true;
+        releaseAll();
+        report("Disconnected by user", true);
+    }
+    void reconnect() {
+        if (!disconnected || config.smoke || !hud || hud->overlay() != HudOverlay::Lost) return;
+        {
+            std::lock_guard lock(videoLock);
+            videoQ.clear(); queuedBytes = 0; initialWindowReady = true;
+            stopping = false;
+        }
+        { std::lock_guard lock(endLock); endStatus = {}; }
+        { std::lock_guard lock(statsLock); stats = {}; prevStats = {}; }
+        { std::lock_guard lock(cursorLock); cursorIncoming.reset(); }
+        { std::lock_guard lock(clipboardLock); clipboardIncoming.reset(); }
+        userDisconnected = false;
+        disconnected = false;
+        resumePending = true;
+        hud->showReconnecting();
+        hudTick(true);
+        applyHook();
+        worker = std::thread(&Client::stream, this);
+    }
+    void hudAction(HudAction action) {
+        switch (action) {
+        case HudAction::Monitor: cycleMonitor(); break;
+        case HudAction::Capture: toggleKeyCapture(); break;
+        case HudAction::Swap: toggleSwap(); break;
+        case HudAction::Fullscreen: toggleFullscreen(); break;
+        case HudAction::Disconnect: userDisconnect(); break;
+        case HudAction::Reconnect: reconnect(); break;
+        case HudAction::Close: PostMessageW(wnd, WM_CLOSE, 0, 0); break;
+        default: break;
+        }
+    }
+    // Pointer handling: anything the HUD owns is handled locally and never reaches the remote host.
+    bool hudMove(LPARAM l) {
+        if (!hud) return false;
+        const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        if (!mouseTracking) {
+            TRACKMOUSEEVENT track{sizeof track, TME_LEAVE, wnd, 0};
+            mouseTracking = TrackMouseEvent(&track) != FALSE;
+        }
+        const bool changed = hud->moved(p, Clock::now());
+        const bool over = hud->hit(p) != HudAction::None;
+        if (over != overHud) { overHud = over; if (over) SetCursor(LoadCursorW(nullptr, IDC_ARROW)); else applyCursor(); }
+        if (changed) hudTick(true);
+        return over || hudPress != HudAction::None;
+    }
+    bool hudButton(UINT m, LPARAM l) {
+        if (!hud) return false;
+        const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        const bool down = m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN;
+        const unsigned bit = (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP) ? 1 : (m == WM_RBUTTONDOWN || m == WM_RBUTTONUP) ? 2 : 4;
+        if (down) {
+            const auto action = hud->hit(p);
+            if (action == HudAction::None) return false;
+            hudSwallow |= bit;
+            if (bit == 1) {
+                hudPress = action;
+                hud->setPressed(action);
+                SetFocus(wnd); SetCapture(wnd);
+                hudTick(true);
+            }
+            return true;
+        }
+        if (!(hudSwallow & bit)) return false;
+        hudSwallow &= ~bit;
+        if (bit == 1) {
+            const auto action = std::exchange(hudPress, HudAction::None);
+            hud->setPressed(HudAction::None);
+            if (GetCapture() == wnd && !buttons) ReleaseCapture();
+            if (action != HudAction::None && action != HudAction::Surface && hud->hit(p) == action) hudAction(action);
+            hudTick(true);
+        }
+        return true;
+    }
+    bool overHudScreen(LPARAM l) {
+        if (!hud) return false;
+        POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        ScreenToClient(wnd, &p);
+        return hud->hit(p) != HudAction::None;
+    }
     void changeCursor() {
         std::optional<Cursor> cursor;
         { std::lock_guard lock(cursorLock); cursor = std::exchange(cursorIncoming, std::nullopt); }
@@ -483,7 +698,19 @@ class Client {
             sendInput(6, uint16_t(axis), uint32_t(part * WHEEL_DELTA)); pulses -= part;
         }
     }
+    // Ctrl <-> Cmd swap: local Ctrl becomes the remote GUI/Cmd key and the local Windows key becomes remote Ctrl.
+    uint8_t mapModifier(uint8_t code) const {
+        if (!swapCmdCtrl) return code;
+        switch (code) {
+        case hidLCtrl: return hidLGui;
+        case hidRCtrl: return hidRGui;
+        case hidLGui: return hidLCtrl;
+        case hidRGui: return hidRCtrl;
+        default: return code;
+        }
+    }
     void remoteKey(uint8_t code, bool down) {
+        code = mapModifier(code);
         if (!code || !client || config.smoke || (!down && !held[code])) return;
         held[code] = down;
         if (code >= 224) {
@@ -495,6 +722,10 @@ class Client {
     void key(WPARAM vk, LPARAM l, bool down) {
         const bool repeat = (l & (1L << 30)) != 0;
         if (vk == VK_F11) { if (down && !repeat) toggleFullscreen(); return; }
+        if (disconnected) {
+            if (down && !repeat && vk == VK_RETURN) reconnect();
+            return;
+        }
         if (vk == 'G' && ((GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) < 0) || localG)) {
             if (down && !repeat) { localG = true; toggleKeyCapture(); }
             if (!down) localG = false;
@@ -502,6 +733,20 @@ class Client {
         }
         if (composing || vk == VK_PROCESSKEY) return;
         const auto code = hid(unsigned(vk), unsigned(l >> 16) & 255, (l & (1L << 24)) != 0);
+        if (down && !repeat) {
+            // Double-tap Right Ctrl toggles system key capture. The first tap is forwarded like any Ctrl tap;
+            // the second is consumed here. Any other key press in between cancels the gesture.
+            if (code == hidRCtrl) {
+                const auto now = Clock::now();
+                if (rctrlArmed && now - rctrlAt <= doubleTapWindow) { rctrlArmed = false; toggleKeyCapture(); return; }
+                rctrlArmed = true; rctrlAt = now;
+            } else rctrlArmed = false;
+        }
+        if (vk == VK_ESCAPE) {
+            // Short presses forward immediately; only a 1.2 s hold in fullscreen leaves fullscreen.
+            if (down && !repeat && fullscreen) SetTimer(wnd, escTimer, escHoldMs, nullptr);
+            else if (!down) KillTimer(wnd, escTimer);
+        }
         if (vk == VK_PAUSE || vk == VK_CANCEL) { if (down && !repeat) { remoteKey(code, true); remoteKey(code, false); } return; }
         // Some keyboards deliver PrintScreen only on key-up.
         if (vk == VK_SNAPSHOT && !down && !held[code]) remoteKey(code, true);
@@ -540,17 +785,31 @@ class Client {
         return true;
     }
     void toggleFullscreen() {
-        if (!fullscreen) {
+        const bool entering = !fullscreen;
+        if (entering) {
             GetWindowPlacement(wnd, &placement); windowStyle = DWORD(GetWindowLongPtrW(wnd, GWL_STYLE));
             MONITORINFO mi{sizeof mi}; GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi);
             SetWindowLongPtrW(wnd, GWL_STYLE, (windowStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
             SetWindowPos(wnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
         } else {
+            KillTimer(wnd, escTimer);
             SetWindowLongPtrW(wnd, GWL_STYLE, windowStyle); SetWindowPlacement(wnd, &placement);
             SetWindowPos(wnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         }
-        fullscreen = !fullscreen;
+        fullscreen = entering;
+        // Fullscreen captures system keys automatically; leaving restores the windowed preference.
+        if (entering) { windowedCapture = captureKeys; setCapture(true); }
+        else setCapture(windowedCapture);
+        syncHud();
+        toast(entering ? hudText().fullscreenOn : hudText().fullscreenOff);
+    }
+    // Esc held for escHoldMs in fullscreen: leave fullscreen and make sure the remote sees Esc released.
+    void escHeld() {
+        KillTimer(wnd, escTimer);
+        if (!fullscreen || disconnected) return;
+        remoteKey(hidEscape, false);
+        toggleFullscreen();
     }
     static LRESULT CALLBACK keyboardHook(int n, WPARAM w, LPARAM l) {
         auto self = hookOwner;
@@ -558,7 +817,8 @@ class Client {
             const auto& k = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(l);
             const bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
             const bool tab = k.vkCode == VK_TAB && ((k.flags & LLKHF_ALTDOWN) || self->systemTab);
-            if (k.vkCode == VK_LWIN || k.vkCode == VK_RWIN || tab) {
+            const bool escCombo = k.vkCode == VK_ESCAPE && ((k.flags & LLKHF_ALTDOWN) || GetAsyncKeyState(VK_CONTROL) < 0);
+            if (k.vkCode == VK_LWIN || k.vkCode == VK_RWIN || tab || escCombo) {
                 if (tab) self->systemTab = down;
                 if (!self->composing) self->remoteKey(hid(k.vkCode, k.scanCode, (k.flags & LLKHF_EXTENDED) != 0), down);
                 return 1;
@@ -570,17 +830,27 @@ class Client {
         if (captureKeys && !disconnected && GetFocus() == wnd && !hook) {
             hookOwner = this;
             hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHook, GetModuleHandleW(nullptr), 0);
-            if (!hook) { hookOwner = nullptr; captureKeys = false; std::fprintf(stderr, "WH_KEYBOARD_LL failed: %lu\n", GetLastError()); }
+            if (!hook) {
+                hookOwner = nullptr; captureKeys = false;
+                ensureConsole(); std::fprintf(stderr, "WH_KEYBOARD_LL failed: %lu\n", GetLastError());
+            }
         }
     }
     void removeHook() {
         if (hook) UnhookWindowsHookEx(std::exchange(hook, nullptr));
         hookOwner = nullptr; systemTab = false;
     }
+    void setCapture(bool on) {
+        if (captureKeys == on) return;
+        releaseAll(); captureKeys = on;
+        if (captureKeys) applyHook(); else removeHook();
+        syncHud();
+    }
     void toggleKeyCapture() {
         if (disconnected) return;
-        releaseAll(); captureKeys = !captureKeys;
-        if (captureKeys) applyHook(); else removeHook();
+        setCapture(!captureKeys);
+        if (!fullscreen) windowedCapture = captureKeys;
+        toast(captureKeys ? hudText().captureOn : hudText().captureOff);
     }
     void tick() {
         const auto s = snapshot(); const auto now = Clock::now();
@@ -590,9 +860,18 @@ class Client {
             const auto sec = std::max(0.001, std::chrono::duration<double>(now - prevTitle).count());
             const auto fps = (s.presented - prevStats.presented) / sec;
             wchar_t title[256]{};
-            swprintf_s(title, L"Skylatch | %ux%u | %.1f FPS | F11: Fullscreen | Ctrl+Alt+G: Capture system keys [%ls]",
+            swprintf_s(title, L"Skylatch | %ux%u | %.1f FPS | F11: Fullscreen | Double-tap Right Ctrl: Capture system keys [%ls]",
                 s.width, s.height, fps, captureKeys ? L"On" : L"Off");
-            SetWindowTextW(wnd, title); prevStats = s; prevTitle = now;
+            SetWindowTextW(wnd, title);
+            if (hud && s.width) {
+                const auto frames = s.presented - prevStats.presented;
+                const double waitMs = frames ? double(s.waitUs - prevStats.waitUs) / (1000.0 * double(frames)) : 0.0;
+                wchar_t label[16]{}, stat[48]{};
+                if (s.height >= 2160) swprintf_s(label, L"4K"); else swprintf_s(label, L"%up", s.height);
+                swprintf_s(stat, L"%ls %.0f · %.1fms", label, fps, waitMs);
+                hud->setStat(stat);
+            }
+            prevStats = s; prevTitle = now;
         }
         if (!s.decoded && now - connectedAt >= std::chrono::seconds(8)) report("timed out waiting for H.264 video");
         else if (config.smoke && !s.presented && now - connectedAt >= std::chrono::seconds(8))
@@ -621,11 +900,11 @@ class Client {
         const auto end = status();
         if (!end.ended || disconnected) return;
         disconnected = true;
-        removeHook(); clearInputState();
+        removeHook(); clearInputState(); KillTimer(wnd, escTimer);
         stop();
         KillTimer(wnd, statusTimer);
         std::wstring reason;
-        try { reason = displayText(fromUtf8(end.message)); }
+        try { reason = userDisconnected ? std::wstring(hudText().userDisconnected) : displayText(fromUtf8(end.message)); }
         catch (const std::exception&) { reason = L"Remote session ended"; }
         if (!config.smoke && shown) {
             hiddenCursor = false;
@@ -634,6 +913,7 @@ class Client {
                 DestroyCursor(std::exchange(customCursor, nullptr));
             }
             SetWindowTextW(wnd, (L"Skylatch | Disconnected: " + reason).c_str());
+            if (hud) { hud->showLost(reason); hudTick(true); } // The card replaces any modal dialog once the window is visible.
         } else {
             if (!config.smoke) MessageBoxW(wnd, reason.c_str(), L"Skylatch", MB_OK | MB_ICONERROR);
             PostQuitMessage(1);
@@ -652,14 +932,23 @@ class Client {
             return 0;
         case msgFirstFrame: showFirstFrame(unsigned(w), unsigned(l)); return 0;
         case msgEnded: ended(); return 0;
+        case msgMonitors: applyMonitors(); return 0;
+        case msgResumed:
+            if (hud && !disconnected) { hud->clearOverlay(); hudTick(true); }
+            return 0;
         case msgCursor: changeCursor(); return 0;
         case msgClipboard: applyClipboard(); return 0;
         case WM_CLIPBOARDUPDATE: sendClipboard(); return 0;
         case WM_DESTROY: removeClipboardListener(); break;
-        case WM_TIMER: if (w == statusTimer && !disconnected) tick(); return 0;
+        case WM_TIMER:
+            if (w == statusTimer && !disconnected) tick();
+            else if (w == hudTimer) hudTick();
+            else if (w == escTimer) escHeld();
+            return 0;
         case WM_SETCURSOR: if (LOWORD(l) == HTCLIENT) { applyCursor(); return TRUE; } break;
         case WM_ERASEBKGND: return TRUE;
         case WM_SIZE:
+            if (hud && w != SIZE_MINIMIZED) hud->setView(UINT(LOWORD(l)), UINT(HIWORD(l)), GetDpiForWindow(wnd));
             if (shown && w != SIZE_MINIMIZED) {
                 if (paintingVideo) InvalidateRect(wnd, nullptr, FALSE);
                 else repaint();
@@ -676,17 +965,32 @@ class Client {
             return 0;
         }
         case WM_SETFOCUS: applyHook(); return 0;
-        case WM_KILLFOCUS: releaseAll(); removeHook(); composing = false; highSurrogate = 0; localG = false; return 0;
+        case WM_KILLFOCUS:
+            releaseAll(); removeHook(); composing = false; highSurrogate = 0; localG = false;
+            KillTimer(wnd, escTimer); rctrlArmed = false;
+            return 0;
         case WM_CAPTURECHANGED: if (buttons) releaseAll(); return 0;
+        case WM_MOUSELEAVE:
+            mouseTracking = false;
+            if (hud && hudPress == HudAction::None) {
+                overHud = false;
+                hud->left(Clock::now());
+                hudTick(true);
+            }
+            return 0;
         case WM_MOUSEMOVE:
+            if (hudMove(l)) return 0;
             position(l, false);
             if (composing) placeIme();
             if (snapshot().width) sendInput(3);
             return 0;
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP: mouseButton(1, m == WM_LBUTTONDOWN, l); return 0;
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP: mouseButton(2, m == WM_MBUTTONDOWN, l); return 0;
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP: mouseButton(3, m == WM_RBUTTONDOWN, l); return 0;
-        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: wheel(m == WM_MOUSEHWHEEL, w, l); return 0;
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: if (hudButton(m, l)) return 0; mouseButton(1, m == WM_LBUTTONDOWN, l); return 0;
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: if (hudButton(m, l)) return 0; mouseButton(2, m == WM_MBUTTONDOWN, l); return 0;
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: if (hudButton(m, l)) return 0; mouseButton(3, m == WM_RBUTTONDOWN, l); return 0;
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+            if (overHudScreen(l)) return 0;
+            wheel(m == WM_MOUSEHWHEEL, w, l);
+            return 0;
         case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
             key(w, l, m == WM_KEYDOWN || m == WM_SYSKEYDOWN); return 0;
         case WM_SYSCHAR: return 0;
@@ -721,14 +1025,34 @@ public:
     explicit Client(Config c) : config(std::move(c)) {}
     ~Client() {
         removeHook(); stop();
+        activeRenderer.store(nullptr); // Release the swap chain before its window goes away.
         if (wnd) DestroyWindow(wnd);
         if (customCursor) DestroyCursor(customCursor);
     }
     int run() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        WNDCLASSEXW wc{sizeof wc}; wc.lpfnWndProc = wndProc; wc.hInstance = GetModuleHandleW(nullptr);
+        const auto instance = GetModuleHandleW(nullptr);
+        const UINT systemDpi = GetDpiForSystem();
+        const auto icon = [&](int cx, int cy) {
+            return static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(appIconId), IMAGE_ICON,
+                GetSystemMetricsForDpi(cx, systemDpi), GetSystemMetricsForDpi(cy, systemDpi), LR_DEFAULTCOLOR | LR_SHARED));
+        };
+        WNDCLASSEXW wc{sizeof wc}; wc.lpfnWndProc = wndProc; wc.hInstance = instance;
+        wc.hIcon = icon(SM_CXICON, SM_CYICON); wc.hIconSm = icon(SM_CXSMICON, SM_CYSMICON);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = L"SkylatchNativeView";
         require(RegisterClassExW(&wc) != 0, "RegisterClassExW failed");
+        if (!config.smoke) {
+            hud = std::make_shared<Hud>();
+            if (config.hub.empty()) {
+                // Direct sessions have no device record; label the HUD with the endpoint's host.
+                auto url = std::string_view(config.direct);
+                url.remove_prefix(url.starts_with("wss://") ? 6 : 5);
+                deviceName = fromUtf8(url.substr(0, url.find_first_of("/?#")));
+                swapCmdCtrl = config.swapCmdCtrl == 1;
+            }
+            hud->setDevice(deviceName);
+            syncHud();
+        }
         int winX = CW_USEDEFAULT, winY = CW_USEDEFAULT, winW = 1100, winH = 730;
         POINT cursor{};
         MONITORINFO mi{sizeof mi};
@@ -746,17 +1070,21 @@ public:
         require(CreateWindowExW(config.smoke ? WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW : 0, wc.lpszClassName,
             L"Skylatch | Waiting for video", WS_OVERLAPPEDWINDOW, winX, winY,
             winW, winH, nullptr, nullptr, wc.hInstance, this) != nullptr, "CreateWindowExW failed");
-        worker = std::thread(!config.hub.empty() && config.device.empty() ? &Client::enumerate : &Client::stream, this);
+        // Hub mode looks the device up first (name and OS drive the HUD label and the Ctrl/Cmd default).
+        const bool lookup = !config.hub.empty() && (config.device.empty() || !config.smoke);
+        worker = std::thread(lookup ? &Client::enumerate : &Client::stream, this);
         MSG msg{}; BOOL next;
         while ((next = GetMessageW(&msg, nullptr, 0, 0)) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         if (next < 0) report("GetMessageW failed");
         stop();
         const auto end = status();
         if (end.ended && (!end.clean || config.smoke)) {
+            ensureConsole();
             std::fprintf(stderr, "Skylatch: %s\n", end.message);
             return 1;
         }
         if (config.smoke) {
+            ensureConsole();
             const auto s = snapshot();
             require(s.presented > 0 && Clock::now() - s.firstPresent >= std::chrono::seconds(config.smoke),
                 "smoke run ended before the requested live duration");
@@ -773,10 +1101,11 @@ int wmain(int argc, wchar_t** argv) {
     using namespace skylatch;
     Config config;
     try { config = parseArgs(argc, argv); }
-    catch (const std::exception& e) { std::fprintf(stderr, "Skylatch: %s\n", e.what()); return 2; }
+    catch (const std::exception& e) { ensureConsole(); std::fprintf(stderr, "Skylatch: %s\n", e.what()); return 2; }
     try {
-        if (config.help) { usage(); return 0; }
-        if (config.list) { printDevices(discover(config.hub, config.token)); return 0; }
+        if (config.help) { ensureConsole(); usage(); return 0; }
+        if (config.list) { ensureConsole(); printDevices(discover(config.hub, config.token)); return 0; }
+        if (config.smoke) ensureConsole();
         return Client(std::move(config)).run();
-    } catch (const std::exception& e) { std::fprintf(stderr, "Skylatch: %s\n", e.what()); return 1; }
+    } catch (const std::exception& e) { ensureConsole(); std::fprintf(stderr, "Skylatch: %s\n", e.what()); return 1; }
 }

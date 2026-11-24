@@ -40,10 +40,12 @@ for %%I in ("%RUST_OUT%\%CORE_DLL%" "%RUST_OUT%\%CORE_DLL%.lib") do if not exist
     echo Missing %%~I. Run build.bat without --skip-rust using x86_64-pc-windows-msvc Rust. 1>&2
     exit /b 1
 )
+rc.exe /nologo /fo skylatch.res skylatch.rc
+if errorlevel 1 exit /b %ERRORLEVEL%
 cl.exe /nologo /std:c++20 /O2 /EHsc /W3 /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 ^
   /I"..\..\crates\skylatch-client-core\include" client.cpp /Fe:skylatch-client.exe ^
-  /link /SUBSYSTEM:CONSOLE "%RUST_OUT%\%CORE_DLL%.lib" ^
-  d3d11.lib dxgi.lib mfplat.lib mfuuid.lib mf.lib user32.lib gdi32.lib ole32.lib oleaut32.lib imm32.lib wmcodecdspuuid.lib runtimeobject.lib
+  /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup skylatch.res "%RUST_OUT%\%CORE_DLL%.lib" ^
+  d3d11.lib dxgi.lib mfplat.lib mfuuid.lib mf.lib user32.lib gdi32.lib ole32.lib oleaut32.lib imm32.lib wmcodecdspuuid.lib runtimeobject.lib d2d1.lib dwrite.lib
 if errorlevel 1 exit /b %ERRORLEVEL%
 copy /Y "%RUST_OUT%\%CORE_DLL%" "%~dp0%CORE_DLL%"
 exit /b %ERRORLEVEL%

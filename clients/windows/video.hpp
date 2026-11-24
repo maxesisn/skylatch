@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "common.hpp"
+#include "hud.hpp"
 #include <d3d11.h>
 #include <d3d10.h>
 #include <dxgi1_2.h>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 
 namespace skylatch {
@@ -67,6 +69,44 @@ class Renderer {
     VideoFormat cachedFmt{};
     unsigned cachedFrameW{}, cachedFrameH{};
     bool hasCachedFrame{};
+    // Direct2D 1.1 shares this D3D device and draws the HUD straight into the swap chain back buffer.
+    std::shared_ptr<Hud> hud;
+    ComPtr<ID2D1DeviceContext> d2d;
+    ComPtr<ID2D1SolidColorBrush> d2dBrush;
+    bool d2dFailed{};
+    void initHud() {
+        if (!hud || d2d || d2dFailed) return;
+        try {
+            ComPtr<IDXGIDevice> dxgi; ComPtr<ID2D1Factory1> factory; ComPtr<ID2D1Device> d2dDevice;
+            hrcheck(device.As(&dxgi), "IDXGIDevice");
+            hrcheck(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, IID_PPV_ARGS(&factory)), "D2D1CreateFactory");
+            hrcheck(factory->CreateDevice(dxgi.Get(), &d2dDevice), "ID2D1Factory1::CreateDevice");
+            hrcheck(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2d), "CreateDeviceContext");
+            hrcheck(d2d->CreateSolidColorBrush(D2D1::ColorF(0), &d2dBrush), "CreateSolidColorBrush");
+        } catch (const std::exception&) {
+            d2d.Reset(); d2dBrush.Reset(); d2dFailed = true; // Video keeps working without the HUD.
+        }
+    }
+    void drawHud(UINT w, UINT h) noexcept {
+        try {
+            initHud();
+            if (!d2d) return;
+            ComPtr<IDXGISurface> surface; ComPtr<ID2D1Bitmap1> bitmap;
+            hrcheck(swap->GetBuffer(0, IID_PPV_ARGS(&surface)), "swap chain GetBuffer(DXGI)");
+            const UINT dpi = std::max(96u, GetDpiForWindow(hwnd));
+            hrcheck(d2d->CreateBitmapFromDxgiSurface(surface.Get(), D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), float(dpi), float(dpi)), &bitmap),
+                "CreateBitmapFromDxgiSurface");
+            d2d->SetTarget(bitmap.Get());
+            d2d->BeginDraw();
+            hud->draw(d2d.Get(), d2dBrush.Get(), w, h, dpi);
+            const HRESULT hr = d2d->EndDraw();
+            d2d->SetTarget(nullptr); // The back buffer must be unreferenced before ResizeBuffers.
+            if (hr == D2DERR_RECREATE_TARGET) { d2dBrush.Reset(); d2d.Reset(); }
+        } catch (const std::exception&) {
+        }
+    }
     void setup(UINT tw, UINT th, UINT w, UINT h) {
         const bool resize = w != outW || h != outH;
         if (resize) {
@@ -150,13 +190,14 @@ class Renderer {
         vctx->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &dst);
         D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable = TRUE; stream.pInputSurface = source.Get();
         hrcheck(vctx->VideoProcessorBlt(processor.Get(), target.Get(), 0, 1, &stream), "VideoProcessorBlt");
+        if (hud) drawHud(outW, outH);
         const HRESULT p = swap->Present(0, 0);
         hrcheck(p, "Present(0, 0)");
         return p != DXGI_STATUS_OCCLUDED;
     }
 public:
     ComPtr<ID3D11Device> device;
-    explicit Renderer(HWND window) : hwnd(window) {
+    explicit Renderer(HWND window, std::shared_ptr<Hud> overlay = {}) : hwnd(window), hud(std::move(overlay)) {
         constexpr D3D_FEATURE_LEVEL levels[]{D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         hrcheck(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
