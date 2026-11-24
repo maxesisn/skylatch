@@ -177,7 +177,7 @@ class Client {
     Clock::time_point connectedAt{}, prevTitle{};
     HCURSOR customCursor{};
     bool hiddenCursor{}, composing{}, fullscreen{}, captureKeys{}, windowedCapture{}, systemTab{}, localG{};
-    bool swapCmdCtrl{}, userDisconnected{}, rctrlArmed{}, mouseTracking{}, overHud{};
+    bool audioOn{true}, swapCmdCtrl{}, userDisconnected{}, rctrlArmed{}, mouseTracking{}, overHud{};
     Clock::time_point rctrlAt{};
     HudAction hudPress{HudAction::None};
     unsigned hudSwallow{}; // Mouse buttons (1 left, 2 right, 4 middle) pressed on the HUD; their releases stay local.
@@ -575,6 +575,16 @@ class Client {
         syncHud();
         toast(swapCmdCtrl ? hudText().swapOn : hudText().swapOff);
     }
+    void toggleAudio() {
+        const auto active = client.load();
+        if (!active || disconnected || !audio || !hud) return;
+        const bool next = !audioOn;
+        if (skylatch_set_audio_enabled(active, next ? 1 : 0) != SKYLATCH_OK) return;
+        audioOn = next;
+        if (!next) audio->clear();
+        hud->setAudio(next);
+        toast(next ? hudText().audioOn : hudText().audioOff);
+    }
     void userDisconnect() {
         if (disconnected || config.smoke) return;
         userDisconnected = true;
@@ -594,6 +604,8 @@ class Client {
         { std::lock_guard lock(clipboardLock); clipboardIncoming.reset(); }
         userDisconnected = false;
         disconnected = false;
+        audioOn = true;
+        hud->setAudio(true);
         resumePending = true;
         hud->showReconnecting();
         hudTick(true);
@@ -603,6 +615,7 @@ class Client {
     void hudAction(HudAction action) {
         switch (action) {
         case HudAction::Monitor: cycleMonitor(); break;
+        case HudAction::Audio: toggleAudio(); break;
         case HudAction::Capture: toggleKeyCapture(); break;
         case HudAction::Swap: toggleSwap(); break;
         case HudAction::Fullscreen: toggleFullscreen(); break;
@@ -1073,6 +1086,7 @@ public:
                 swapCmdCtrl = config.swapCmdCtrl == 1;
             }
             hud->setDevice(deviceName);
+            hud->setAudioAvailable(audio != nullptr);
             syncHud();
         }
         int winX = CW_USEDEFAULT, winY = CW_USEDEFAULT, winW = 1100, winH = 730;

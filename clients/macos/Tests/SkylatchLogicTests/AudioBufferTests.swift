@@ -25,6 +25,17 @@ final class AudioBufferTests: XCTestCase {
         XCTAssertEqual(buffer.queuedFrames, 1)
     }
 
+    func testClearDropsQueuedSamplesAndPrimesAgain() {
+        var buffer = PcmJitterBuffer(channels: 1, target: 2, limit: 4)
+        write(&buffer, [1, 2, 3])
+        buffer.clear()
+        XCTAssertEqual(buffer.queuedFrames, 0)
+        write(&buffer, [7])
+        XCTAssertEqual(read(&buffer, frames: 1).frames, 0)
+        write(&buffer, [8])
+        XCTAssertEqual(read(&buffer, frames: 2).samples, [7, 8])
+    }
+
     func testUnderrunPadsWithSilenceAndPrimesAgain() {
         var buffer = PcmJitterBuffer(channels: 1, target: 2, limit: 4)
         write(&buffer, [5, 6, 7])

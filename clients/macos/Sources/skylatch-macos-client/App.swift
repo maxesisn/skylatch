@@ -36,6 +36,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
     private var deviceName = ""
     private var swapEnabled = false
     private var captureOn = false
+    private var audioOn = true
     private var windowedCapture = false
     private var fullscreen = false
     private var monitors: [MonitorEntry] = []
@@ -201,6 +202,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         guard let renderer else { return }
         let session = Session(config: config, renderer: renderer, delegate: self)
         self.session = session
+        audioOn = true
+        hud?.setAudioAvailable(session.hasAudio)
+        hud?.setAudioEnabled(true)
         session.start(device: deviceID)
     }
 
@@ -302,6 +306,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         switch action {
         case .monitor:
             if let next = Monitors.next(after: monitors) { session?.selectMonitor(next.id) }
+        case .audio: toggleAudio()
         case .capture: toggleCapture()
         case .swap: toggleSwap()
         case .fullscreen: window?.toggleFullScreen(nil)
@@ -310,6 +315,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         case .close: window?.close()
         case .none, .surface: break
         }
+    }
+
+    private func toggleAudio() {
+        guard let session, session.hasAudio, session.setAudio(!audioOn) else { return }
+        audioOn.toggle()
+        hud?.setAudioEnabled(audioOn)
+        hud?.toast(audioOn ? text.audioOn : text.audioOff)
     }
 
     /// Turns system-key capture on or off. Turning it on needs the Accessibility permission; without it the
