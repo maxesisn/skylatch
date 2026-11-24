@@ -45,3 +45,7 @@ xcuserdata/
 .idea/
 .vscode/
 *.swp
+
+# Host engine build output
+/host/skylatch-host-engine
+/host/build/
