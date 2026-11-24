@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Skylatch
+Comment=Connect to a Skylatch remote desktop from the command line
+Exec=sh -c "skylatch-client --help; exec sh -i"
+Icon=skylatch
+Terminal=true
+Categories=Network;RemoteAccess;

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.maxesisn.skylatch</string>
+    <key>CFBundleName</key>
+    <string>Skylatch</string>
+    <key>CFBundleDisplayName</key>
+    <string>Skylatch</string>
+    <key>CFBundleExecutable</key>
+    <string>skylatch-ui</string>
+    <key>CFBundleIconFile</key>
+    <string>Skylatch.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@BUILD_VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>@MIN_VERSION@</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Skylatch needs permission when you open files from your Desktop folder.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Skylatch shares your screen when you use this Mac as a remote desktop host.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Skylatch uses Accessibility to apply remote keyboard and pointer input on this Mac.</string>
+</dict>
+</plist>

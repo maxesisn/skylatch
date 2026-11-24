@@ -1,0 +1,17 @@
+[Unit]
+Description=Skylatch host agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=skylatch
+Group=skylatch
+StateDirectory=skylatch
+StateDirectoryMode=0700
+Environment=XDG_CONFIG_HOME=/var/lib/skylatch
+ExecStart=/usr/bin/skylatch-agent --engine-bin /usr/bin/skylatch-host-engine
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
