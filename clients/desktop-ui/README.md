@@ -16,8 +16,15 @@ client for the screen you pick, with one click. **License: Apache-2.0.**
 - **Live data** – `skylatch-client-core` lists the online devices on a background thread at
   start-up, on refresh (`R`) and every 10 seconds. The window never blocks; connection problems and
   rejected tokens are shown inline.
-- **Demo fleet** – without a hub the built-in demo fleet is shown, so you can try the UI at once
-  (`--demo` forces it).
+- **First run** – with no hub configured the launcher shows an empty L-shaped desk and an onboarding
+  card instead of any fake devices: **Connect to Hub** (hub URL plus user name and password, or an
+  existing account token) or **Direct Connect** (`ws://` / `wss://` address of one host plus an
+  optional token, starts the native client at once). See
+  [Onboarding and adding devices](#onboarding-and-adding-devices).
+- **Add device** – while signed in, `+ 添加设备` in the top bar shows a one-time 6-digit pairing code and
+  a copyable `skylatch-agent join` command.
+- **Demo fleet** – `--demo` (and only `--demo`) shows the built-in demo fleet, to try the UI without a
+  hub.
 
 ## Build
 
@@ -35,7 +42,12 @@ Requires a recent stable Rust toolchain (edition 2024). Windows needs the MSVC b
 tested on Windows; the macOS and Linux code paths (fonts, window chrome, config location) build
 on the GPUI backends of those platforms but have not been exercised yet.
 
-`skylatch-ui --help` and `--version` print and exit without creating a window.
+On Windows the executable uses the GUI subsystem (no console window appears when it is started by a
+double click) and carries the Lock-Bolt icon (resource id 101, compiled from `skylatch-ui.rc` by
+`build.rs` with the Windows SDK `rc.exe`, found on `PATH` or under `Windows Kits`).
+
+`skylatch-ui --help` and `--version` print and exit without creating a window; they attach to the
+parent console, and output redirected to a file or a pipe works as usual.
 
 ## Connect to a hub
 
@@ -51,14 +63,27 @@ skylatch-ui --hub wss://hub.example.com --token "$SKYLATCH_HUB_TOKEN"
 | `--hub <URL>`, `SKYLATCH_HUB`     | Hub base URL; `ws://`, `wss://`, `http://`, `https://` or a bare host |
 | `--token <TOKEN>`, `SKYLATCH_TOKEN` | Hub account token                                                  |
 | `SKYLATCH_CLIENT`            | Path of the native stream client (overrides the saved setting)        |
-| `--demo`                     | Show the demo fleet even if a hub is configured                       |
+| `--demo`                     | Show the built-in demo fleet (the only way to get demo data)          |
 | `--dark`, `--shelf`          | Start in Dark Mode / Shelf view                                       |
 
 Precedence: command-line flags, then environment variables, then the saved settings. Flags and
 variables are never written to the settings file.
 
 The drawer also has **Prefer direct** (unchecked adds `--no-direct` to the client, so everything goes
-through the relay) and **Switch to demo**, which clears the saved hub URL and token.
+through the relay) and **Sign out**, which clears the saved hub URL and token and returns to the
+first-run screen.
+
+### Onboarding and adding devices
+
+- **Connect to Hub** signs in with `skylatch_client_core::login` on a background thread. The password
+  is wiped from the form when you submit and is never stored; only the hub URL and the returned
+  session token are saved. *Paste an account token instead* skips the password.
+- **Direct Connect** runs `skylatch-client --direct <url> [--token <token>]` without a hub; nothing
+  is saved.
+- A reachable hub with no online device shows the **添加第一台设备** card with a live pairing code.
+- `+ 添加设备` (top bar, whenever a hub is configured) opens the pairing dialog: the 6-digit code
+  (valid 10 minutes, single use) and the copyable `skylatch-agent join <hub> --code <code>` command.
+  `Enter` copies it, `R` or **换一码** mints another code, `Esc` closes.
 
 ### Saved settings
 

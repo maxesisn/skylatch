@@ -213,7 +213,8 @@ pub struct Effective {
     pub dark: bool,
     pub shelf: bool,
     pub client_bin: Option<String>,
-    /// `--demo`: stay on the built-in fleet even when a hub is configured.
+    /// `--demo`: show the built-in fleet even when a hub is configured. This flag is the only
+    /// way to get demo data.
     pub demo: bool,
 }
 
@@ -244,9 +245,18 @@ impl Effective {
         !self.demo && !self.hub_url.trim().is_empty() && !self.token.is_empty()
     }
 
+    /// Neither a hub nor `--demo`: the first-run onboarding is shown, never a fake fleet.
+    pub fn unconfigured(&self) -> bool {
+        !self.demo && !self.live()
+    }
+
+    /// The built-in demo fleet (`--demo`).
     #[cfg(test)]
     pub fn demo_only() -> Effective {
-        Effective::from_config(&Config::default())
+        Effective {
+            demo: true,
+            ..Effective::from_config(&Config::default())
+        }
     }
 
     pub fn from_config(cfg: &Config) -> Effective {
@@ -510,6 +520,12 @@ mod tests {
         eff.demo = true;
         assert!(!eff.live(), "--demo forces the built-in fleet");
         assert!(!Effective::demo_only().live());
+        assert!(Effective::demo_only().demo && !Effective::demo_only().unconfigured());
+        assert!(
+            Effective::from_config(&Config::default()).unconfigured(),
+            "no hub and no --demo: onboarding, not a fake fleet"
+        );
+        assert!(!Effective::from_config(&sample()).unconfigured());
         let half = Config {
             hub_url: "wss://h.example".into(),
             ..Config::default()
