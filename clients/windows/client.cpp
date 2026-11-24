@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <utility>
 
@@ -88,7 +89,7 @@ Config parseArgs(int argc, wchar_t** argv) {
 }
 
 constexpr UINT msgDevices = WM_APP + 1, msgConnected = WM_APP + 2, msgCursor = WM_APP + 3, msgEnded = WM_APP + 4;
-constexpr UINT msgClipboard = WM_APP + 5;
+constexpr UINT msgClipboard = WM_APP + 5, msgFirstFrame = WM_APP + 6;
 constexpr UINT_PTR statusTimer = 1;
 constexpr size_t maxClipboardBytes = 1024 * 1024;
 
@@ -107,12 +108,14 @@ struct EndStatus { bool ended{}, clean{}; char message[1024]{}; };
 class Client {
     Config config;
     HWND wnd{};
-    bool shown{}, disconnected{};
+    bool shown{}, disconnected{}, paintingVideo{};
     std::atomic<bool> stopping{false};
     std::atomic<SkylatchClient*> client{nullptr};
+    std::atomic<std::shared_ptr<Renderer>> activeRenderer{};
     std::thread worker;
     std::mutex videoLock, statsLock, cursorLock, endLock, clipboardLock;
     std::condition_variable videoReady;
+    bool initialWindowReady{}; // Protected by videoLock.
     std::deque<QueuedFrame> videoQ;
     size_t queuedBytes{};
     Stats stats;
@@ -271,11 +274,56 @@ class Client {
         if (std::exchange(clipboardListening, false)) RemoveClipboardFormatListener(wnd);
     }
 
+    void repaint() {
+        if (config.smoke || stopping || paintingVideo) return;
+        if (const auto render = activeRenderer.load()) {
+            // DXGI may re-enter the window procedure on this thread during a repaint.
+            paintingVideo = true;
+            struct Reset { bool& flag; ~Reset() { flag = false; } } reset{paintingVideo};
+            render->repaint();
+        }
+    }
+    void showFirstFrame(unsigned width, unsigned height) {
+        if (config.smoke || shown || disconnected || stopping || !width || !height) return;
+        MONITORINFO mi{sizeof mi};
+        require(GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi) != FALSE,
+            "could not get the viewer monitor work area");
+        const LONG workW = mi.rcWork.right - mi.rcWork.left, workH = mi.rcWork.bottom - mi.rcWork.top;
+        RECT frame{};
+        const auto style = DWORD(GetWindowLongPtrW(wnd, GWL_STYLE)), exStyle = DWORD(GetWindowLongPtrW(wnd, GWL_EXSTYLE));
+        require(AdjustWindowRectExForDpi(&frame, style, FALSE, exStyle, GetDpiForWindow(wnd)) != FALSE,
+            "could not compute the viewer window frame");
+        const LONG frameW = frame.right - frame.left, frameH = frame.bottom - frame.top;
+        const LONG maxW = std::max(1L, workW * 85 / 100 - frameW), maxH = std::max(1L, workH * 85 / 100 - frameH);
+        const unsigned divisor = std::gcd(width, height);
+        const LONG unitW = LONG(width / divisor), unitH = LONG(height / divisor);
+        const LONG scale = std::min(maxW / unitW, maxH / unitH);
+        // Use exact aspect-ratio multiples where they fit, otherwise round to the pixel grid.
+        const RECT fit = scale ? RECT{0, 0, scale * unitW, scale * unitH} : letterbox(maxW, maxH, width, height);
+        const LONG outerW = fit.right - fit.left + frameW, outerH = fit.bottom - fit.top + frameH;
+        require(SetWindowPos(wnd, nullptr, mi.rcWork.left + (workW - outerW) / 2, mi.rcWork.top + (workH - outerH) / 2,
+            outerW, outerH, SWP_NOACTIVATE | SWP_NOZORDER) != FALSE, "could not size the viewer window");
+        repaint();
+        shown = true;
+        ShowWindow(wnd, SW_SHOW);
+        repaint();
+        {
+            std::lock_guard lock(videoLock);
+            initialWindowReady = true;
+        }
+        videoReady.notify_one();
+    }
+
     void stream() {
         try {
             ComRuntime com;
             MfRuntime mf;
-            Renderer render(wnd);
+            const auto render = std::make_shared<Renderer>(wnd);
+            struct Unpublish {
+                std::atomic<std::shared_ptr<Renderer>>& slot;
+                ~Unpublish() { slot.store(nullptr); }
+            } unpublish{activeRenderer};
+            activeRenderer.store(render);
             const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected};
             char err[1024]{};
             auto active = config.hub.empty()
@@ -303,6 +351,7 @@ class Client {
             std::unique_ptr<Decoder> decode;
             uint32_t currentGeneration = 0;
             unsigned currentWidth = 0, currentHeight = 0;
+            bool awaitingInitialFit = !config.smoke;
             while (!stopping) {
                 QueuedFrame q;
                 {
@@ -321,32 +370,43 @@ class Client {
                 }
                 bool outputStarted = false;
                 auto output = [&](IMFSample* sample, const VideoFormat& fmt, const FrameInfo& f, uint32_t us) {
+                    if (stopping) return;
                     outputStarted = true;
-                    const auto result = render.draw(sample, fmt, f);
+                    const auto result = render->draw(sample, fmt, f, awaitingInitialFit);
                     const auto now = Clock::now();
                     const auto wait = elapsedUs(f.arrival, now);
                     ack(f, wait);
                     const char* mode = decode->mode(result.dxgiBacked);
-                    std::lock_guard lock(statsLock);
-                    stats.width = f.width; stats.height = f.height; stats.mode = mode;
-                    ++stats.decoded; stats.decodeUs += us;
-                    if (result.presented) {
-                        if (!stats.presented) stats.firstPresent = now;
-                        ++stats.presented; stats.waitUs += wait;
+                    {
+                        std::lock_guard lock(statsLock);
+                        stats.width = f.width; stats.height = f.height; stats.mode = mode;
+                        ++stats.decoded; stats.decodeUs += us;
+                        if (result.presented) {
+                            if (!stats.presented) stats.firstPresent = now;
+                            ++stats.presented; stats.waitUs += wait;
+                        }
+                    }
+                    if (awaitingInitialFit) {
+                        require(PostMessageW(wnd, msgFirstFrame, f.width, f.height) != FALSE, "could not queue viewer window sizing");
+                        // Let the UI fit and present the first cached frame before drawing any more frames.
+                        // draw() has released renderLock; stop() can cancel this wait through videoReady.
+                        std::unique_lock lock(videoLock);
+                        videoReady.wait(lock, [&] { return stopping || initialWindowReady; });
+                        awaitingInitialFit = false;
                     }
                 };
                 auto feed = [&] { decode->feed(q.annexB, q.info, q.key, output, drop); };
                 if (decode) { feed(); continue; }
                 if (!q.key) { drop(q.info); continue; }
                 try {
-                    decode = std::make_unique<Decoder>(render.device.Get(), true);
+                    decode = std::make_unique<Decoder>(render->device.Get(), true);
                     feed();
                 } catch (const std::runtime_error&) {
                     // DXVA can reject oversized surfaces only once the first input type is set.
                     // Don't retry a frame that has already reached the renderer.
                     if (outputStarted || (currentWidth <= 4096 && currentHeight <= 4096)) throw;
                     decode.reset();
-                    decode = std::make_unique<Decoder>(render.device.Get(), false);
+                    decode = std::make_unique<Decoder>(render->device.Get(), false);
                     feed();
                 }
             }
@@ -588,9 +648,9 @@ class Client {
                 if (clipboardEnabled()) clipboardListening = AddClipboardFormatListener(wnd) != FALSE;
                 connectedAt = prevTitle = Clock::now();
                 require(SetTimer(wnd, statusTimer, config.smoke ? 50 : 1000, nullptr) != 0, "could not start session timer");
-                if (!config.smoke) { shown = true; ShowWindow(wnd, SW_SHOW); UpdateWindow(wnd); }
             }
             return 0;
+        case msgFirstFrame: showFirstFrame(unsigned(w), unsigned(l)); return 0;
         case msgEnded: ended(); return 0;
         case msgCursor: changeCursor(); return 0;
         case msgClipboard: applyClipboard(); return 0;
@@ -599,7 +659,17 @@ class Client {
         case WM_TIMER: if (w == statusTimer && !disconnected) tick(); return 0;
         case WM_SETCURSOR: if (LOWORD(l) == HTCLIENT) { applyCursor(); return TRUE; } break;
         case WM_ERASEBKGND: return TRUE;
-        case WM_PAINT: { PAINTSTRUCT ps{}; BeginPaint(wnd, &ps); EndPaint(wnd, &ps); return 0; }
+        case WM_SIZE:
+            if (shown && w != SIZE_MINIMIZED) {
+                if (paintingVideo) InvalidateRect(wnd, nullptr, FALSE);
+                else repaint();
+            }
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{}; BeginPaint(wnd, &ps); EndPaint(wnd, &ps);
+            if (shown) repaint();
+            return 0;
+        }
         case WM_DPICHANGED: {
             const auto& r = *reinterpret_cast<const RECT*>(l);
             if (!fullscreen) SetWindowPos(wnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_NOZORDER);
