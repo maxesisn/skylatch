@@ -30,6 +30,9 @@ pub struct Config {
     /// Let other devices take over this machine: the launcher enrolls it as a host and keeps a
     /// local `skylatch-agent` running while a hub is configured.
     pub host_enabled: bool,
+    /// Room this machine joins when the launcher enrolls it (empty: the hub's default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_room: Option<String>,
     /// Optional absolute path of the native stream client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_bin: Option<String>,
@@ -44,6 +47,7 @@ impl Default for Config {
             dark_mode: false,
             shelf_mode: false,
             host_enabled: true,
+            host_room: None,
             client_bin: None,
         }
     }
@@ -66,6 +70,7 @@ impl fmt::Debug for Config {
             .field("dark_mode", &self.dark_mode)
             .field("shelf_mode", &self.shelf_mode)
             .field("host_enabled", &self.host_enabled)
+            .field("host_room", &self.host_room)
             .field("client_bin", &self.client_bin)
             .finish()
     }
@@ -357,6 +362,7 @@ mod tests {
             dark_mode: true,
             shelf_mode: true,
             host_enabled: false,
+            host_room: Some("办公室".into()),
             client_bin: Some("/opt/skylatch/skylatch-client".into()),
         }
     }
@@ -372,6 +378,7 @@ mod tests {
             "dark_mode",
             "shelf_mode",
             "host_enabled",
+            "host_room",
             "client_bin",
         ] {
             assert!(
@@ -383,6 +390,7 @@ mod tests {
         // optional override is omitted when unset
         let plain = serde_json::to_string(&Config::default()).unwrap();
         assert!(!plain.contains("client_bin"));
+        assert!(!plain.contains("host_room"), "an unset room is omitted");
         assert_eq!(
             serde_json::from_str::<Config>(&plain).unwrap(),
             Config::default()
@@ -442,6 +450,26 @@ mod tests {
         // a config written before this setting existed keeps hosting on
         std::fs::write(&path, r#"{"hub_url":"wss://h.example","token":"t"}"#).unwrap();
         assert!(load(&path).unwrap().host_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_room_is_persisted_and_optional() {
+        assert_eq!(Config::default().host_room, None);
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-room-cfg-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let cfg = Config {
+            host_room: Some("客厅工作台".into()),
+            ..Config::default()
+        };
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            load(&path).unwrap().host_room.as_deref(),
+            Some("客厅工作台")
+        );
+        // a config written before this setting existed has no room
+        std::fs::write(&path, r#"{"hub_url":"wss://h.example","token":"t"}"#).unwrap();
+        assert_eq!(load(&path).unwrap().host_room, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

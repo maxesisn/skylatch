@@ -18,6 +18,28 @@ use std::time::{Duration, Instant};
 pub const MAX_URL_LEN: usize = 256;
 pub const MAX_NAME_LEN: usize = 128;
 pub const MAX_SECRET_LEN: usize = 512;
+/// Longest room name typed into the launcher.
+pub const MAX_ROOM_LEN: usize = 40;
+
+/// Characters that may appear in a room name that ends up inside a quoted shell command:
+/// control characters and the ones double quotes do not protect are left out.
+pub fn room_char_ok(c: char) -> bool {
+    !c.is_control() && !matches!(c, '"' | '`' | '$' | '\\' | '!')
+}
+
+/// A room name as the agent receives it: trimmed, cleaned and clipped; `None` when blank.
+pub fn clean_room(text: &str) -> Option<String> {
+    let room: String = text
+        .chars()
+        .filter(|c| room_char_ok(*c))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_ROOM_LEN)
+        .collect();
+    let room = room.trim().to_string();
+    (!room.is_empty()).then_some(room)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -33,6 +55,8 @@ pub enum OnbField {
     Token,
     DirectUrl,
     DirectToken,
+    /// Hub tab, while hosting this machine is on: the room it should join.
+    HostRoom,
 }
 
 /// What the Hub tab asks the app to do.
@@ -64,6 +88,8 @@ pub struct Onboarding {
     pub direct_token: String,
     /// Hub tab: also let other devices take over this machine (default on).
     pub host_enabled: bool,
+    /// Hub tab: room this machine joins (optional; blank keeps the hub's default).
+    pub host_room: String,
     pub busy: bool,
     pub error: Option<String>,
     /// Pending background sign-in, with the hub URL it was started for.
@@ -83,6 +109,7 @@ impl Onboarding {
             direct_url: String::new(),
             direct_token: String::new(),
             host_enabled: true,
+            host_room: String::new(),
             busy: false,
             error: None,
             login: None,
@@ -91,10 +118,17 @@ impl Onboarding {
 
     /// Fields of the visible form, in Tab order.
     pub fn fields(&self) -> &'static [OnbField] {
-        match (self.tab, self.token_mode) {
-            (Tab::Hub, false) => &[OnbField::HubUrl, OnbField::Username, OnbField::Password],
-            (Tab::Hub, true) => &[OnbField::HubUrl, OnbField::Token],
-            (Tab::Direct, _) => &[OnbField::DirectUrl, OnbField::DirectToken],
+        match (self.tab, self.token_mode, self.host_enabled) {
+            (Tab::Hub, false, false) => &[OnbField::HubUrl, OnbField::Username, OnbField::Password],
+            (Tab::Hub, false, true) => &[
+                OnbField::HubUrl,
+                OnbField::Username,
+                OnbField::Password,
+                OnbField::HostRoom,
+            ],
+            (Tab::Hub, true, false) => &[OnbField::HubUrl, OnbField::Token],
+            (Tab::Hub, true, true) => &[OnbField::HubUrl, OnbField::Token, OnbField::HostRoom],
+            (Tab::Direct, _, _) => &[OnbField::DirectUrl, OnbField::DirectToken],
         }
     }
 
@@ -120,7 +154,38 @@ impl Onboarding {
         self.field = list[(at + dir).rem_euclid(list.len() as i32) as usize];
     }
 
-    fn buf(&mut self) -> (&mut String, usize) {
+    /// Switches "let others take over this machine"; the room field goes with it.
+    pub fn set_host_enabled(&mut self, on: bool) {
+        self.host_enabled = on;
+        if !self.fields().contains(&self.field) {
+            self.field = self.fields()[0];
+        }
+    }
+
+    /// The room to enroll this machine in: only while hosting is on, and only when typed.
+    pub fn host_room_value(&self) -> Option<String> {
+        if self.host_enabled {
+            clean_room(&self.host_room)
+        } else {
+            None
+        }
+    }
+
+    /// The text of one field.
+    pub fn text_of(&self, field: OnbField) -> &str {
+        match field {
+            OnbField::HubUrl => &self.hub_url,
+            OnbField::Username => &self.username,
+            OnbField::Password => &self.password,
+            OnbField::Token => &self.token,
+            OnbField::DirectUrl => &self.direct_url,
+            OnbField::DirectToken => &self.direct_token,
+            OnbField::HostRoom => &self.host_room,
+        }
+    }
+
+    /// The text of the focused field with its length limit.
+    pub fn buf(&mut self) -> (&mut String, usize) {
         match self.field {
             OnbField::HubUrl => (&mut self.hub_url, MAX_URL_LEN),
             OnbField::Username => (&mut self.username, MAX_NAME_LEN),
@@ -128,9 +193,11 @@ impl Onboarding {
             OnbField::Token => (&mut self.token, MAX_SECRET_LEN),
             OnbField::DirectUrl => (&mut self.direct_url, MAX_URL_LEN),
             OnbField::DirectToken => (&mut self.direct_token, MAX_SECRET_LEN),
+            OnbField::HostRoom => (&mut self.host_room, MAX_ROOM_LEN),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn type_text(&mut self, text: &str) {
         let (buf, max) = self.buf();
         for c in text.chars().filter(|c| !c.is_control()) {
@@ -259,6 +326,8 @@ pub struct Pairing {
     pub pending: Option<(u64, Receiver<PairOutcome>)>,
     /// (minutes left, expired) as last painted; the pump repaints when it changes.
     pub shown: (u64, bool),
+    /// Room the joining machine should land in, as typed in the modal (blank: none).
+    pub room: String,
 }
 
 impl Pairing {
@@ -272,6 +341,7 @@ impl Pairing {
             generation: 0,
             pending: None,
             shown: (u64::MAX, false),
+            room: String::new(),
         }
     }
 
@@ -283,9 +353,14 @@ impl Pairing {
     }
 }
 
-/// The command to run on the machine that should join.
-pub fn join_command(hub_url: &str, code: &str) -> String {
-    format!("skylatch-agent join {hub_url} --code {code}")
+/// The command to run on the machine that should join; a non-blank `room` is appended as
+/// `--room "<room>"`.
+pub fn join_command(hub_url: &str, code: &str, room: Option<&str>) -> String {
+    let base = format!("skylatch-agent join {hub_url} --code {code}");
+    match room.and_then(clean_room) {
+        Some(room) => format!("{base} --room \"{room}\""),
+        None => base,
+    }
 }
 
 /// One-line explanation of a failed pairing-code request.
@@ -397,7 +472,12 @@ mod tests {
         o.backspace();
         assert_eq!((o.username.as_str(), o.password.as_str()), ("bob", "pw"));
         o.move_focus(1);
+        assert_eq!(o.field, OnbField::HostRoom, "the room field comes last");
+        o.type_text("办公室");
+        assert_eq!(o.host_room, "办公室");
+        o.move_focus(1);
         assert_eq!(o.field, OnbField::HubUrl, "focus wraps around");
+        o.move_focus(-1);
         o.move_focus(-1);
         assert_eq!(o.field, OnbField::Password);
         o.wipe_password();
@@ -410,8 +490,22 @@ mod tests {
     #[test]
     fn join_command_and_errors_read_well() {
         assert_eq!(
-            join_command("wss://hub.example.com", "482-917"),
+            join_command("wss://hub.example.com", "482-917", None),
             "skylatch-agent join wss://hub.example.com --code 482-917"
+        );
+        assert_eq!(
+            join_command("wss://hub.example.com", "482-917", Some("  ")),
+            "skylatch-agent join wss://hub.example.com --code 482-917",
+            "a blank room adds nothing"
+        );
+        assert_eq!(
+            join_command("wss://hub.example.com", "482-917", Some(" 办公室 ")),
+            "skylatch-agent join wss://hub.example.com --code 482-917 --room \"办公室\""
+        );
+        assert_eq!(
+            join_command("wss://h", "1", Some("a\"$(x)`")),
+            "skylatch-agent join wss://h --code 1 --room \"a(x)\"",
+            "characters a quote does not protect are dropped"
         );
         let unauthorized = ClientError::Hub {
             code: "401".into(),
@@ -425,6 +519,29 @@ mod tests {
         };
         assert!(describe_login_error(&limited).contains("频繁"));
         assert!(describe_login_error(&ClientError::InvalidUrl).contains("地址"));
+    }
+
+    #[test]
+    fn the_room_field_follows_the_hosting_switch() {
+        let mut o = Onboarding::new();
+        assert!(o.fields().contains(&OnbField::HostRoom));
+        o.host_room = "  客厅工作台 ".into();
+        assert_eq!(o.host_room_value().as_deref(), Some("客厅工作台"));
+        o.field = OnbField::HostRoom;
+        o.set_host_enabled(false);
+        assert!(!o.fields().contains(&OnbField::HostRoom));
+        assert_eq!(o.field, OnbField::HubUrl, "focus leaves the hidden field");
+        assert_eq!(o.host_room_value(), None, "no hosting: no room");
+        o.set_host_enabled(true);
+        o.host_room = " ".into();
+        assert_eq!(o.host_room_value(), None, "blank means the hub default");
+        o.host_room = "x".repeat(100);
+        assert_eq!(o.host_room_value().unwrap().chars().count(), MAX_ROOM_LEN);
+        o.set_token_mode(true);
+        assert_eq!(
+            o.fields(),
+            &[OnbField::HubUrl, OnbField::Token, OnbField::HostRoom]
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod scene;
 mod theme;
 mod tray;
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,11 +26,11 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, FocusHandle,
-    FontWeight, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div, fill,
-    point, px, size,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, ElementInputHandler,
+    EntityInputHandler, FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, TitlebarOptions, UTF16Selection, Window, WindowBounds,
+    WindowControlArea, WindowOptions, canvas, div, fill, point, px, size,
 };
 use skylatch_proto::control::DeviceInfo;
 use skylatch_proto::layout::{FurnitureKind, WorkspaceLayout};
@@ -38,7 +39,7 @@ use config::{Config, Effective};
 use host_mgr::{HostManager, HostStatus};
 use iso::*;
 use live::{HubTarget, LiveHandle};
-use onboard::{Code, HubSubmit, Onboarding, Pairing, Tab};
+use onboard::{Code, HubSubmit, OnbField, Onboarding, Pairing, Tab};
 use scene::*;
 use theme::{Pal, Rgb};
 
@@ -46,6 +47,60 @@ pub const DOT_STEP: f32 = 22.0;
 
 /// Set when the user chose "退出 Skylatch": from then on closing the window really closes it.
 static QUITTING: AtomicBool = AtomicBool::new(false);
+
+// Clipboard and editing commands. Paste is the one place that reads the clipboard: the key
+// binding, the macOS Edit menu and a held-down input method all end up here.
+gpui::actions!(skylatch_ui, [Paste, Copy, SelectAll]);
+
+/// Key bindings of the editing commands (Cmd on macOS, Ctrl elsewhere).
+fn bind_keys(cx: &mut App) {
+    let m = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    cx.bind_keys([
+        KeyBinding::new(&format!("{m}-v"), Paste, None),
+        KeyBinding::new(&format!("{m}-c"), Copy, None),
+        KeyBinding::new(&format!("{m}-a"), SelectAll, None),
+    ]);
+}
+
+/// A minimal menu bar: the macOS key equivalents of Edit are delivered through the menu even
+/// while an input method is active, so Paste must be an item of it.
+#[cfg(target_os = "macos")]
+mod mac_menu {
+    use super::*;
+    use gpui::{Menu, MenuItem, OsAction};
+
+    gpui::actions!(skylatch_ui, [Quit]);
+
+    pub fn install(cx: &mut App, host: Option<Arc<HostManager>>) {
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.on_action(move |_: &Quit, cx| {
+            QUITTING.store(true, Ordering::SeqCst);
+            if let Some(host) = &host {
+                host.shutdown();
+            }
+            cx.quit();
+        });
+        cx.set_menus(vec![
+            Menu {
+                name: "Skylatch".into(),
+                items: vec![MenuItem::action("Quit Skylatch", Quit)],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::os_action("Copy", Copy, OsAction::Copy),
+                    MenuItem::os_action("Paste", Paste, OsAction::Paste),
+                    MenuItem::separator(),
+                    MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+                ],
+            },
+        ]);
+    }
+}
 
 const HELP: &str = "\
 Skylatch desktop launcher — isometric corner desks, a VM mini rack and a shelf (GPUI)
@@ -106,6 +161,77 @@ CONFIGURATION
 
 fn f(p: Pixels) -> f32 {
     f32::from(p)
+}
+
+// ───────────────────────────── UTF-16 <-> UTF-8 ─────────────────────────────
+
+// The platforms count text in UTF-16 code units (NSTextInputClient, WM_IME_COMPOSITION); the
+// text boxes hold UTF-8. A Chinese character is 3 bytes but 1 unit; an emoji is 4 bytes and 2
+// units. Offsets that fall inside a character are moved to its edge instead of panicking.
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Byte offset of UTF-16 offset `off`; inside a character it goes to the start (`up` false)
+/// or the end (`up` true), past the end of the text to the end.
+fn utf16_to_utf8_at(s: &str, off: usize, up: bool) -> usize {
+    let mut units = 0;
+    for (i, c) in s.char_indices() {
+        if off == units {
+            return i;
+        }
+        let next = units + c.len_utf16();
+        if off < next {
+            return if up { i + c.len_utf8() } else { i };
+        }
+        units = next;
+    }
+    s.len()
+}
+
+fn utf16_range_to_utf8(s: &str, r: &Range<usize>) -> Range<usize> {
+    let start = utf16_to_utf8_at(s, r.start, false);
+    let end = utf16_to_utf8_at(s, r.end, true).max(start);
+    start..end
+}
+
+fn utf8_to_utf16(s: &str, off: usize) -> usize {
+    let off = off.min(s.len());
+    s.char_indices()
+        .take_while(|(i, _)| *i < off)
+        .map(|(_, c)| c.len_utf16())
+        .sum()
+}
+
+fn utf8_range_to_utf16(s: &str, r: &Range<usize>) -> Range<usize> {
+    utf8_to_utf16(s, r.start)..utf8_to_utf16(s, r.end)
+}
+
+fn plain_char(c: char) -> bool {
+    !c.is_control()
+}
+
+/// Puts `text` (control characters dropped, `keep` applied) over the UTF-16 `range` of `buf`,
+/// or at the end when there is none, up to `max` characters in all.
+fn splice(
+    buf: &mut String,
+    max: usize,
+    range: Option<Range<usize>>,
+    text: &str,
+    keep: fn(char) -> bool,
+) {
+    let at = match range {
+        Some(r) => utf16_range_to_utf8(buf, &r),
+        None => buf.len()..buf.len(),
+    };
+    let after = buf.chars().count() - buf[at.clone()].chars().count();
+    let clean: String = text
+        .chars()
+        .filter(|c| keep(*c))
+        .take(max.saturating_sub(after))
+        .collect();
+    buf.replace_range(at, &clean);
 }
 
 fn rgba(c: Rgb, a: f32) -> Hsla {
@@ -706,6 +832,17 @@ enum Field {
     Token,
 }
 
+/// The text box that takes keyboard and input-method text right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    /// the inline field of the arrange toolbar (new room, rename)
+    Edit,
+    Drawer(Field),
+    Onb(OnbField),
+    /// the room of the `+ 添加设备` modal
+    Pair,
+}
+
 /// The in-window Hub settings drawer.
 struct Drawer {
     open: bool,
@@ -851,6 +988,9 @@ struct Proto {
     local_id: Option<String>,
     /// Where this machine's `agent.json` lives (read for `local_id`).
     agent_json: Option<PathBuf>,
+    /// Composition text of an input method (preedit) and the box it belongs to. It is shown
+    /// underlined behind the typed text and only becomes text when the method commits it.
+    marked: Option<(Target, String)>,
 }
 
 /// What the shell around the view has to do after a tray action.
@@ -948,6 +1088,7 @@ impl Proto {
             },
             local_id: None,
             agent_json: None,
+            marked: None,
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -981,7 +1122,7 @@ impl Proto {
     fn sync_host(&mut self) {
         let Some(host) = &self.host else { return };
         let hub = self.eff.live().then(|| self.live_target());
-        host.configure(self.stored.host_enabled, hub);
+        host.configure(self.stored.host_enabled, hub, self.stored.host_room.clone());
     }
 
     fn host_status(&self) -> HostStatus {
@@ -1458,58 +1599,156 @@ impl Proto {
         }
     }
 
-    fn field_buf(&mut self) -> (&mut String, usize) {
-        match self.drawer.field {
-            Field::Url => (&mut self.drawer.url, MAX_URL_LEN),
-            Field::Token => (&mut self.drawer.token, MAX_TOKEN_LEN),
+    // ───────────── text input ─────────────
+
+    /// The box that takes text now, in the order the overlays stack: the add-device modal, the
+    /// Hub drawer, the first-run card, the arrange toolbar's field.
+    fn active_target(&self) -> Option<Target> {
+        if self.pair.open {
+            Some(Target::Pair)
+        } else if self.drawer.open {
+            Some(Target::Drawer(self.drawer.field))
+        } else if self.onboarding_active() {
+            Some(Target::Onb(self.onb.field))
+        } else if self.edit_input.is_some() {
+            Some(Target::Edit)
+        } else {
+            None
         }
     }
 
-    fn type_text(&mut self, text: &str) {
-        let (buf, max) = self.field_buf();
-        for c in text.chars().filter(|c| !c.is_control()) {
-            if buf.chars().count() < max {
-                buf.push(c);
-            }
+    /// The committed text of a box.
+    fn text_of(&self, t: Target) -> Option<&str> {
+        match t {
+            Target::Edit => self.edit_input.as_ref().map(|i| i.text.as_str()),
+            Target::Drawer(Field::Url) => Some(&self.drawer.url),
+            Target::Drawer(Field::Token) => Some(&self.drawer.token),
+            Target::Onb(f) => Some(self.onb.text_of(f)),
+            Target::Pair => Some(&self.pair.room),
         }
-        self.drawer.error = None;
     }
 
-    fn drawer_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+    /// Passwords and tokens are never handed to the input method.
+    fn is_secret(t: Target) -> bool {
+        matches!(
+            t,
+            Target::Drawer(Field::Token)
+                | Target::Onb(OnbField::Password | OnbField::Token | OnbField::DirectToken)
+        )
+    }
+
+    fn target_buf(&mut self, t: Target) -> Option<(&mut String, usize)> {
+        match t {
+            Target::Edit => self
+                .edit_input
+                .as_mut()
+                .map(|i| (&mut i.text, MAX_INPUT_LEN)),
+            Target::Drawer(Field::Url) => Some((&mut self.drawer.url, MAX_URL_LEN)),
+            Target::Drawer(Field::Token) => Some((&mut self.drawer.token, MAX_TOKEN_LEN)),
+            Target::Onb(_) => Some(self.onb.buf()),
+            Target::Pair => Some((&mut self.pair.room, onboard::MAX_ROOM_LEN)),
+        }
+    }
+
+    fn keeps(t: Target) -> fn(char) -> bool {
+        if t == Target::Pair {
+            onboard::room_char_ok
+        } else {
+            plain_char
+        }
+    }
+
+    /// The composition text of `t`, while it is the box in use.
+    fn marked_for(&self, t: Target) -> Option<&str> {
+        self.marked
+            .as_ref()
+            .filter(|(mt, m)| *mt == t && !m.is_empty() && self.active_target() == Some(t))
+            .map(|(_, m)| m.as_str())
+    }
+
+    /// Committed text plus composition, what the input method sees as the document.
+    fn document(&self, t: Target) -> Option<String> {
+        let mut doc = self.text_of(t)?.to_string();
+        doc.push_str(self.marked_for(t).unwrap_or_default());
+        Some(doc)
+    }
+
+    /// Types `text` into `t` (over a UTF-16 `range`, or at the end).
+    fn put_text(&mut self, t: Target, range: Option<Range<usize>>, text: &str) {
+        let keep = Self::keeps(t);
+        if let Some((buf, max)) = self.target_buf(t) {
+            splice(buf, max, range, text, keep);
+        }
+        match t {
+            Target::Drawer(_) => self.drawer.error = None,
+            Target::Onb(_) => self.onb.error = None,
+            _ => {}
+        }
+    }
+
+    /// Cmd+V / Ctrl+V and the Edit menu: the clipboard text goes into the box in use. This is
+    /// the only place that pastes, whichever way it was asked for.
+    fn paste_active(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.active_target() else {
+            return;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+            return;
+        };
+        self.marked = None;
+        self.put_text(t, None, text.trim());
+        self.kick();
+    }
+
+    /// Cmd+C / Ctrl+C: the whole text of the box in use (secrets stay where they are).
+    fn copy_active(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.active_target().filter(|t| !Self::is_secret(*t)) else {
+            return;
+        };
+        if let Some(text) = self.text_of(t).filter(|t| !t.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        }
+    }
+
+    /// Keys of the Hub drawer. Typed characters are not handled here: they reach the input
+    /// handler (and so the input method) when nobody claims them. Returns whether the key was
+    /// used.
+    fn drawer_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
         let m = &ks.modifiers;
         match ks.key.as_str() {
-            "escape" => self.drawer.open = false,
+            "escape" => {
+                self.marked = None;
+                self.drawer.open = false;
+            }
             "tab" => {
+                self.marked = None;
                 self.drawer.field = if self.drawer.field == Field::Url {
                     Field::Token
                 } else {
                     Field::Url
                 };
             }
-            "enter" => self.save_and_connect(cx),
+            "enter" => {
+                self.marked = None;
+                self.save_and_connect(cx);
+            }
             "backspace" => {
-                self.field_buf().0.pop();
+                self.marked = None;
+                self.field_buf().pop();
                 self.drawer.error = None;
             }
-            "v" if m.secondary() => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    self.type_text(text.trim());
-                }
-            }
-            key => {
-                if m.control || m.alt || m.platform {
-                    return;
-                }
-                let typed = ks
-                    .key_char
-                    .clone()
-                    .or_else(|| (key.chars().count() == 1).then(|| key.to_string()));
-                if let Some(t) = typed {
-                    self.type_text(&t);
-                }
-            }
+            // pasted by the Paste action; never twice
+            "v" if m.secondary() => {}
+            _ => return false,
         }
-        self.kick();
+        true
+    }
+
+    fn field_buf(&mut self) -> &mut String {
+        match self.drawer.field {
+            Field::Url => &mut self.drawer.url,
+            Field::Token => &mut self.drawer.token,
+        }
     }
 
     fn save_and_connect(&mut self, cx: &mut Context<Self>) {
@@ -1582,32 +1821,26 @@ impl Proto {
         self.eff.unconfigured()
     }
 
-    fn onb_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+    fn onb_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
         let m = &ks.modifiers;
         match ks.key.as_str() {
-            "tab" => self.onb.move_focus(if m.shift { -1 } else { 1 }),
-            "enter" => self.onb_submit(cx),
-            "backspace" => self.onb.backspace(),
-            "escape" => {}
-            "v" if m.secondary() => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    self.onb.type_text(text.trim());
-                }
+            "tab" => {
+                self.marked = None;
+                self.onb.move_focus(if m.shift { -1 } else { 1 });
             }
-            key => {
-                if m.control || m.alt || m.platform {
-                    return;
-                }
-                let typed = ks
-                    .key_char
-                    .clone()
-                    .or_else(|| (key.chars().count() == 1).then(|| key.to_string()));
-                if let Some(t) = typed {
-                    self.onb.type_text(&t);
-                }
+            "enter" => {
+                self.marked = None;
+                self.onb_submit(cx);
             }
+            "backspace" => {
+                self.marked = None;
+                self.onb.backspace();
+            }
+            "escape" => self.marked = None,
+            "v" if m.secondary() => {}
+            _ => return false,
         }
-        self.kick();
+        true
     }
 
     fn onb_submit(&mut self, cx: &mut Context<Self>) {
@@ -1620,6 +1853,7 @@ impl Proto {
                 Err(e) => self.onb.error = Some(e),
                 Ok(HubSubmit::Token { url, token }) => {
                     self.stored.host_enabled = self.onb.host_enabled;
+                    self.stored.host_room = self.onb.host_room_value();
                     self.onb = Onboarding::new();
                     self.adopt_hub(url, token, cx);
                     self.say("正在连接 Hub…", false);
@@ -1699,13 +1933,26 @@ impl Proto {
         self.hover = None;
         if !self.pair.open {
             self.pair.open = true;
+            self.marked = None;
+            // the new machine most likely joins the room on screen
+            self.pair.room = self.current_room_name().unwrap_or_default();
             self.request_code();
         }
         self.kick();
     }
 
+    /// Name of the room tab on screen, unless it is the hub's catch-all "Default".
+    fn current_room_name(&self) -> Option<String> {
+        self.scenes
+            .desks
+            .get(self.desk)
+            .filter(|d| d.kind == DeskKind::Room && !is_default_room(&d.name))
+            .and_then(|d| onboard::clean_room(&d.name))
+    }
+
     fn close_pair_modal(&mut self) {
         self.pair.open = false;
+        self.marked = None;
         self.kick();
     }
 
@@ -1714,20 +1961,34 @@ impl Proto {
         let Some(code) = self.pair.code.as_ref().filter(|c| !c.expired()) else {
             return;
         };
-        let cmd = onboard::join_command(&config::normalize_hub_url(&self.eff.hub_url), &code.code);
+        let cmd = onboard::join_command(
+            &config::normalize_hub_url(&self.eff.hub_url),
+            &code.code,
+            Some(&self.pair.room),
+        );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
         self.pair.copied_at = Some(Instant::now());
         self.kick();
     }
 
-    fn pair_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+    /// Keys of the add-device modal; plain letters belong to its room field.
+    fn pair_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let m = &ks.modifiers;
         match ks.key.as_str() {
             "escape" => self.close_pair_modal(),
-            "enter" => self.copy_join_command(cx),
-            "r" => self.request_code(),
-            _ => {}
+            "enter" => {
+                self.marked = None;
+                self.copy_join_command(cx);
+            }
+            "backspace" => {
+                self.marked = None;
+                self.pair.room.pop();
+            }
+            "r" if m.secondary() || m.control => self.request_code(),
+            "v" if m.secondary() => {}
+            _ => return false,
         }
-        self.kick();
+        true
     }
 
     /// Applies finished sign-in and pairing requests and keeps the code badge fresh.
@@ -1742,6 +2003,7 @@ impl Proto {
                 match outcome {
                     Ok(token) => {
                         self.stored.host_enabled = self.onb.host_enabled;
+                        self.stored.host_room = self.onb.host_room_value();
                         self.onb = Onboarding::new();
                         self.adopt_hub(url, token, cx);
                         self.say("已登录，正在加载设备…", false);
@@ -2165,6 +2427,8 @@ impl Proto {
             .collect();
         match op(&mut l, &|id: &str| online.contains(id)) {
             Ok(()) => {
+                // an empty "Default" room is only a leftover once real rooms exist
+                prune_empty_default(&mut l);
                 self.layout = l;
                 self.edit_dirty = true;
                 self.rebuild_scenes(false);
@@ -2212,6 +2476,21 @@ impl Proto {
         self.edit_layout(|l, online| remove_furniture(l, &room, &id, online));
     }
 
+    /// The room on screen, when it can be deleted: nobody sits in it and another room remains.
+    fn removable_room(&self) -> Option<String> {
+        let layout = self.scenes.layout.as_ref()?;
+        let d = self.scenes.desks.get(self.desk)?;
+        let id = d.room_id.clone()?;
+        (layout.rooms.len() > 1 && d.shelf_devs.is_empty()).then_some(id)
+    }
+
+    fn arrange_remove_room(&mut self) {
+        let Some(id) = self.removable_room() else {
+            return;
+        };
+        self.edit_layout(|l, online| remove_room(l, &id, online));
+    }
+
     fn open_input(&mut self, kind: InputKind) {
         let text = match kind {
             InputKind::NewRoom => String::new(),
@@ -2224,45 +2503,27 @@ impl Proto {
         self.kick();
     }
 
-    fn input_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+    fn input_key(&mut self, ks: &Keystroke) -> bool {
         let m = &ks.modifiers;
         match ks.key.as_str() {
-            "escape" => self.edit_input = None,
-            "enter" => self.commit_input(),
+            "escape" => {
+                self.marked = None;
+                self.edit_input = None;
+            }
+            "enter" => {
+                self.marked = None;
+                self.commit_input();
+            }
             "backspace" => {
+                self.marked = None;
                 if let Some(i) = &mut self.edit_input {
                     i.text.pop();
                 }
             }
-            "v" if m.secondary() => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    self.input_text(text.trim());
-                }
-            }
-            key => {
-                if m.control || m.alt || m.platform {
-                    return;
-                }
-                let typed = ks
-                    .key_char
-                    .clone()
-                    .or_else(|| (key.chars().count() == 1).then(|| key.to_string()));
-                if let Some(t) = typed {
-                    self.input_text(&t);
-                }
-            }
+            "v" if m.secondary() => {}
+            _ => return false,
         }
-        self.kick();
-    }
-
-    fn input_text(&mut self, text: &str) {
-        if let Some(i) = &mut self.edit_input {
-            for c in text.chars().filter(|c| !c.is_control()) {
-                if i.text.chars().count() < MAX_INPUT_LEN {
-                    i.text.push(c);
-                }
-            }
-        }
+        true
     }
 
     fn commit_input(&mut self) {
@@ -2412,30 +2673,32 @@ impl Proto {
             && f(pos.y) <= r.y + r.h
     }
 
+    /// Every key press lands here. A key that is used stops there; keys nobody uses (letters
+    /// typed into a text box, input-method keys) travel on to the platform's input handler.
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        if self.pair.open {
-            self.pair_key(ks, cx);
+        let handled = if self.pair.open {
+            self.pair_key(ks, cx)
+        } else if self.drawer.open {
+            self.drawer_key(ks, cx)
+        } else if self.onboarding_active() {
+            self.onb_key(ks, cx)
+        } else if self.edit_input.is_some() {
+            self.input_key(ks)
+        } else {
+            self.desk_key(ks)
+        };
+        if handled {
+            self.kick();
             cx.notify();
-            return;
+            cx.stop_propagation();
         }
-        if self.drawer.open {
-            self.drawer_key(ks, cx);
-            cx.notify();
-            return;
-        }
-        if self.onboarding_active() {
-            self.onb_key(ks, cx);
-            cx.notify();
-            return;
-        }
-        if self.edit_input.is_some() {
-            self.input_key(ks, cx);
-            cx.notify();
-            return;
-        }
+    }
+
+    /// Shortcuts of the desk itself (no text box is open).
+    fn desk_key(&mut self, ks: &Keystroke) -> bool {
         if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
-            return;
+            return false;
         }
         match ks.key.as_str() {
             "left" => self.cycle(-1),
@@ -2452,9 +2715,179 @@ impl Proto {
             "escape" if self.edit => self.exit_edit(),
             "0" => self.reset_camera(),
             "enter" => self.connect(),
-            _ => return,
+            _ => return false,
+        }
+        true
+    }
+}
+
+// ───────────── input method ─────────────
+
+impl EntityInputHandler for Proto {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let t = self.active_target().filter(|t| !Self::is_secret(*t))?;
+        let doc = self.document(t)?;
+        let bytes = utf16_range_to_utf8(&doc, &range);
+        *adjusted_range = Some(utf8_range_to_utf16(&doc, &bytes));
+        Some(doc[bytes].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // the caret sits at the end of the text (and of the composition)
+        let t = self.active_target()?;
+        let end = utf16_len(&self.document(t)?);
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let t = self.active_target()?;
+        let marked = self.marked_for(t)?;
+        let start = utf16_len(self.text_of(t)?);
+        Some(start..start + utf16_len(marked))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // the composition stays as typed
+        if let Some((t, text)) = self.marked.take()
+            && self.active_target() == Some(t)
+        {
+            self.put_text(t, None, &text);
         }
         cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(t) = self.active_target() else {
+            return;
+        };
+        // a committed text replaces the composition; a range inside the composition (or past
+        // the text) means the end
+        let typed = self.text_of(t).map(utf16_len).unwrap_or(0);
+        let range = range.map(|r| r.start.min(typed)..r.end.min(typed));
+        self.marked = None;
+        self.put_text(t, range, text);
+        self.kick();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(t) = self.active_target() else {
+            return;
+        };
+        // re-converting text that was already committed takes it back into the composition
+        let typed = self.text_of(t).map(utf16_len).unwrap_or(0);
+        if let Some(r) = range.filter(|r| r.start < typed) {
+            self.put_text(t, Some(r.start..r.end.min(typed)), "");
+        }
+        let keep = Self::keeps(t);
+        let used = self
+            .target_buf(t)
+            .map(|(buf, max)| max.saturating_sub(buf.chars().count()))
+            .unwrap_or(0);
+        let text: String = new_text.chars().filter(|c| keep(*c)).take(used).collect();
+        self.marked = (!text.is_empty()).then_some((t, text));
+        self.kick();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // the candidate window opens under the box that takes the text
+        self.active_target().map(|_| element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Proto {
+    /// What an input box shows behind its text: the input method's composition, underlined.
+    fn preedit(
+        &self,
+        t: Target,
+        secret: bool,
+        size: f32,
+        mono: bool,
+        pal: &Pal,
+    ) -> Option<gpui::Div> {
+        let m = self.marked_for(t)?;
+        let shown = if secret {
+            onboard_view::mask(m)
+        } else {
+            m.to_string()
+        };
+        let ink = rgba(pal.ink, 1.0);
+        Some(
+            if mono {
+                mtxt(shown, size, ink)
+            } else {
+                txt(shown, size, ink)
+            }
+            .underline(),
+        )
+    }
+
+    /// An invisible element that hands the box it sits in to the platform's input method
+    /// while that box is the one in use: the candidate window opens right under it.
+    fn ime_anchor(&self, t: Target, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.active_target() == Some(t);
+        let entity = cx.entity();
+        let focus = self.focus.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                if active {
+                    window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
     }
 }
 
@@ -2633,7 +3066,8 @@ impl Proto {
         let Some(input) = &self.edit_input else {
             return div().into_any_element();
         };
-        let empty = input.text.is_empty();
+        let preedit = self.preedit(Target::Edit, false, 12.0, false, pal);
+        let empty = input.text.is_empty() && preedit.is_none();
         div()
             .flex()
             .items_center()
@@ -2642,6 +3076,7 @@ impl Proto {
                 div()
                     .id("edit-input")
                     .debug_selector(|| "edit-input".to_string())
+                    .relative()
                     .h(px(26.0))
                     .w(px(168.0))
                     .px(px(9.0))
@@ -2657,6 +3092,7 @@ impl Proto {
                     } else {
                         txt(input.text.clone(), 12.0, rgba(pal.ink, 1.0))
                     })
+                    .children(preedit)
                     .child(
                         div()
                             .w(px(1.5))
@@ -2664,7 +3100,8 @@ impl Proto {
                             .ml(px(1.0))
                             .flex_none()
                             .bg(rgba(pal.accent, 1.0)),
-                    ),
+                    )
+                    .child(self.ime_anchor(Target::Edit, cx)),
             )
             .child(
                 self.tool_btn("edit-input-ok", "确定", true, true, pal, cx, |t| {
@@ -2703,6 +3140,7 @@ impl Proto {
             .is_some_and(|i| i.kind == InputKind::Rename);
         let on_room = self.current_room_id().is_some();
         let can_remove = self.removable_furniture().is_some();
+        let can_remove_room = self.removable_room().is_some();
         let status = match &self.save.status {
             LayoutStatus::Idle => (String::new(), muted),
             LayoutStatus::Saving => ("保存中…".to_string(), rgba(pal.blue, 1.0)),
@@ -2776,6 +3214,17 @@ impl Proto {
                     |t| t.open_input(InputKind::NewRoom),
                 )
             })
+            .children((!adding_room).then(|| {
+                self.tool_btn(
+                    "edit-remove-room",
+                    "删除空房间",
+                    can_remove_room,
+                    false,
+                    pal,
+                    cx,
+                    |t| t.arrange_remove_room(),
+                )
+            }))
             .child(div().flex_1())
             .child(txt(status.0, 11.5, status.1))
             .child(
@@ -2997,9 +3446,17 @@ impl Proto {
     ) -> gpui::AnyElement {
         let focused = self.drawer.field == field;
         let ink = rgba(pal.ink, 1.0);
-        let empty = value.is_empty();
+        let preedit = self.preedit(
+            Target::Drawer(field),
+            field == Field::Token && !self.drawer.show_token,
+            12.0,
+            true,
+            pal,
+        );
+        let empty = value.is_empty() && preedit.is_none();
         div()
             .id(id)
+            .relative()
             .h(px(32.0))
             .w_full()
             .px(px(10.0))
@@ -3028,6 +3485,7 @@ impl Proto {
                     } else {
                         mtxt(value, 12.0, ink)
                     })
+                    .children(preedit)
                     .when(focused, |d| {
                         d.child(
                             div()
@@ -3039,7 +3497,9 @@ impl Proto {
                         )
                     }),
             )
+            .child(self.ime_anchor(Target::Drawer(field), cx))
             .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                this.marked = None;
                 this.drawer.field = field;
                 cx.notify();
             }))
@@ -4257,6 +4717,17 @@ impl Render for Proto {
             .text_color(ink)
             .when(self.hover.is_some(), |d| d.cursor_pointer())
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| this.on_key(ev, cx)))
+            .on_action(cx.listener(|this, _: &Paste, _w, cx| {
+                this.paste_active(cx);
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &Copy, _w, cx| {
+                this.copy_active(cx);
+                cx.stop_propagation();
+            }))
+            // text boxes have no selection yet: swallow, so nothing else reacts to it
+            .on_action(cx.listener(|_, _: &SelectAll, _w, cx| cx.stop_propagation()))
             .child(header)
             .children(self.edit.then(|| self.edit_toolbar(&pal, cx)))
             .child(stage)
@@ -4354,6 +4825,9 @@ fn main() {
     let host = (!eff.demo).then(|| Arc::new(HostManager::spawn()));
 
     Application::new().run(move |cx| {
+        bind_keys(cx);
+        #[cfg(target_os = "macos")]
+        mac_menu::install(cx, host.clone());
         let tray = if eff.demo {
             None
         } else {
@@ -4483,6 +4957,12 @@ mod ui_tests {
     use skylatch_proto::control::{DeviceFormFactor, DirectEndpoint, EndpointKind};
     use skylatch_proto::nsl1::MonitorInfo;
 
+    /// The editing key bindings the app installs at start-up.
+    fn bound(cx: &mut TestAppContext) -> &mut TestAppContext {
+        cx.update(bind_keys);
+        cx
+    }
+
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, app| {
             window.draw(app).clear();
@@ -4494,7 +4974,7 @@ mod ui_tests {
         dark: bool,
         shelf: bool,
     ) -> (gpui::Entity<Proto>, &mut VisualTestContext) {
-        cx.add_window_view(move |window, cx| {
+        bound(cx).add_window_view(move |window, cx| {
             let eff = Effective {
                 dark,
                 shelf,
@@ -4994,7 +5474,7 @@ mod ui_tests {
         let path = dir.join("config.json");
         let _ = std::fs::remove_dir_all(&dir);
         let path2 = path.clone();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
+        let (view, cx) = bound(cx).add_window_view(move |window, cx| {
             let p = Proto::new(cx, Config::default(), Effective::demo_only(), Some(path2));
             window.focus(&p.focus);
             p
@@ -5119,7 +5599,7 @@ mod ui_tests {
     #[gpui::test]
     fn take_over_starts_the_native_client_with_hub_token_and_device(cx: &mut TestAppContext) {
         let fake_client = std::env::current_exe().unwrap();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
+        let (view, cx) = bound(cx).add_window_view(move |window, cx| {
             let stored = Config {
                 hub_url: "https://hub.example.test".into(),
                 token: "tok".into(),
@@ -5354,7 +5834,7 @@ mod ui_tests {
         cx: &mut TestAppContext,
         path: Option<PathBuf>,
     ) -> (gpui::Entity<Proto>, &mut VisualTestContext) {
-        cx.add_window_view(move |window, cx| {
+        bound(cx).add_window_view(move |window, cx| {
             let cfg = Config::default();
             let p = Proto::new(cx, cfg.clone(), Effective::from_config(&cfg), path);
             window.focus(&p.focus);
@@ -5570,7 +6050,7 @@ mod ui_tests {
             token: "account-token".into(),
             ..Effective::from_config(&Config::default())
         };
-        cx.add_window_view(move |window, cx| {
+        bound(cx).add_window_view(move |window, cx| {
             let p = Proto::new(cx, Config::default(), eff, None);
             window.focus(&p.focus);
             p
@@ -5594,7 +6074,7 @@ mod ui_tests {
         );
         let (code, cmd) = view.read_with(cx, |v, _| {
             let c = v.pair.code.as_ref().unwrap().code.clone();
-            let cmd = onboard::join_command(&config::normalize_hub_url(&v.eff.hub_url), &c);
+            let cmd = onboard::join_command(&config::normalize_hub_url(&v.eff.hub_url), &c, None);
             (c, cmd)
         });
         assert_eq!(code, "482-917");
@@ -5652,7 +6132,14 @@ mod ui_tests {
         let clip = clipboard_text(cx);
         assert_eq!(
             clip.as_deref(),
-            Some(format!("skylatch-agent join {} --code 482-917", hub.ws_url()).as_str())
+            Some(
+                format!(
+                    "skylatch-agent join {} --code 482-917 --room \"Home\"",
+                    hub.ws_url()
+                )
+                .as_str()
+            ),
+            "the room on screen is already filled in"
         );
         assert!(view.read_with(cx, |v, _| v.pair.copied_at.is_some()));
 
@@ -5665,13 +6152,14 @@ mod ui_tests {
             "135-790"
         );
 
-        // R regenerates, Enter copies, Esc closes; the desk behind ignores the mouse meanwhile
-        cx.simulate_keystrokes("r");
+        // Ctrl+R regenerates, Enter copies, Esc closes; the desk behind ignores the mouse
+        // meanwhile (a plain R is a letter of the room field)
+        cx.simulate_keystrokes("ctrl-r");
         pump_until(&view, cx, "the third code", |v| {
             v.pair.code.as_ref().is_some_and(|c| c.code == "264-081")
         });
         cx.simulate_keystrokes("enter");
-        assert!(clipboard_text(cx).is_some_and(|t| t.ends_with("--code 264-081")));
+        assert!(clipboard_text(cx).is_some_and(|t| t.contains("--code 264-081")));
         cx.simulate_keystrokes("escape");
         assert!(view.read_with(cx, |v, _| !v.pair.open));
 
@@ -6033,7 +6521,7 @@ mod ui_tests {
         let _ = std::fs::remove_dir_all(&dir);
         write_agent_json(&agent, "wss://hub.example.test/ws/host", "studio");
         let fake_client = std::env::current_exe().unwrap();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
+        let (view, cx) = bound(cx).add_window_view(move |window, cx| {
             let stored = Config {
                 hub_url: "https://hub.example.test".into(),
                 token: "tok".into(),
@@ -6856,5 +7344,608 @@ mod ui_tests {
                 assert!((b.apply(b.invert(c)).x - c.x).abs() < 1e-3);
             });
         }
+    }
+
+    // ───────────── input method, paste, rooms ─────────────
+
+    const PASTE: &str = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
+    fn set_clipboard(cx: &mut VisualTestContext, text: &str) {
+        let text = text.to_string();
+        cx.update(move |_, app| app.write_to_clipboard(ClipboardItem::new_string(text)));
+    }
+
+    /// What an input method does when the user picks a candidate.
+    fn ime_commit(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext, text: &str) {
+        view.update_in(cx, |v, window, cx| {
+            v.replace_text_in_range(None, text, window, cx)
+        });
+    }
+
+    /// What an input method does while the user is still composing.
+    fn ime_mark(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext, text: &str) {
+        view.update_in(cx, |v, window, cx| {
+            v.replace_and_mark_text_in_range(None, text, None, window, cx)
+        });
+    }
+
+    fn marked_range(
+        view: &gpui::Entity<Proto>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Range<usize>> {
+        view.update_in(cx, |v, window, cx| v.marked_text_range(window, cx))
+    }
+
+    fn edit_text(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |v, _| v.edit_input.as_ref().map(|i| i.text.clone()))
+    }
+
+    #[test]
+    fn utf16_offsets_follow_the_characters_of_cjk_text_and_emoji() {
+        let s = "办公室a😀b";
+        assert_eq!(utf16_len(s), 7, "3 + 1 + 2 + 1 units");
+        assert_eq!(
+            s.len(),
+            9 + 1 + 4 + 1,
+            "3 + 1 + 4 + 1 bytes: 3 per Chinese character"
+        );
+        assert_eq!(utf16_range_to_utf8(s, &(1..2)), 3..6);
+        assert_eq!(utf16_range_to_utf8(s, &(0..3)), 0..9);
+        assert_eq!(
+            utf16_range_to_utf8(s, &(4..6)),
+            10..14,
+            "the emoji is two units"
+        );
+        assert_eq!(utf8_range_to_utf16(s, &(3..6)), 1..2);
+        assert_eq!(utf8_range_to_utf16(s, &(0..s.len())), 0..7);
+        // past the end clamps, an inside offset moves to the edge of its character
+        assert_eq!(utf16_range_to_utf8(s, &(50..90)), s.len()..s.len());
+        assert_eq!(utf16_range_to_utf8("a😀", &(2..2)), 1..5);
+        assert_eq!(
+            utf8_to_utf16("办", 1),
+            1,
+            "inside a character: counted whole"
+        );
+        assert_eq!(utf8_to_utf16("", 5), 0);
+        // no pair of offsets ever panics or leaves a character boundary
+        for text in ["", "a", "办公室", "a😀b", "客厅工作台😀"] {
+            for a in 0..14 {
+                for b in 0..14 {
+                    let r = utf16_range_to_utf8(text, &(a..b));
+                    assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
+                    assert!(r.start <= r.end && r.end <= text.len());
+                    let back = utf8_range_to_utf16(text, &r);
+                    assert!(back.end <= utf16_len(text));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splicing_text_honours_ranges_limits_and_filters() {
+        let mut b = String::from("办公室");
+        splice(&mut b, 10, None, "A\nB", plain_char);
+        assert_eq!(
+            b, "办公室AB",
+            "control characters are dropped, text goes to the end"
+        );
+        splice(&mut b, 10, Some(1..2), "X", plain_char);
+        assert_eq!(b, "办X室AB", "a UTF-16 range replaces whole characters");
+        let mut b = String::from("ab");
+        splice(&mut b, 4, None, "办公室", plain_char);
+        assert_eq!(b, "ab办公", "the limit counts characters, not bytes");
+        splice(&mut b, 4, None, "x", plain_char);
+        assert_eq!(b, "ab办公");
+        let mut b = String::new();
+        splice(&mut b, 40, None, "a\"b$c`d\\e!f", onboard::room_char_ok);
+        assert_eq!(
+            b, "abcdef",
+            "room names carry nothing a quote cannot protect"
+        );
+    }
+
+    #[gpui::test]
+    fn the_input_method_commits_chinese_into_the_toolbar_fields(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        // no text box open: input is ignored, never a panic
+        ime_commit(&view, cx, "办公室");
+        ime_mark(&view, cx, "bangongshi");
+        assert!(view.read_with(cx, |v, _| v.marked.is_none() && v.edit_input.is_none()));
+        assert_eq!(marked_range(&view, cx), None);
+
+        cx.simulate_keystrokes("e");
+        click_sel(cx, "edit-add-room");
+        ime_commit(&view, cx, "办公室");
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("办公室"));
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |v, _| {
+            assert!(v.edit_input.is_none());
+            assert_eq!(v.scenes.desks[v.desk].name, "办公室");
+            assert!(v.layout.rooms.iter().any(|r| r.name == "办公室"));
+        });
+
+        // the field of 改名
+        show_tab(&view, cx, "办公室工位");
+        let studio = key(&view, cx, "demo-studio#display-1");
+        let p = view.read_with(cx, |v, _| screen_px(v, studio));
+        cx.simulate_click(p, Modifiers::none());
+        click_sel(cx, "edit-rename");
+        view.update(cx, |v, _| v.edit_input.as_mut().unwrap().text.clear());
+        ime_commit(&view, cx, "主力工作站");
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("主力工作站"));
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.scenes
+                    .devices
+                    .iter()
+                    .filter(|d| d.machine_id == "demo-studio")
+                    .all(|d| d.title == "主力工作站")
+            );
+            assert_eq!(
+                v.layout
+                    .placements
+                    .iter()
+                    .find(|p| p.device_id == "demo-studio")
+                    .and_then(|p| p.custom_name.as_deref()),
+                Some("主力工作站")
+            );
+        });
+
+        // the platform path (a key press that is nobody's shortcut) reaches the field too
+        click_sel(cx, "edit-add-room");
+        cx.simulate_input("书房");
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("书房"));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("书"));
+        // the field has a limit, in characters
+        ime_commit(&view, cx, &"房".repeat(100));
+        assert_eq!(edit_text(&view, cx).unwrap().chars().count(), MAX_INPUT_LEN);
+        // the candidate window opens under the field
+        draw(cx);
+        let field = cx
+            .debug_bounds("edit-input")
+            .expect("the field is on screen");
+        let at = view.update_in(cx, |v, window, cx| {
+            v.bounds_for_range(0..0, field, window, cx)
+        });
+        assert_eq!(at, Some(field));
+    }
+
+    #[gpui::test]
+    fn the_onboarding_room_field_takes_composition_text_and_commits_it(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        assert!(
+            has_sel(cx, "onb-host-room"),
+            "hosting is on: the room is asked for"
+        );
+        click_sel(cx, "onb-host-room");
+        assert_eq!(view.read_with(cx, |v, _| v.onb.field), OnbField::HostRoom);
+
+        // pinyin on its way: shown (underlined) but not yet text
+        ime_mark(&view, cx, "bangongshi");
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.onb.host_room, "");
+            assert_eq!(
+                v.marked,
+                Some((Target::Onb(OnbField::HostRoom), "bangongshi".to_string()))
+            );
+            assert!(
+                v.preedit(Target::Onb(OnbField::HostRoom), false, 12.0, true, &v.pal())
+                    .is_some()
+            );
+        });
+        assert_eq!(marked_range(&view, cx), Some(0..10));
+        draw(cx);
+        // narrowing down to Chinese characters: the range counts UTF-16 units
+        ime_mark(&view, cx, "办公");
+        assert_eq!(marked_range(&view, cx), Some(0..2));
+        let doc = view.update_in(cx, |v, window, cx| {
+            let mut adjusted = None;
+            let text = v.text_for_range(0..2, &mut adjusted, window, cx);
+            (text, adjusted)
+        });
+        assert_eq!(doc, (Some("办公".to_string()), Some(0..2)));
+        let sel = view
+            .update_in(cx, |v, window, cx| v.selected_text_range(false, window, cx))
+            .unwrap();
+        assert_eq!((sel.range, sel.reversed), (2..2, false));
+        // the candidate is picked
+        ime_commit(&view, cx, "办公室");
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.onb.host_room, "办公室");
+            assert_eq!(v.marked, None);
+        });
+        assert_eq!(marked_range(&view, cx), None);
+
+        // a second composition behind committed text starts at its end (3 units, 9 bytes)
+        ime_mark(&view, cx, "ni");
+        assert_eq!(marked_range(&view, cx), Some(3..5));
+        ime_commit(&view, cx, "你");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.onb.host_room.clone()),
+            "办公室你"
+        );
+        // a replacement range inside the committed text replaces those characters
+        view.update_in(cx, |v, window, cx| {
+            v.replace_text_in_range(Some(3..4), "客", window, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.onb.host_room.clone()),
+            "办公室客"
+        );
+        // an empty composition (Escape in the input method) clears it
+        ime_mark(&view, cx, "x");
+        ime_mark(&view, cx, "");
+        assert_eq!(marked_range(&view, cx), None);
+        // unmarking keeps the text as typed
+        ime_mark(&view, cx, "ab");
+        view.update_in(cx, |v, window, cx| v.unmark_text(window, cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.onb.host_room.clone()),
+            "办公室客ab"
+        );
+        assert_eq!(marked_range(&view, cx), None);
+
+        // moving to another field drops a composition that was left over
+        ime_mark(&view, cx, "zz");
+        cx.simulate_keystrokes("tab");
+        assert!(view.read_with(cx, |v, _| v.marked.is_none()
+            && v.onb.field == OnbField::HubUrl));
+
+        // passwords and tokens are not shown to the input method
+        view.update(cx, |v, _| v.onb.field = OnbField::Password);
+        ime_commit(&view, cx, "秘密");
+        let shown = view.update_in(cx, |v, window, cx| {
+            let mut adjusted = None;
+            v.text_for_range(0..2, &mut adjusted, window, cx)
+        });
+        assert_eq!(shown, None);
+        assert_eq!(view.read_with(cx, |v, _| v.onb.password.clone()), "秘密");
+        ime_mark(&view, cx, "mima");
+        assert!(view.read_with(cx, |v, _| {
+            v.preedit(Target::Onb(OnbField::Password), true, 12.0, true, &v.pal())
+                .is_some()
+        }));
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn the_hub_drawer_takes_chinese_and_shows_a_composition(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        cx.simulate_keystrokes("h");
+        assert!(view.read_with(cx, |v, _| v.drawer.open));
+        view.update(cx, |v, _| v.drawer.url.clear());
+        ime_mark(&view, cx, "hub");
+        assert_eq!(marked_range(&view, cx), Some(0..3));
+        ime_commit(&view, cx, "主机");
+        assert_eq!(view.read_with(cx, |v, _| v.drawer.url.clone()), "主机");
+        // Tab moves to the Token box, which takes text the same way
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("ab");
+        assert!(view.read_with(cx, |v, _| v.drawer.token.ends_with("ab")));
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn paste_puts_chinese_text_once_into_the_box_in_use(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        set_clipboard(cx, "书房");
+        // nothing is open: nothing happens
+        cx.simulate_keystrokes(PASTE);
+        assert!(view.read_with(cx, |v, _| v.edit_input.is_none() && v.banner.is_none()));
+
+        cx.simulate_keystrokes("e");
+        click_sel(cx, "edit-add-room");
+        cx.simulate_keystrokes(PASTE);
+        assert_eq!(
+            edit_text(&view, cx).as_deref(),
+            Some("书房"),
+            "one key press, one paste"
+        );
+        // the Edit menu asks for the very same thing
+        cx.dispatch_action(Paste);
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("书房书房"));
+        // a plain v is a letter, not a paste
+        cx.simulate_input("v");
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("书房书房v"));
+        assert!(
+            view.read_with(cx, |v, _| v.edit && !v.shelf),
+            "no shortcut fired"
+        );
+        // lines are joined, the ends trimmed, controls dropped
+        view.update(cx, |v, _| v.edit_input.as_mut().unwrap().text.clear());
+        set_clipboard(cx, "  客厅\n工作台 ");
+        cx.simulate_keystrokes(PASTE);
+        assert_eq!(edit_text(&view, cx).as_deref(), Some("客厅工作台"));
+        // Copy hands the text back
+        cx.dispatch_action(Copy);
+        assert_eq!(clipboard_text(cx).as_deref(), Some("客厅工作台"));
+        cx.simulate_keystrokes("escape");
+
+        // the first-run card: the room field and the others
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        set_clipboard(cx, "书房");
+        click_sel(cx, "onb-host-room");
+        cx.simulate_keystrokes(PASTE);
+        assert_eq!(view.read_with(cx, |v, _| v.onb.host_room.clone()), "书房");
+        cx.simulate_keystrokes("tab");
+        set_clipboard(cx, "  https://hub.example.test \n");
+        cx.simulate_keystrokes(PASTE);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.onb.hub_url.clone()),
+            "https://hub.example.test"
+        );
+        // select-all swallows the key and changes nothing
+        cx.dispatch_action(SelectAll);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.onb.hub_url.clone()),
+            "https://hub.example.test"
+        );
+    }
+
+    #[gpui::test]
+    fn the_add_device_modal_asks_for_a_room_and_puts_it_in_the_command(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        click_sel(cx, "add-device");
+        pump_until(&view, cx, "the pairing code", |v| v.pair.code.is_some());
+        assert!(has_sel(cx, "pair-room"));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.pair.room.clone()),
+            "Home",
+            "filled with the room on screen"
+        );
+
+        // typed Chinese replaces it; the copied command carries it
+        view.update(cx, |v, _| v.pair.room.clear());
+        ime_mark(&view, cx, "keting");
+        assert_eq!(marked_range(&view, cx), Some(0..6));
+        ime_commit(&view, cx, "客厅工作台");
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "客厅工作台");
+        click_sel(cx, "pair-copy");
+        assert_eq!(
+            clipboard_text(cx),
+            Some(format!(
+                "skylatch-agent join {} --code 482-917 --room \"客厅工作台\"",
+                hub.ws_url()
+            ))
+        );
+
+        // plain letters go to the field; Ctrl+R is what mints another code
+        let requests = hub.log().len();
+        cx.simulate_input("r");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.pair.room.clone()),
+            "客厅工作台r"
+        );
+        assert_eq!(hub.log().len(), requests, "R alone did not ask for a code");
+        cx.simulate_keystrokes("backspace backspace");
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "客厅工作");
+
+        // paste
+        set_clipboard(cx, "书房");
+        view.update(cx, |v, _| v.pair.room.clear());
+        cx.simulate_keystrokes(PASTE);
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "书房");
+
+        // a blank room adds nothing to the command, and quotes cannot get in
+        view.update(cx, |v, _| v.pair.room = "  ".into());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            clipboard_text(cx),
+            Some(format!(
+                "skylatch-agent join {} --code 482-917",
+                hub.ws_url()
+            ))
+        );
+        view.update(cx, |v, _| v.pair.room.clear());
+        ime_commit(&view, cx, "a\"b$c");
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "abc");
+        cx.simulate_keystrokes("escape");
+        assert!(view.read_with(cx, |v, _| !v.pair.open));
+        // the next time starts from the room on screen again
+        click_sel(cx, "add-device");
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "Home");
+    }
+
+    #[gpui::test]
+    fn the_add_device_room_stays_empty_for_the_default_room(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 1 };
+            v.apply_devices(vec![info(
+                "stray",
+                "Stray",
+                DeviceFormFactor::Desktop,
+                "",
+                0,
+                vec![mon("d1", 0, 1920, 1080)],
+                false,
+            )]);
+        });
+        draw(cx);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.scenes.desks[v.desk].name.clone()),
+            "Default"
+        );
+        click_sel(cx, "add-device");
+        assert_eq!(view.read_with(cx, |v, _| v.pair.room.clone()), "");
+    }
+
+    #[gpui::test]
+    fn an_empty_default_room_leaves_the_tabs_and_the_saved_layout(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        // the hub remembers a Default room nobody is in any more
+        view.update(cx, |v, _| {
+            let mut l = materialize_for(&v.devices, None);
+            l.rooms.insert(
+                0,
+                skylatch_proto::layout::RoomLayout {
+                    id: "room-ghost".into(),
+                    name: "Default".into(),
+                    furniture: vec![skylatch_proto::layout::FurnitureItem {
+                        id: "f1".into(),
+                        kind: FurnitureKind::LDesk,
+                        grid_x: 0,
+                        grid_y: 0,
+                        facing: Default::default(),
+                    }],
+                },
+            );
+            v.layout = l;
+            v.rebuild_scenes(false);
+        });
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            let names: Vec<&str> = v.scenes.desks.iter().map(|d| d.name.as_str()).collect();
+            assert!(!names.contains(&"Default"), "{names:?}");
+            assert_eq!(names, ["Cage", "Home", "Office"]);
+            assert_eq!(v.layout.rooms.len(), 4, "the hub's layout still lists it");
+        });
+        // the first edit tidies the arrangement up and saves it without the ghost
+        cx.simulate_keystrokes("e");
+        click_sel(cx, "edit-add-ldesk");
+        pump_until(&view, cx, "the layout save", |v| {
+            v.save.inflight.is_none() && !v.save.dirty && v.save.status == LayoutStatus::Saved
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.layout.rooms.len(), 3);
+            assert!(v.layout.rooms.iter().all(|r| r.name != "Default"));
+        });
+        let saved = hub.saved_layout().expect("saved on the hub");
+        assert!(saved.rooms.iter().all(|r| r.name != "Default"), "{saved:?}");
+    }
+
+    #[gpui::test]
+    fn the_toolbar_deletes_an_empty_room_and_only_an_empty_one(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        cx.simulate_keystrokes("e");
+        assert!(has_sel(cx, "edit-remove-room"));
+        assert!(
+            view.read_with(cx, |v, _| v.removable_room().is_none()),
+            "the room on screen has machines"
+        );
+        let before = view.read_with(cx, |v, _| v.layout.rooms.len());
+        click_sel(cx, "edit-remove-room");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.layout.rooms.len()),
+            before,
+            "a disabled button does nothing"
+        );
+
+        click_sel(cx, "edit-add-room");
+        ime_commit(&view, cx, "车库");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(view.read_with(cx, |v, _| v.layout.rooms.len()), before + 1);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.scenes.desks[v.desk].name.clone()),
+            "车库"
+        );
+        assert!(view.read_with(cx, |v, _| v.removable_room().is_some()));
+        click_sel(cx, "edit-remove-room");
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.layout.rooms.len(), before);
+            assert!(v.scenes.desks.iter().all(|d| d.name != "车库"));
+            assert!(v.removable_room().is_none());
+            assert!(v.save.dirty || v.save.inflight.is_some());
+        });
+        pump_until(&view, cx, "the layout save", |v| {
+            v.save.inflight.is_none() && !v.save.dirty && v.save.status == LayoutStatus::Saved
+        });
+        let saved = hub.saved_layout().expect("saved on the hub");
+        assert!(saved.rooms.iter().all(|r| r.name != "车库"));
+        assert_eq!(saved.rooms.len(), before);
+
+        // a hub with a single room: that one stays
+        view.update(cx, |v, _| {
+            v.layout.rooms.truncate(1);
+            v.layout.placements.clear();
+            v.rebuild_scenes(false);
+        });
+        assert!(view.read_with(cx, |v, _| v.removable_room().is_none()));
+    }
+
+    #[gpui::test]
+    fn the_chosen_room_reaches_enrollment_the_agent_and_the_saved_settings(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        let dir =
+            std::env::temp_dir().join(format!("skylatch-ui-host-room-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (view, cx) = onboarding_view(cx, Some(path.clone()));
+        let host = Arc::new(HostManager::with_backend(fake.backend(), FAST));
+        view.update(cx, |v, _| v.attach_host(Some(host), false));
+        draw(cx);
+        let url = hub.http_url();
+        view.update(cx, |v, _| {
+            v.onb.hub_url = url;
+            v.onb.username = "alice".into();
+            v.onb.password = "pw".into();
+        });
+        click_sel(cx, "onb-host-room");
+        ime_commit(&view, cx, "办公室");
+        cx.simulate_keystrokes("enter");
+        pump_until(&view, cx, "the login", |v| v.eff.live());
+        wait_until("the agent", || fake.running() == 1);
+        {
+            let s = fake.0.lock().unwrap();
+            assert_eq!(s.enroll_rooms, [Some("办公室".to_string())]);
+            assert_eq!(s.start_rooms, [Some("办公室".to_string())]);
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.stored.host_room.clone())
+                .as_deref(),
+            Some("办公室")
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"host_room\": \"办公室\""), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // with hosting switched off the room is not kept
+        let (view, cx) = onboarding_view(cx, None);
+        click_sel(cx, "onb-host-room");
+        ime_commit(&view, cx, "书房");
+        click_sel(cx, "onb-host");
+        draw(cx);
+        assert!(
+            view.read_with(cx, |v, _| !v.onb.fields().contains(&OnbField::HostRoom)),
+            "no hosting: no room field"
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.onb.host_room_value()), None);
+        assert_ne!(
+            view.read_with(cx, |v, _| v.onb.field),
+            OnbField::HostRoom,
+            "focus left the hidden field"
+        );
+    }
+
+    #[gpui::test]
+    fn the_onboarding_card_with_the_room_field_fits_the_smallest_window(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        cx.simulate_resize(size(px(960.0), px(640.0)));
+        draw(cx);
+        let card = cx.debug_bounds("onboarding-card").expect("the card");
+        let stage_h = view.read_with(cx, |v, _| v.stage.1);
+        assert!(
+            f(card.size.height) <= stage_h,
+            "card {:?} in a stage {stage_h} high",
+            card.size
+        );
     }
 }

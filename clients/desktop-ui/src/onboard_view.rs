@@ -8,7 +8,7 @@ use crate::host_mgr::{ChipKind, chip_look};
 use crate::onboard::{self, OnbField, Tab};
 use crate::scene::HEADER_H;
 use crate::theme::Pal;
-use crate::{Proto, clip, hint_row, mtxt, paint_mark, rgba, txt};
+use crate::{Proto, Target, clip, hint_row, mtxt, paint_mark, rgba, txt};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, canvas, div, px,
@@ -46,7 +46,7 @@ fn centered(card: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
-fn mask(s: &str) -> String {
+pub(crate) fn mask(s: &str) -> String {
     "•".repeat(s.chars().count().min(48))
 }
 
@@ -66,10 +66,16 @@ impl Proto {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let focused = self.onb.field == field;
-        let empty = value.is_empty();
+        let secret = matches!(
+            field,
+            OnbField::Password | OnbField::Token | OnbField::DirectToken
+        );
+        let preedit = self.preedit(Target::Onb(field), secret, 12.0, true, pal);
+        let empty = value.is_empty() && preedit.is_none();
         div()
             .id(id)
             .debug_selector(|| id.to_string())
+            .relative()
             .h(px(34.0))
             .w_full()
             .px(px(10.0))
@@ -98,6 +104,7 @@ impl Proto {
                     } else {
                         mtxt(value, 12.0, rgba(pal.ink, 1.0))
                     })
+                    .children(preedit)
                     .when(focused, |d| {
                         d.child(
                             div()
@@ -109,10 +116,59 @@ impl Proto {
                         )
                     }),
             )
+            .child(self.ime_anchor(Target::Onb(field), cx))
             .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                this.marked = None;
                 this.onb.field = field;
                 cx.notify();
             }))
+            .into_any_element()
+    }
+
+    /// The room of the machine that is about to join, in the add-device modal.
+    fn pair_room_input(&self, pal: &Pal, cx: &mut Context<Self>) -> AnyElement {
+        let preedit = self.preedit(Target::Pair, false, 12.0, true, pal);
+        let value = self.pair.room.clone();
+        let empty = value.is_empty() && preedit.is_none();
+        div()
+            .id("pair-room")
+            .debug_selector(|| "pair-room".to_string())
+            .relative()
+            .h(px(34.0))
+            .w_full()
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgba(pal.accent, 1.0))
+            .bg(rgba(pal.canvas, 1.0))
+            .cursor_text()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .justify_end()
+                    .child(if empty {
+                        mtxt("留空则由 Hub 决定，例如 办公室", 12.0, rgba(pal.muted, 0.7))
+                    } else {
+                        mtxt(value, 12.0, rgba(pal.ink, 1.0))
+                    })
+                    .children(preedit)
+                    .child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(15.0))
+                            .ml(px(1.0))
+                            .flex_none()
+                            .bg(rgba(pal.accent, 1.0)),
+                    ),
+            )
+            .child(self.ime_anchor(Target::Pair, cx))
             .into_any_element()
     }
 
@@ -321,12 +377,12 @@ impl Proto {
                 .id("onb-host")
                 .debug_selector(|| "onb-host".to_string())
                 .flex()
-                .items_start()
+                .flex_none()
+                .items_center()
                 .gap(px(9.0))
                 .cursor_pointer()
                 .child(
                     div()
-                        .mt(px(1.0))
                         .size(px(15.0))
                         .flex_none()
                         .flex()
@@ -338,15 +394,39 @@ impl Proto {
                         .bg(if on { accent } else { rgba(pal.canvas, 1.0) })
                         .when(on, |d| d.child(txt("✓", 10.5, on_accent))),
                 )
-                .child(div().flex_1().min_w(px(0.0)).child(txt(
-                    "允许远端接管本机（开机/常驻托盘可被其他设备连接）",
-                    11.5,
-                    ink,
-                )))
+                .child(txt("允许远端接管本机", 11.5, ink))
                 .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                    this.onb.host_enabled = !this.onb.host_enabled;
+                    this.marked = None;
+                    let on = !this.onb.host_enabled;
+                    this.onb.set_host_enabled(on);
                     cx.notify();
                 }))
+        });
+        // where this machine should land on its first login (optional), beside the checkbox
+        let host_room = (o.tab == Tab::Hub && o.host_enabled).then(|| {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_none().child(self.small_label("本机房间", pal)))
+                .child(div().flex_1().min_w(px(0.0)).child(self.onb_input(
+                    "onb-host-room",
+                    OnbField::HostRoom,
+                    o.host_room.clone(),
+                    "Home 或 办公室",
+                    pal,
+                    cx,
+                )))
+        });
+        let host_row = host_opt.map(|opt| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(14.0))
+                .child(opt)
+                .children(host_room)
         });
 
         let (status, status_col) = match (&o.error, o.busy) {
@@ -392,10 +472,16 @@ impl Proto {
                     12.0,
                     muted,
                 ))
-                .child(div().flex().child(tabs))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(tabs)
+                        .children(toggle),
+                )
                 .children(form)
-                .children(toggle)
-                .children(host_opt)
+                .children(host_row)
                 .child(
                     div()
                         .h(px(18.0))
@@ -534,6 +620,7 @@ impl Proto {
             Some(c) => onboard::join_command(
                 &crate::config::normalize_hub_url(&self.eff.hub_url),
                 &c.code,
+                Some(&self.pair.room),
             ),
             None => "skylatch-agent join <hub> --code <code>".to_string(),
         };
@@ -675,9 +762,27 @@ impl Proto {
                 12.0,
                 muted,
             ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(div().flex_none().child(self.small_label("加入房间", pal)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(self.pair_room_input(pal, cx)),
+                    ),
+            )
             .children(body)
             .child(hint_row(
-                &[("Enter", "复制命令"), ("R", "换一码"), ("Esc", "关闭")],
+                &[
+                    ("Enter", "复制命令"),
+                    ("Ctrl+R", "换一码"),
+                    ("Ctrl+V", "粘贴"),
+                    ("Esc", "关闭"),
+                ],
                 pal,
             ));
 

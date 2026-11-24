@@ -92,7 +92,9 @@ first-run screen.
 - A reachable hub with no online device shows the **添加第一台设备** card with a live pairing code.
 - `+ 添加设备` (top bar, whenever a hub is configured) opens the pairing dialog: the 6-digit code
   (valid 10 minutes, single use) and the copyable `skylatch-agent join <hub> --code <code>` command.
-  `Enter` copies it, `R` or **换一码** mints another code, `Esc` closes.
+  The **加入房间** field (filled with the room on screen unless that is `Default`) appends
+  `--room "<room>"` to the command; leave it empty to let the hub decide. `Enter` copies the
+  command, `Ctrl+R` or **换一码** mints another code, `Esc` closes.
 
 ### Tray and hosting this machine
 
@@ -100,7 +102,8 @@ Install the launcher on two computers, sign in on both, and each can take over t
 command line. While the launcher is signed in to a hub and hosting is on (the default), it
 
 - enrolls this machine once per hub: it mints a pairing code with the account token and runs
-  `skylatch-agent join <hub> --code <code>`, so the agent writes its own `agent.json` (mode `0600`
+  `skylatch-agent join <hub> --code <code> [--room <room>]` (the optional **本机房间** field of the
+  sign-in card, saved as `host_room` in the settings, and also passed to the running agent), so the agent writes its own `agent.json` (mode `0600`
   on Unix) with a dedicated, revocable per-device token — your password is never stored;
 - keeps `skylatch-agent --engine-bin <engine> --enable-direct` running (no console window on
   Windows), restarting it with a growing delay if it dies, and stops it when hosting is switched off,
@@ -167,7 +170,9 @@ started.
 `build_scene_from_devices` (`src/scene.rs`) maps the hub's `DeviceInfo` records to scenes:
 
 - Devices are grouped by `room` (`Default` when unset); rooms are listed alphabetically. A room
-  gets a desk when it owns at least one physical machine.
+  gets a desk when it owns at least one physical machine. In an arranged layout an empty
+  `Default` room is left off the tabs while another room exists, and the next arrangement edit
+  drops it from the saved layout.
 - Inside a room, machines are ordered by `slot`, then by `device_id`, so the picture is stable no
   matter in which order the hub reports them.
 - `Desktop` and `Mini` machines: right-back wing, one screen per active entry of `monitor_list`
@@ -200,7 +205,8 @@ double-clicking takes over, nothing can be dragged by accident.
   kind refuse the drop.
 - `+ L形桌`, `+ 直桌`, `+ 机柜` add a piece of furniture on free floor of the room on screen;
   `移除空家具` removes an empty one (a room keeps at least one piece).
-- `+ 新建房间` asks for a name and adds a room with an empty L-desk.
+- `+ 新建房间` asks for a name and adds a room with an empty L-desk; **删除空房间** deletes the
+  room on screen when nobody sits in it and another room remains.
 - With a machine selected: **改名** gives it a name of its own (all its screens), the room chips
   under **移到房间** move it to the first open slot of that room, **恢复自动布局** forgets the
   whole arrangement and goes back to the automatic one.
