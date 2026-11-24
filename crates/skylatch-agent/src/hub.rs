@@ -1,6 +1,6 @@
 //! The outbound hub connection and the session bridge.
 
-use crate::cli::{Cli, DaemonCredentials};
+use crate::cli::{AgentArgs, DaemonCredentials};
 use crate::direct::{self, Direct};
 use crate::engine::{EngineEvent, EngineSource, LocalLink};
 use crate::hardware::detect_hardware_profile;
@@ -39,7 +39,7 @@ struct Active {
 }
 
 /// Runs until the process is stopped, reconnecting to the hub with capped exponential backoff.
-pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(mut cli: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let credentials = cli.resolve()?;
     let direct_enabled = cli.enable_direct || cli.direct_port != 0;
     if direct_enabled
@@ -106,6 +106,12 @@ pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             EngineSource::spawn(bin, None, vec![])
         }
     }));
+    #[cfg(windows)]
+    let _follower = engine
+        .lock()
+        .await
+        .follows_console()
+        .then(|| crate::engine_win_session::Follower::spawn(engine.clone()));
     let viewer = Arc::new(Semaphore::new(1));
     if let Some(listener) = listener {
         let (key, watch) = watch::channel(None);
@@ -322,8 +328,25 @@ async fn connection(
                         Some(EngineEvent::Closed(gen)) => {
                             if active.as_ref().is_some_and(|a| a.link.generation == gen) {
                                 let old = active.take().expect("checked above");
-                                tracing::warn!(session_id = %old.session_id, "engine closed the stream");
+                                let switches = old.link.switches;
                                 old.link.close().await;
+                                let mut engine = engine.lock().await;
+                                if engine.session_switches() != switches {
+                                    // The engine moved to a new console session; resume the
+                                    // same client session on it.
+                                    generation += 1;
+                                    match engine.open_link(generation, events_tx.clone()).await {
+                                        Ok(link) => {
+                                            tracing::info!(session_id = %old.session_id, "session resumed in the new console session");
+                                            active = Some(Active { session_id: old.session_id, link, viewer: old.viewer });
+                                            continue;
+                                        }
+                                        Err(err) => tracing::error!(session_id = %old.session_id, "cannot resume session: {err}"),
+                                    }
+                                } else {
+                                    tracing::warn!(session_id = %old.session_id, "engine closed the stream");
+                                }
+                                drop(engine);
                                 sink.send(json(&HostToHub::SessionClosed { session_id: old.session_id }))
                                     .await
                                     .map_err(|e| ConnError::Ws(e.to_string()))?;

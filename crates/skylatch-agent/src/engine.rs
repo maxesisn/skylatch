@@ -39,12 +39,44 @@ pub enum EngineSource {
     /// Attach to an engine somebody else runs.
     Attach { base: Url },
     /// Start `skylatch-host-engine` on loopback and restart it if it dies.
-    Spawn {
-        bin: PathBuf,
-        port: Option<u16>,
-        args: Vec<String>,
-        running: Option<Box<(Child, u16)>>,
-    },
+    Spawn(Spawner),
+}
+
+pub struct Spawner {
+    bin: PathBuf,
+    port: Option<u16>,
+    args: Vec<String>,
+    running: Option<Running>,
+    /// Set once the engine was needed; it then keeps running.
+    wanted: bool,
+    /// Engines stopped because the console session changed.
+    switches: u64,
+    /// Started from Session 0, so the engine must run in the active console session.
+    console: bool,
+}
+
+struct Running {
+    child: EngineChild,
+    port: u16,
+}
+
+enum EngineChild {
+    Local(Box<Child>),
+    #[cfg(windows)]
+    Console(crate::engine_win_session::ConsoleChild),
+}
+
+impl EngineChild {
+    fn try_exit(&mut self) -> Option<String> {
+        match self {
+            Self::Local(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(status.to_string()),
+                _ => None,
+            },
+            #[cfg(windows)]
+            Self::Console(child) => child.try_exit(),
+        }
+    }
 }
 
 impl EngineSource {
@@ -53,11 +85,31 @@ impl EngineSource {
     }
 
     pub fn spawn(bin: PathBuf, port: Option<u16>, args: Vec<String>) -> Self {
-        Self::Spawn {
+        #[cfg(windows)]
+        let console = crate::engine_win_session::in_session_zero();
+        #[cfg(not(windows))]
+        let console = false;
+        Self::Spawn(Spawner {
             bin,
             port,
             args,
             running: None,
+            wanted: false,
+            switches: 0,
+            console,
+        })
+    }
+
+    /// Whether the engine is started into the active console session from Session 0.
+    pub fn follows_console(&self) -> bool {
+        matches!(self, Self::Spawn(spawn) if spawn.console)
+    }
+
+    /// How often a running engine was stopped to move it to a new console session.
+    pub fn session_switches(&self) -> u64 {
+        match self {
+            Self::Attach { .. } => 0,
+            Self::Spawn(spawn) => spawn.switches,
         }
     }
 
@@ -67,41 +119,23 @@ impl EngineSource {
             Self::Attach { base } => {
                 stream_url(base.host_str().unwrap_or("127.0.0.1"), base.port())
             }
-            Self::Spawn {
-                bin,
-                port,
-                args,
-                running,
-            } => {
-                if let Some(boxed) = running {
-                    if let Ok(Some(status)) = boxed.0.try_wait() {
-                        tracing::warn!(%status, "engine exited; restarting");
-                        *running = None;
-                    }
-                }
-                if running.is_none() {
-                    let chosen = match port {
-                        Some(p) => *p,
-                        None => free_loopback_port()?,
-                    };
-                    let child = Command::new(&*bin)
-                        .arg("--no-viewer")
-                        .arg("--insecure-local")
-                        .args(["--bind", "127.0.0.1"])
-                        .args(["--port", &chosen.to_string()])
-                        .args(args.iter())
-                        .kill_on_drop(true)
-                        .spawn()
-                        .map_err(|source| EngineError::Spawn {
-                            path: bin.display().to_string(),
-                            source,
-                        })?;
-                    tracing::info!(port = chosen, "started engine");
-                    *running = Some(Box::new((child, chosen)));
-                }
-                let port = running.as_deref().map(|(_, p)| *p).unwrap_or_default();
+            Self::Spawn(spawn) => {
+                let port = spawn.ready_port().await?;
                 stream_url("127.0.0.1", Some(port))
             }
+        }
+    }
+
+    /// Moves a running engine to the active console session, or restarts a needed one.
+    #[cfg(windows)]
+    pub(crate) fn follow_console(&mut self, active: Option<u32>) -> Result<(), EngineError> {
+        use crate::engine_win_session::plan;
+        match self {
+            Self::Spawn(spawn) if spawn.console => {
+                let step = plan(spawn.running_session(), active, spawn.wanted);
+                spawn.apply(step)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -112,6 +146,7 @@ impl EngineSource {
         events: mpsc::Sender<EngineEvent>,
     ) -> Result<LocalLink, EngineError> {
         let url = self.ensure_ready().await?;
+        let switches = self.session_switches();
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             let connect = tokio::time::timeout_at(
@@ -122,15 +157,14 @@ impl EngineSource {
                 .await
                 .map_err(|_| EngineError::NotReady("WebSocket handshake timed out".into()))?
             {
-                Ok(link) => return Ok(link),
+                Ok(mut link) => {
+                    link.switches = switches;
+                    return Ok(link);
+                }
                 Err(err) => {
-                    if let Self::Spawn {
-                        running: Some(boxed),
-                        ..
-                    } = self
-                    {
-                        if let Ok(Some(status)) = boxed.0.try_wait() {
-                            return Err(EngineError::Exited(status.to_string()));
+                    if let Self::Spawn(spawn) = self {
+                        if let Some(status) = spawn.reap() {
+                            return Err(EngineError::Exited(status));
                         }
                     }
                     if Instant::now() >= deadline {
@@ -140,6 +174,109 @@ impl EngineSource {
                 }
             }
         }
+    }
+}
+
+impl Spawner {
+    /// Drops an exited engine and returns its exit status.
+    fn reap(&mut self) -> Option<String> {
+        let status = self.running.as_mut()?.child.try_exit()?;
+        self.running = None;
+        Some(status)
+    }
+
+    fn engine_args(&self, port: u16) -> Vec<String> {
+        let mut args: Vec<String> = ["--no-viewer", "--insecure-local", "--bind", "127.0.0.1"]
+            .map(String::from)
+            .into();
+        args.extend(["--port".into(), port.to_string()]);
+        args.extend(self.args.iter().cloned());
+        args
+    }
+
+    fn launch_port(&self) -> Result<u16, EngineError> {
+        match self.port {
+            Some(p) => Ok(p),
+            None => free_loopback_port(),
+        }
+    }
+
+    async fn ready_port(&mut self) -> Result<u16, EngineError> {
+        self.wanted = true;
+        if let Some(status) = self.reap() {
+            tracing::warn!(%status, "engine exited; restarting");
+        }
+        #[cfg(windows)]
+        if self.console {
+            let active = crate::engine_win_session::wait_for_console(READY_TIMEOUT)
+                .await
+                .ok_or_else(|| {
+                    EngineError::NotReady("no session is attached to the console".into())
+                })?;
+            let step = crate::engine_win_session::plan(self.running_session(), Some(active), true);
+            self.apply(step)?;
+        }
+        if self.running.is_none() {
+            let chosen = self.launch_port()?;
+            let child = Command::new(&self.bin)
+                .args(self.engine_args(chosen))
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|source| EngineError::Spawn {
+                    path: self.bin.display().to_string(),
+                    source,
+                })?;
+            tracing::info!(port = chosen, "started engine");
+            self.running = Some(Running {
+                child: EngineChild::Local(Box::new(child)),
+                port: chosen,
+            });
+        }
+        Ok(self.running.as_ref().map(|r| r.port).unwrap_or_default())
+    }
+
+    #[cfg(windows)]
+    fn running_session(&mut self) -> Option<u32> {
+        if let Some(status) = self.reap() {
+            tracing::warn!(%status, "engine exited");
+        }
+        match &self.running.as_ref()?.child {
+            EngineChild::Console(child) => Some(child.session),
+            EngineChild::Local(_) => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn apply(&mut self, step: crate::engine_win_session::Step) -> Result<(), EngineError> {
+        use crate::engine_win_session::{ConsoleChild, Step};
+        let session = match step {
+            Step::Keep | Step::Wait => return Ok(()),
+            Step::Launch(to) => to,
+            Step::Switch { from, to } => {
+                tracing::info!(from, to, "console session changed; moving the engine");
+                self.running = None;
+                self.switches += 1;
+                to
+            }
+        };
+        let port = self.launch_port()?;
+        let child = ConsoleChild::launch(&self.bin, &self.engine_args(port), session).map_err(
+            |source| EngineError::Spawn {
+                path: self.bin.display().to_string(),
+                source,
+            },
+        )?;
+        tracing::info!(
+            port,
+            session,
+            pid = child.pid,
+            "started engine in the console session"
+        );
+        self.running = Some(Running {
+            child: EngineChild::Console(child),
+            port,
+        });
+        Ok(())
     }
 }
 
@@ -173,6 +310,8 @@ pub struct LocalLink {
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     pub generation: u64,
+    /// [`EngineSource::session_switches`] when the link was opened.
+    pub switches: u64,
 }
 
 impl LocalLink {
@@ -232,6 +371,7 @@ impl LocalLink {
             reader,
             writer,
             generation,
+            switches: 0,
         })
     }
 

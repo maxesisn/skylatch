@@ -1,7 +1,8 @@
 //! Command line and derived configuration.
 
 use crate::join::{config_path, load, Join};
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use crate::service::Service;
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use skylatch_proto::control::{DeviceFormFactor, DirectEndpoint, EndpointKind};
 use skylatch_proto::credentials::is_token;
 use std::path::PathBuf;
@@ -36,8 +37,21 @@ impl FormFactorArg {
 /// its `NSL1` stream to the local `skylatch-host-engine`.
 #[derive(Parser)]
 #[command(version, about, args_conflicts_with_subcommands = true)]
-#[command(group(ArgGroup::new("engine").args(["engine_bin", "engine_url"])))]
 pub struct Cli {
+    #[command(flatten)]
+    pub agent: AgentArgs,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Options of the long-running agent, shared by the foreground mode and `service run`.
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("engine").args(["engine_bin", "engine_url"])))]
+pub struct AgentArgs {
+    /// Saved configuration written by `join` (default: the per-user configuration file).
+    #[arg(long, env = "SKYLATCH_CONFIG", value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Hub URL: `wss://hub.example.com/ws/host`, or a base URL such as `ws://127.0.0.1:8080`
     /// (`/ws/host` is appended when the path is empty).
     #[arg(long, env = "SKYLATCH_HUB", value_parser = parse_hub_url)]
@@ -118,14 +132,15 @@ pub struct Cli {
     /// Capture backend passed to the engine (for example `x11`, `wayland`, `macos`, `windows`).
     #[arg(long, requires = "engine_bin")]
     pub backend: Option<String>,
-    #[command(subcommand)]
-    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
     /// Enroll this workstation and save its private device credentials.
     Join(Join),
+    /// Install, remove or run the Windows service.
+    #[cfg_attr(not(windows), command(hide = true))]
+    Service(Service),
 }
 
 pub(crate) struct DaemonCredentials {
@@ -134,12 +149,12 @@ pub(crate) struct DaemonCredentials {
     pub device_token: bool,
 }
 
-impl Cli {
+impl AgentArgs {
     pub(crate) fn resolve(&mut self) -> Result<DaemonCredentials, Box<dyn std::error::Error>> {
         let saved = if self.hub.is_some() && self.token.is_some() {
             None
         } else {
-            match config_path() {
+            match self.config.clone().map_or_else(config_path, Ok) {
                 Ok(path) => load(&path)?,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => return Err(err.into()),

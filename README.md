@@ -74,6 +74,10 @@ Download packages and `SHA256SUMS` from [GitHub Releases](https://github.com/max
 - **Windows x64:** Run `Skylatch-<version>-windows-x64-setup.exe`, or extract the portable archive
   and run `skylatch-ui.exe`. To enable host startup at login, select the installer option and run
   `skylatch-agent.exe join <hub-url> --code <6-digit>` as the same Windows user.
+  To control UAC prompts, the lock screen and elevated windows, install for all users and keep the
+  **Windows service** option: setup registers the `SkylatchAgent` LocalSystem service. Enroll it
+  from an elevated prompt with `skylatch-agent.exe join --system <hub-url> --code <6-digit>`; see
+  [Windows service](docs/ARCHITECTURE.md#windows-service).
 - **macOS (Apple silicon):** Open `Skylatch-<version>-macos-arm64.dmg` and drag **Skylatch** into
   **Applications**. Release builds are ad-hoc signed unless a Developer ID identity is supplied.
   Hosting requires Screen Recording and Accessibility permissions.

@@ -2,6 +2,7 @@ use clap::Parser;
 use skylatch_agent::{
     cli::{Cli, Command},
     hub,
+    service::ServiceAction,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -20,21 +21,40 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn log_to_stderr() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    let mut cli = Cli::parse();
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let Cli { agent, command } = Cli::parse();
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    if let Some(Command::Join(join)) = cli.command.take() {
-        return join.run().await;
+    match command {
+        Some(Command::Service(service)) => {
+            // `service run` logs to a file next to its configuration.
+            if !matches!(service.action, ServiceAction::Run(_)) {
+                log_to_stderr();
+            }
+            service.run()
+        }
+        command => {
+            log_to_stderr();
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async move {
+                    if let Some(Command::Join(join)) = command {
+                        return join.run().await;
+                    }
+                    tokio::select! {
+                        result = hub::run(agent) => result?,
+                        _ = shutdown_signal() => tracing::info!("shutting down"),
+                    }
+                    Ok(())
+                })
+        }
     }
-    tokio::select! {
-        result = hub::run(cli) => result?,
-        _ = shutdown_signal() => tracing::info!("shutting down"),
-    }
-    Ok(())
 }
