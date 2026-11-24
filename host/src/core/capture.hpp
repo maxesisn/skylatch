@@ -49,6 +49,12 @@ class CaptureEncoder {
   void beginSession(uint32_t generation);
   void endSession(uint32_t generation);
   void acknowledge(uint32_t generation, uint32_t sequence);
+  /**
+   * Asks the capture loop to build a fresh source from the factory, for example after the backend switched to another
+   * display. The stream restarts with an IDR at the new source's size; the session, generation and sequence continue.
+   * A factory failure keeps the previous source.
+   */
+  void reopenSource();
   void setFlowControl(uint32_t generation, unsigned window, uint64_t bitrate, bool paused, uint64_t admit_until_us);
   CaptureStats stats() const;
   /** Returns the current stream width and height after fitting the capture surface to the H.264 budget; it changes when the source is resized. */

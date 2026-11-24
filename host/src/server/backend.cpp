@@ -8,6 +8,8 @@ bool initializeNativeBackend(const std::string& output, unsigned fps, const Back
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
+std::vector<MonitorInfo> listMonitors();
+bool selectMonitor(const std::string& id);
 }
 #endif
 #ifdef RELAY_BACKEND_wayland
@@ -16,6 +18,8 @@ bool initializeNativeBackend(const std::string& output, unsigned fps, const Back
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
+std::vector<MonitorInfo> listMonitors();
+bool selectMonitor(const std::string& id);
 }
 #endif
 #ifdef RELAY_BACKEND_windows
@@ -24,6 +28,8 @@ bool initializeNativeBackend(const std::string& output, unsigned fps, const Back
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
+std::vector<MonitorInfo> listMonitors();
+bool selectMonitor(const std::string& id);
 }
 #endif
 #ifdef RELAY_BACKEND_macos
@@ -32,22 +38,24 @@ bool initializeNativeBackend(const std::string& output, unsigned fps, const Back
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
+std::vector<MonitorInfo> listMonitors();
+bool selectMonitor(const std::string& id);
 }
 #endif
 
 namespace {
 const Backend backends[] = {
 #ifdef RELAY_BACKEND_x11
-  {"x11", x11::initializeNativeBackend, x11::makeCaptureSource, x11::makeInputBackend, x11::makeClipboard},
+  {"x11", x11::initializeNativeBackend, x11::makeCaptureSource, x11::makeInputBackend, x11::makeClipboard, x11::listMonitors, x11::selectMonitor},
 #endif
 #ifdef RELAY_BACKEND_wayland
-  {"wayland", wayland::initializeNativeBackend, wayland::makeCaptureSource, wayland::makeInputBackend, wayland::makeClipboard},
+  {"wayland", wayland::initializeNativeBackend, wayland::makeCaptureSource, wayland::makeInputBackend, wayland::makeClipboard, wayland::listMonitors, wayland::selectMonitor},
 #endif
 #ifdef RELAY_BACKEND_windows
-  {"windows", windows::initializeNativeBackend, windows::makeCaptureSource, windows::makeInputBackend, windows::makeClipboard},
+  {"windows", windows::initializeNativeBackend, windows::makeCaptureSource, windows::makeInputBackend, windows::makeClipboard, windows::listMonitors, windows::selectMonitor},
 #endif
 #ifdef RELAY_BACKEND_macos
-  {"macos", macos::initializeNativeBackend, macos::makeCaptureSource, macos::makeInputBackend, macos::makeClipboard},
+  {"macos", macos::initializeNativeBackend, macos::makeCaptureSource, macos::makeInputBackend, macos::makeClipboard, macos::listMonitors, macos::selectMonitor},
 #endif
 };
 }

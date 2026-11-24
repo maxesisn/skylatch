@@ -65,7 +65,7 @@ class Duplicator {
     std::lock_guard<std::mutex> lock(mutex);
     return !failure.empty();
   }
-  Duplicator() : display(windows::findOutput()) {
+  Duplicator() : display(windows::findOutput()), selection(windows::selectionRevision()) {
     build();
     duplicate();
     worker = std::thread([this] { run(); });
@@ -111,6 +111,8 @@ class Duplicator {
   static CursorImage hidden() { return windows::hiddenCursor(); }
 
  private:
+  /// The monitor choice this duplication was built for; run() reconnects when selectMonitor() changed it.
+  unsigned selection = 0;
   int level = 0, width = 0, height = 0;
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> context;
@@ -186,6 +188,11 @@ void Duplicator::unsubscribe(WindowsCapture* source) {
 void Duplicator::run() {
   std::vector<uint8_t> metadata, shapeData;
   while (!stopping) {
+    if (const unsigned chosen = windows::selectionRevision(); chosen != selection) {
+      selection = chosen;
+      if (!reconnect()) return;
+      continue;
+    }
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> resource;
     const HRESULT result = duplication ? duplication->AcquireNextFrame(100, &info, &resource) : DXGI_ERROR_ACCESS_LOST;

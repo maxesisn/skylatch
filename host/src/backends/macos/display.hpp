@@ -1,5 +1,8 @@
 #pragma once
+#include "core/monitor.hpp"
 #include <CoreGraphics/CoreGraphics.h>
+#include <string>
+#include <vector>
 
 namespace relay {
 namespace macos {
@@ -20,5 +23,10 @@ struct Display {
 };
 /// Finds the display chosen with --output by CGDirectDisplayID, or the main display when none was chosen.
 Display findDisplay();
+/// Every active display with its global bounds in points; the one findDisplay() returns is marked active.
+std::vector<MonitorInfo> listMonitors();
+/// Streams the display with this CGDirectDisplayID from now on; capture and input follow within a second.
+/// False, changing nothing, when it is not an active display or its size cannot be streamed.
+bool selectMonitor(const std::string& id);
 }
 }

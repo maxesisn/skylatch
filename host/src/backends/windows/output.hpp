@@ -1,8 +1,10 @@
 #pragma once
 #include "core/backend-options.hpp"
+#include "core/monitor.hpp"
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 #include <windows.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -50,6 +52,14 @@ struct Geometry {
   std::pair<int, int> streamSize() const { return {(width() >> level()) & ~1, (height() >> level()) & ~1}; }
 };
 Geometry findGeometry();
+/// Every monitor attached to the desktop, found with EnumDisplayMonitors so it works for DXGI and GDI capture alike.
+/// The id is the GDI device name, such as \\.\DISPLAY2, which is also what --output takes; the streamed one is active.
+std::vector<MonitorInfo> listMonitors();
+/// Streams the monitor with this id from now on; false, changing nothing, when no attached monitor has it or its size
+/// cannot be streamed. Capture and input follow without a restart.
+bool selectMonitor(const std::string& id);
+/// Counts selectMonitor() calls that changed the choice, so a capture thread notices a switch.
+unsigned selectionRevision();
 /// Throws with the HRESULT and a readable action when a Windows call fails.
 void check(HRESULT result, const char* action);
 }

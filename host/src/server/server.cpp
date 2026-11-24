@@ -111,6 +111,7 @@ void Server::Stream::end() {
   buffered_stream_bytes = 0; stream_notsent_lowat = 0; flow_timer_due_us = 0;
   if (old) capture.endSession(old);
   clipboard_notices = clipboard_pending = false;
+  monitors_pending.reset(); clipboard_data_pending.reset();
   lastSequence = 0; width = height = 0; received.clear(); viewer = nullptr;
 }
 Server::Server(Config settings) : config(std::move(settings)) {
@@ -158,6 +159,7 @@ int Server::startStream(lws* wsi, Socket socket, const ConnectionPlan& plan, boo
   auto& stream = **slot;
   stream.width = width; stream.height = height;
   stream.clipboard_notices = clipboardNotices;
+  if (auto list = monitorSnapshot(); !list.empty()) stream.monitors_pending = std::move(list);
   stream.begin(wsi, ++nextGeneration);
   stream.updateFlow(config.proxy);
   return 0;
@@ -230,9 +232,70 @@ bool Server::streamMessage(Stream& stream) {
     if (accepted) { stream.capture.acknowledge(gen, seq); stream.updateFlow(config.proxy); }
     return true;
   }
+  if (b[5] == 18) {
+    std::string id;
+    if (seq || !selectMonitorId(b.data()+nsl1_header_bytes, b.size()-nsl1_header_bytes, id)) return false;
+    if (gen == stream.generation) selectMonitor(stream, id);
+    return true;
+  }
+  if (b[5] == 19) {
+    std::string text;
+    if (seq || !clipboardDataText(b.data()+nsl1_header_bytes, b.size()-nsl1_header_bytes, text)) return false;
+    // Only a /stream?clipboard=1 viewer may write; a message from an older session or with NUL, which no desktop
+    // clipboard holds, is dropped without ending the connection.
+    if (gen != stream.generation || !stream.clipboard_notices || !clipboard.available() ||
+        text.find('\0') != std::string::npos) return true;
+    echo.applied(text);
+    if (!clipboard.submitApply(std::move(text))) echo.reset();
+    return true;
+  }
   if (b[5] != 3 || b.size() != 36 || seq || gen != stream.generation) return false;
   if (input_viewer != stream.viewer) return true;
   return input->apply(inputEvent(b.data()+20)) != InputStatus::invalid;
+}
+std::vector<MonitorInfo> Server::monitorSnapshot() {
+  const auto& backend = backendFor(config.backend);
+  if (!backend.monitors) return {};
+  try { return backend.monitors(); }
+  catch (const std::exception& error) { std::cerr << "Listing displays failed: " << error.what() << '\n'; }
+  return {};
+}
+void Server::queueMonitorList() {
+  const auto list = monitorSnapshot();
+  if (list.empty()) return;
+  for (const auto& stream : streams) if (stream && stream->viewer) {
+    stream->monitors_pending = list;
+    lws_callback_on_writable(stream->viewer);
+  }
+}
+void Server::selectMonitor(Stream& stream, const std::string& id) {
+  const auto& backend = backendFor(config.backend);
+  if (input_viewer != stream.viewer || !backend.selectMonitor) return;
+  const auto list = monitorSnapshot();
+  const auto target = std::find_if(list.begin(), list.end(), [&](const MonitorInfo& m) { return m.id == id; });
+  if (target == list.end() || !backend.selectMonitor(id)) {
+    // An unknown or unusable display: tell the viewer what is there.
+    if (!list.empty()) { stream.monitors_pending = list; lws_callback_on_writable(stream.viewer); }
+    return;
+  }
+  if (target->active) return;
+  std::cerr << "Switching to display " << id << '\n';
+  for (const auto& other : streams) if (other && other->viewer) other->capture.reopenSource();
+  queueMonitorList();
+}
+void Server::clipboardFinished(const ClipboardWorker::Reply& reply) {
+  if (reply.origin == ClipboardWorker::Origin::apply) {
+    if (!reply.ok) echo.reset();
+    return;
+  }
+  if (!reply.ok || !reply.text || !echo.shouldSend(*reply.text)) return;
+  // The legacy notice already went out; viewers that read Type 19 get the text itself.
+  if (reply.text->size() > max_clipboard_data_bytes || !validUtf8(*reply.text)) return;
+  if (!input_viewer) return;
+  if (auto* stream = streamFor(input_viewer); stream && stream->clipboard_notices) {
+    stream->clipboard_data_pending = *reply.text;
+    lws_callback_on_writable(stream->viewer);
+  }
 }
 void Server::Stream::updateFlow([[maybe_unused]] bool proxy) {
   if (viewer && !lws_partial_buffered(viewer)) buffered_stream_bytes = 0;
@@ -363,10 +426,10 @@ int Server::Stream::write(bool proxy) {
   updateFlow(proxy);
   std::optional<EncodedFrame> frame;
   std::optional<CursorImage> cursor;
-  const bool send_notice = lastSequence && clipboard_pending;
+  const bool send_control = lastSequence && (monitors_pending || clipboard_pending || clipboard_data_pending);
   { std::lock_guard<std::mutex> lock(mutex);
     if (failed) return -1;
-    if (!send_notice) {
+    if (!send_control) {
       // Start with video to establish the generation; then share writes fairly.
       if (lastSequence && pending_cursor && (!last_write_cursor || pending.empty())) {
         cursor = std::move(pending_cursor); pending_cursor.reset();
@@ -377,15 +440,25 @@ int Server::Stream::write(bool proxy) {
     }
   }
   std::vector<uint8_t> wire;
-  if (send_notice) {
+  if (send_control) {
     if (lws_partial_buffered(wsi)) {
       lws_callback_on_writable(wsi);
       return 0;
     }
-    clipboardNotice(wire, LWS_PRE, generation);
+    if (monitors_pending) {
+      monitorListMessage(wire, LWS_PRE, generation, *monitors_pending);
+      monitors_pending.reset();
+    } else if (clipboard_pending) {
+      clipboardNotice(wire, LWS_PRE, generation);
+      clipboard_pending = false;
+    } else {
+      const bool built = clipboardDataMessage(wire, LWS_PRE, generation, *clipboard_data_pending);
+      clipboard_data_pending.reset();
+      if (!built) { lws_callback_on_writable(wsi); return 0; }
+    }
     const size_t size = wire.size() - LWS_PRE;
     if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
-    clipboard_pending = false;
+    buffered_stream_bytes = lws_partial_buffered(wsi) ? size : 0;
     lws_callback_on_writable(wsi);
     return 0;
   }
@@ -403,7 +476,10 @@ int Server::Stream::write(bool proxy) {
   }
   auto& f = *frame;
   if (f.generation != generation) return 0;
-  if (!frameMessage(wire, LWS_PRE, generation, lastSequence, f, width, height)) return -1;
+  // A keyframe may carry a new size, when the capture followed a resized or switched display.
+  const uint16_t limit_width = f.keyframe ? uint16_t(max_frame_width) : width;
+  const uint16_t limit_height = f.keyframe ? uint16_t(max_frame_height) : height;
+  if (!frameMessage(wire, LWS_PRE, generation, lastSequence, f, limit_width, limit_height)) return -1;
   const size_t size = wire.size() - LWS_PRE;
   if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
   buffered_stream_bytes = lws_partial_buffered(wsi) ? size : 0;
@@ -749,12 +825,14 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       auto* stream = s->streamFor(wsi);
       if (!stream && s->control != wsi) return -1;
       auto& received = stream ? stream->received : s->control_received;
-      if (!lws_frame_is_binary(wsi) || len > 65536-received.size()) return -1;
+      const size_t most = stream ? nsl1_header_bytes + max_clipboard_data_bytes : 36;
+      if (!lws_frame_is_binary(wsi) || len > most - received.size()) return -1;
       received.insert(received.end(), static_cast<uint8_t*>(in), static_cast<uint8_t*>(in)+len);
-      if (received.size() > 36) return -1;
+      if (received.size() > (stream ? maxViewerMessage(received) : 36)) return -1;
       if (lws_is_final_fragment(wsi) && !lws_remaining_packet_payload(wsi)) {
         if (!(stream ? s->streamMessage(*stream) : s->controlMessage())) return -1;
         received.clear();
+        if (received.capacity() > 4096) std::vector<uint8_t>().swap(received);
       }
       return 0;
     }
@@ -773,6 +851,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       if (s->clipboard_changed.exchange(false) && s->input_viewer) {
         if (auto* stream = s->streamFor(s->input_viewer); stream && stream->clipboard_notices) {
           stream->clipboard_pending = true;
+          s->clipboard.submitObserve();
         }
       }
       for (const auto& stream : s->streams) if (stream && stream->viewer) {
@@ -790,6 +869,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         lws_callback_on_writable(reply->wsi);
       }
       for (auto& reply : s->clipboard.take()) {
+        if (reply.origin != ClipboardWorker::Origin::http) { s->clipboardFinished(reply); continue; }
         auto* response = static_cast<HttpResponse*>(lws_wsi_user(reply.client));
         if (!response) continue;
         response->image = new std::vector<uint8_t>(reply.body.begin(), reply.body.end());

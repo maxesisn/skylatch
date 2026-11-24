@@ -4,6 +4,7 @@
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
 #include "core/backend-options.hpp"
+#include "core/monitor.hpp"
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,8 @@ struct Connection {
   wl_output* output = nullptr;
   int width = 0;
   int height = 0;
+  /// The wl_output name, empty when the compositor offers none (wl_output before version 4).
+  std::string outputName;
   zwlr_screencopy_manager_v1* screencopyManager = nullptr;
   zwp_virtual_keyboard_manager_v1* virtualKeyboardManager = nullptr;
   zwlr_virtual_pointer_manager_v1* virtualPointerManager = nullptr;
@@ -58,4 +61,8 @@ struct Connection {
 };
 
 bool initializeNativeBackend(const std::string& output, unsigned fps, const BackendOptions& options);
+/// The streamed output, the only one this backend offers: a Wayland session is bound to the output chosen with --output.
+std::vector<MonitorInfo> listMonitors();
+/// True when id names the streamed output; the backend cannot move to another output while it runs.
+bool selectMonitor(const std::string& id);
 }

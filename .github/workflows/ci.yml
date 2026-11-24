@@ -51,7 +51,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libx264-dev libwebsockets-dev zlib1g-dev \
-            libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxtst-dev \
+            libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxrandr-dev libxtst-dev \
             libavcodec-dev libavutil-dev libswscale-dev
       - name: Install host build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -60,6 +60,32 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
       - name: Build the host engine
         run: make -C host
+      - name: Run the host unit tests
+        run: make -C host test
+
+  host-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-libwebsockets
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-ffmpeg
+      - name: Build the host engine
+        run: make -C host
+      - name: Check console-only startup
+        run: host/skylatch-host-engine.exe --help
       - name: Run the host unit tests
         run: make -C host test
 

@@ -9,7 +9,7 @@ endif
 BACKENDS ?= x11
 HAS_WAYLAND = $(filter wayland,$(BACKENDS))
 AVAILABLE_BACKENDS = x11 wayland windows macos
-BACKEND_PKGS_x11 = x11 xext xdamage xfixes xtst
+BACKEND_PKGS_x11 = x11 xext xdamage xfixes xrandr xtst
 BACKEND_DIR_x11 = linux/x11
 BACKEND_PKGS_wayland = wayland-client xkbcommon
 BACKEND_DIR_wayland = linux/wayland

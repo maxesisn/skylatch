@@ -1,5 +1,6 @@
 #include "core/input.hpp"
 #include "backends/linux/keycodes.hpp"
+#include "backends/linux/x11/monitors.hpp"
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/keysym.h>
@@ -15,6 +16,8 @@
 
 namespace relay {
 namespace {
+using x11::ScreenRegion;
+using x11::streamedRegion;
 constexpr size_t spareCount = 16;
 /// Minimum time between tapping a spare keycode and rebinding it.
 constexpr std::chrono::milliseconds spareReuse(50);
@@ -35,7 +38,8 @@ class X11Input final : public InputBackend {
     TimePoint tapped{};
   };
   Display* display = nullptr;
-  uint16_t width = 0, height = 0;
+  /// Size of the X root screen; the streamed region lies inside it.
+  int root_width = 0, root_height = 0;
   int columns = 1;
   uint64_t typed = 0;
   std::map<KeySym, KeyCode> layout;
@@ -54,12 +58,11 @@ class X11Input final : public InputBackend {
     if (!display) throw std::runtime_error("X11 input display unavailable; Wayland is unsupported");
     int event, error, major, minor;
     const int screen = DefaultScreen(display);
-    const int root_width = DisplayWidth(display, screen), root_height = DisplayHeight(display, screen);
+    root_width = DisplayWidth(display, screen); root_height = DisplayHeight(display, screen);
     if (!XTestQueryExtension(display, &event, &error, &major, &minor)) {
       XCloseDisplay(display); display = nullptr;
       throw std::runtime_error("input requires the XTest extension");
     }
-    width = uint16_t(root_width); height = uint16_t(root_height);
     findSpares();
     findModifiers();
     worker = std::thread([this] { run(); });
@@ -70,7 +73,11 @@ class X11Input final : public InputBackend {
     if (worker.joinable()) worker.join();
     XCloseDisplay(display);
   }
-  std::pair<uint16_t, uint16_t> dimensions() const override { return {width, height}; }
+  /// The size of the streamed region, which follows a SelectMonitor switch.
+  std::pair<uint16_t, uint16_t> dimensions() const override {
+    const ScreenRegion region = streamedRegion(root_width, root_height);
+    return {uint16_t(region.width), uint16_t(region.height)};
+  }
   const char* name() const override { return "x11"; }
   std::optional<NativeKey> nativeKey(uint16_t usage) const override {
     const int keycode = hidKeycode(usage);
@@ -163,7 +170,11 @@ class X11Input final : public InputBackend {
         break;
       case InputJob::Kind::text: type(job.codepoint); break;
       case InputJob::Kind::button: XTestFakeButtonEvent(display, job.number, job.press, CurrentTime); break;
-      case InputJob::Kind::motion: XTestFakeMotionEvent(display, DefaultScreen(display), job.x, job.y, CurrentTime); break;
+      case InputJob::Kind::motion: {
+        const ScreenRegion region = streamedRegion(root_width, root_height);
+        XTestFakeMotionEvent(display, DefaultScreen(display), region.x + job.x, region.y + job.y, CurrentTime);
+        break;
+      }
       case InputJob::Kind::scroll: wheel(job.number, job.notches); break;
       case InputJob::Kind::locks: XkbLockModifiers(display, XkbUseCoreKbd, LockMask, 0); break;
       case InputJob::Kind::flush: XFlush(display); break;

@@ -4,7 +4,10 @@
 #include "server/metrics.hpp"
 #include "server/wire.hpp"
 #include <libwebsockets.h>
+#include <algorithm>
 #include <cassert>
+#include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <condition_variable>
@@ -258,6 +261,145 @@ int main() {
     clipboardNotice(notice, 1, 9);
     const uint8_t expected[] = {0, 'N', 'S', 'L', '1', 1, 7, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0};
     assert(notice == std::vector<uint8_t>(expected, expected + sizeof(expected)));
+  }
+  {
+    // Type 17 follows the serde_json layout of Vec<MonitorInfo> in crates/skylatch-proto, byte for byte.
+    MonitorInfo monitor;
+    monitor.id = "output-\xe9\x9b\xaa"; monitor.name = "\xc3\x89""cran";
+    monitor.x = -1920; monitor.y = INT32_MIN; monitor.width = 1920; monitor.height = 1080; monitor.primary = true;
+    const std::string expected = "[{\"id\":\"output-\xe9\x9b\xaa\",\"name\":\"\xc3\x89""cran\",\"x\":-1920,\"y\":-2147483648,"
+                                 "\"width\":1920,\"height\":1080,\"primary\":true,\"active\":false}]";
+    assert(monitorListJson({monitor}) == expected);
+    assert(monitorListJson({}) == "[]");
+    std::vector<uint8_t> list;
+    monitorListMessage(list, 2, 23, {monitor});
+    assert(list.size() == 2 + 20 + expected.size());
+    const uint8_t head[] = {0, 0, 'N', 'S', 'L', '1', 1, 17, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0};
+    assert(std::equal(head, head + sizeof(head), list.begin()));
+    assert(u32(list.data() + 2 + 16) == expected.size());
+    assert(std::string(list.begin() + 22, list.end()) == expected);
+    // Names and ids are escaped like any JSON string.
+    MonitorInfo quoted;
+    quoted.id = "\\\\.\\DISPLAY1"; quoted.name = "a\"b"; quoted.active = true; quoted.width = 3840; quoted.height = 2160;
+    assert(monitorListJson({quoted}) == "[{\"id\":\"\\\\\\\\.\\\\DISPLAY1\",\"name\":\"a\\\"b\",\"x\":0,\"y\":0,\"width\":3840,"
+                                        "\"height\":2160,\"primary\":false,\"active\":true}]");
+    // A list that would pass 64 KiB loses its trailing monitors, never half of one.
+    std::vector<MonitorInfo> many;
+    for (int i = 0; i < 400; ++i) { MonitorInfo m; m.id = std::to_string(i); m.name = std::string(200, 'n'); many.push_back(m); }
+    const std::string capped = monitorListJson(many);
+    assert(capped.size() <= max_monitor_list_bytes && capped.front() == '[' && capped.back() == ']');
+    assert(capped.find("\"id\":\"0\"") != std::string::npos && capped.find("\"id\":\"399\"") == std::string::npos);
+    monitorListMessage(list, 0, 1, many);
+    assert(list.size() - 20 <= max_monitor_list_bytes && u32(list.data() + 16) == list.size() - 20);
+  }
+  {
+    // Type 18 carries 1 to 256 UTF-8 bytes of the monitor id, nothing else.
+    std::vector<uint8_t> select;
+    assert(selectMonitorMessage(select, 0, 9, "DISPLAY2"));
+    const uint8_t expected[] = {'N', 'S', 'L', '1', 1, 18, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 8,
+                                'D', 'I', 'S', 'P', 'L', 'A', 'Y', '2'};
+    assert(select == std::vector<uint8_t>(expected, expected + sizeof(expected)));
+    std::string id;
+    assert(selectMonitorId(select.data() + 20, 8, id) && id == "DISPLAY2");
+    assert(!selectMonitorId(select.data() + 20, 0, id) && id == "DISPLAY2");
+    assert(!selectMonitorMessage(select, 0, 9, ""));
+    const std::string longest(max_monitor_id_bytes, 'a');
+    assert(selectMonitorMessage(select, 0, 9, longest) && select.size() == 20 + 256);
+    assert(selectMonitorId(select.data() + 20, 256, id) && id == longest);
+    assert(!selectMonitorMessage(select, 0, 9, longest + "a"));
+    assert(!selectMonitorId(reinterpret_cast<const uint8_t*>(longest.data()), 257, id));
+    // A multi-byte id counts bytes, not characters: 128 two-byte characters fit, 129 do not.
+    std::string wide;
+    for (int i = 0; i < 128; ++i) wide += "\xc3\xa9";
+    assert(selectMonitorMessage(select, 0, 9, wide));
+    assert(!selectMonitorMessage(select, 0, 9, wide + "\xc3\xa9"));
+    const uint8_t broken[] = {'a', 0xff};
+    assert(!selectMonitorId(broken, sizeof(broken), id));
+    const uint8_t truncated[] = {'a', 0xe2, 0x9c};
+    assert(!selectMonitorId(truncated, sizeof(truncated), id));
+  }
+  {
+    // Type 19 carries UTF-8 text up to 1 MiB; an empty payload clears the clipboard.
+    std::vector<uint8_t> data;
+    assert(clipboardDataMessage(data, 1, 5, "caf\xc3\xa9"));
+    const uint8_t expected[] = {0, 'N', 'S', 'L', '1', 1, 19, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 5, 'c', 'a', 'f', 0xc3, 0xa9};
+    assert(data == std::vector<uint8_t>(expected, expected + sizeof(expected)));
+    std::string text;
+    assert(clipboardDataText(data.data() + 21, 5, text) && text == "caf\xc3\xa9");
+    assert(clipboardDataMessage(data, 0, 5, "") && data.size() == 20 && u32(data.data() + 16) == 0);
+    assert(clipboardDataText(data.data() + 20, 0, text) && text.empty());
+    const std::string cap(max_clipboard_data_bytes, 'x');
+    assert(max_clipboard_data_bytes == 1048576);
+    assert(clipboardDataMessage(data, 0, 5, cap) && data.size() == 20 + 1048576 && u32(data.data() + 16) == 1048576);
+    assert(clipboardDataText(data.data() + 20, cap.size(), text) && text == cap);
+    assert(!clipboardDataMessage(data, 0, 5, cap + "x"));
+    assert(!clipboardDataText(reinterpret_cast<const uint8_t*>(cap.data()), cap.size() + 1, text));
+    // A 2-byte character that ends exactly at the cap fits; the invalid sequences are refused in both directions.
+    std::string edge(max_clipboard_data_bytes - 2, 'x'); edge += "\xc3\xa9";
+    assert(clipboardDataMessage(data, 0, 5, edge));
+    assert(!clipboardDataMessage(data, 0, 5, "\xff") && !clipboardDataMessage(data, 0, 5, "\xed\xa0\x80"));
+    const uint8_t overlong[] = {0xc0, 0xaf};
+    assert(!clipboardDataText(overlong, sizeof(overlong), text));
+    // NUL is valid UTF-8 for SL1 even though the desktop clipboard refuses it.
+    const uint8_t nul[] = {'a', 0, 'b'};
+    assert(clipboardDataText(nul, sizeof(nul), text) && text.size() == 3 && validUtf8(text) && !validText(text));
+  }
+  {
+    // The receive limit follows the message type once the type byte has arrived.
+    std::vector<uint8_t> got(5, 0);
+    assert(maxViewerMessage(got) == 36);
+    got.assign(6, 0); got[5] = 3; assert(maxViewerMessage(got) == 36);
+    got[5] = 2; assert(maxViewerMessage(got) == 36);
+    got[5] = 18; assert(maxViewerMessage(got) == 20 + 256);
+    got[5] = 19; assert(maxViewerMessage(got) == 20 + 1048576);
+  }
+  {
+    // Text a viewer wrote is not sent back when the desktop reports it; any other text is.
+    EchoGuard echo;
+    assert(echo.shouldSend("x"));
+    echo.applied("from viewer");
+    assert(!echo.shouldSend("from viewer") && !echo.shouldSend("from viewer"));
+    assert(echo.shouldSend("typed on the desktop") && echo.shouldSend("from viewer"));
+    echo.applied("failed write");
+    echo.reset();
+    assert(echo.shouldSend("failed write"));
+  }
+  {
+    // SL1 clipboard requests carry their origin back to the engine and never reach an HTTP client.
+    struct Fake final : ClipboardBackend {
+      std::string text = "desktop";
+      bool accept = true;
+      std::optional<std::string> read() override { return text; }
+      bool write(const std::string& value) override { if (accept) text = value; return accept; }
+    };
+    auto backend = std::make_unique<Fake>();
+    Fake* fake = backend.get();
+    std::mutex mutex;
+    std::condition_variable woke;
+    size_t wakes = 0;
+    ClipboardWorker worker;
+    assert(!worker.submitApply("x") && !worker.submitObserve());
+    worker.start(std::move(backend), [&] { std::lock_guard<std::mutex> lock(mutex); ++wakes; woke.notify_all(); });
+    assert(worker.submitApply("from viewer") && worker.submitObserve() && worker.submitObserve());
+    { std::unique_lock<std::mutex> lock(mutex); woke.wait(lock, [&] { return wakes >= 2; }); }
+    const auto replies = worker.take();
+    assert(replies.size() == 2);
+    assert(replies[0].origin == ClipboardWorker::Origin::apply && replies[0].ok && !replies[0].text && !replies[0].client);
+    assert(replies[1].origin == ClipboardWorker::Origin::observe && replies[1].ok && replies[1].text == "from viewer");
+    // forget() of an HTTP client leaves engine requests alone.
+    worker.forget(reinterpret_cast<lws*>(1));
+    worker.stop();
+    (void)fake;
+  }
+  {
+    const auto& backend = defaultBackend();
+    assert(backend.monitors && backend.selectMonitor);
+    const auto monitors = backend.monitors();
+    if (!monitors.empty()) {
+      assert(std::count_if(monitors.begin(), monitors.end(), [](const MonitorInfo& m) { return m.active; }) == 1);
+      for (const auto& m : monitors) assert(!m.id.empty() && validUtf8(m.id) && validUtf8(m.name));
+    }
+    assert(!backend.selectMonitor("no such display"));
   }
   {
     struct Fake final : ClipboardBackend {
