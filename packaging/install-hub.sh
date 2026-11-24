@@ -12,13 +12,14 @@ version=
 user=
 password=
 port=17920
+mode=relay
 generated=
 
 die() { echo "install-hub: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --version|--user|--password|--port|--repo)
+        --version|--user|--password|--port|--repo|--mode)
             [ $# -ge 2 ] || die "$1 needs a value"
             case $1 in
                 --version) version=${2#v} ;;
@@ -26,14 +27,17 @@ while [ $# -gt 0 ]; do
                 --password) password=$2 ;;
                 --port) port=$2 ;;
                 --repo) repo=$2 ;;
+                --mode) mode=$2 ;;
             esac
             shift 2 ;;
         -h|--help)
-            echo 'Usage: sudo sh install-hub.sh [--version VER] [--user NAME] [--password PASS] [--port PORT] [--repo OWNER/REPO]'
+            echo 'Usage: sudo sh install-hub.sh [--version VER] [--user NAME] [--password PASS] [--port PORT] [--repo OWNER/REPO] [--mode relay|signaling-only]'
             exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
+
+case $mode in relay|signaling-only) ;; *) die "--mode must be relay or signaling-only" ;; esac
 
 [ "$(id -u)" -eq 0 ] || die 'run as root (use sudo)'
 [ "$(uname -s)" = Linux ] || die 'Linux only'
@@ -113,7 +117,7 @@ After=network-online.target
 
 [Service]
 EnvironmentFile=/etc/skylatch/hub.env
-ExecStart=/usr/local/bin/skylatch-hub --listen 127.0.0.1:$port --state-file /var/lib/skylatch/state.json
+ExecStart=/usr/local/bin/skylatch-hub --listen 127.0.0.1:$port --state-file /var/lib/skylatch/state.json --mode $mode
 Restart=on-failure
 RestartSec=5s
 User=skylatch-hub

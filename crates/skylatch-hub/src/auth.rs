@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::registry::HostCommand;
+use crate::registry::{unix_now, HostCommand};
 
 const PAIRING_LIFETIME: Duration = Duration::from_secs(600);
 const ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
@@ -30,6 +30,8 @@ pub(crate) enum AuthError {
     Invalid,
     Conflict,
     NotFound,
+    Offline,
+    Online,
     Limited,
     Storage(io::Error),
 }
@@ -47,6 +49,9 @@ struct Credentials {
     /// Per-account workspace layouts. Absent in state files written by older hubs.
     #[serde(default)]
     layouts: HashMap<String, WorkspaceLayout>,
+    /// Last known host records by account and device. Absent in state files written by older hubs.
+    #[serde(default)]
+    known_devices: BTreeMap<String, BTreeMap<String, DeviceInfo>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -154,6 +159,14 @@ impl Auth {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
+        }
+        for device in credentials
+            .known_devices
+            .values_mut()
+            .flat_map(|d| d.values_mut())
+        {
+            device.online = false;
+            device.direct_endpoints.clear();
         }
         for (username, password) in users {
             if username.trim().is_empty()
@@ -391,6 +404,95 @@ impl Auth {
         Ok((account, id, cancel))
     }
 
+    fn persist_known(&self, data: &mut Data, account: &str, device: DeviceInfo) {
+        data.credentials
+            .known_devices
+            .entry(account.into())
+            .or_default()
+            .insert(device.device_id.clone(), device);
+        if let Err(error) = write(self.path.as_deref(), &data.credentials) {
+            tracing::error!(%error, "failed to persist device snapshot");
+        }
+    }
+
+    /// Records a connected host's current description as its last known state.
+    pub(crate) fn remember_online(&self, registry: &Registry, account: &str, device_id: &str) {
+        let mut data = self.lock();
+        if let Some(device) = registry.info(account, device_id) {
+            self.persist_known(&mut data, account, device);
+        }
+    }
+
+    /// Ends a host connection but keeps the device listed as offline.
+    pub(crate) fn host_disconnected(
+        &self,
+        registry: &Registry,
+        account: &str,
+        device_id: &str,
+        conn_id: u64,
+    ) {
+        let mut data = self.lock();
+        if let Some(mut device) = registry.unregister(account, device_id, conn_id) {
+            device.online = false;
+            device.direct_endpoints.clear();
+            device.last_seen_unix = Some(unix_now());
+            self.persist_known(&mut data, account, device);
+        }
+    }
+
+    pub(crate) fn is_known(&self, account: &str, device_id: &str) -> bool {
+        self.lock()
+            .credentials
+            .known_devices
+            .get(account)
+            .is_some_and(|d| d.contains_key(device_id))
+    }
+
+    /// Every device of `account`: connected ones first-hand, the rest as offline snapshots.
+    pub(crate) fn devices(&self, registry: &Registry, account: &str) -> Vec<DeviceInfo> {
+        let mut out = registry.list(account);
+        let online: Vec<String> = out.iter().map(|d| d.device_id.clone()).collect();
+        if let Some(known) = self.lock().credentials.known_devices.get(account) {
+            out.extend(
+                known
+                    .iter()
+                    .filter(|(id, _)| !online.contains(id))
+                    .map(|(_, d)| d.clone()),
+            );
+        }
+        out.sort_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.device_id.cmp(&b.device_id))
+        });
+        out
+    }
+
+    pub(crate) fn delete_offline(
+        &self,
+        registry: &Registry,
+        account: &str,
+        device_id: &str,
+    ) -> Result<(), AuthError> {
+        let mut data = self.lock();
+        if registry.info(account, device_id).is_some() {
+            return Err(AuthError::Online);
+        }
+        let mut updated = data.credentials.clone();
+        if updated
+            .known_devices
+            .get_mut(account)
+            .and_then(|d| d.remove(device_id))
+            .is_none()
+        {
+            return Err(AuthError::NotFound);
+        }
+        write(self.path.as_deref(), &updated)?;
+        data.credentials = updated;
+        Ok(())
+    }
+
     pub(crate) fn layout(&self, account: &str) -> WorkspaceLayout {
         self.lock()
             .credentials
@@ -428,6 +530,9 @@ impl Auth {
             .is_none()
         {
             return Err(AuthError::NotFound);
+        }
+        if let Some(known) = updated.known_devices.get_mut(account) {
+            known.remove(device_id);
         }
         write(self.path.as_deref(), &updated)?;
         data.credentials = updated;

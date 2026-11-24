@@ -11,6 +11,6 @@ pub mod gate;
 pub mod registry;
 pub mod server;
 
-pub use config::HubConfig;
+pub use config::{HubConfig, HubMode};
 pub use registry::Registry;
 pub use server::{router, AppState};

@@ -131,10 +131,11 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 | `POST /api/v1/enroll` | pairing code or username and password | Enroll a host and return its device token |
 | `DELETE /api/v1/devices/:id/token` | account Bearer token | Revoke the specified device token |
 | `POST /api/v1/direct-sessions` | account Bearer token | Get a short-lived direct-stream ticket for a connected host |
-| `GET /healthz` | none | Liveness: `{"status":"ok","version":"…"}` |
+| `DELETE /api/v1/devices/:id` | account Bearer token | Forget an offline device snapshot (`409` while it is online) |
+| `GET /healthz` | none | Liveness: `{"status":"ok","version":"…","mode":"relay"}` |
 | `GET /api/v1/layout` | account Bearer token | The account's saved `WorkspaceLayout` (empty default if none) |
 | `PUT /api/v1/layout` | account Bearer token | Replace the account's `WorkspaceLayout` |
-| `GET /api/v1/devices` | `Authorization: Bearer <token>` | `{"devices":[DeviceInfo…]}` for the token's account |
+| `GET /api/v1/devices` | `Authorization: Bearer <token>` | `{"devices":[DeviceInfo…]}` for the token's account, online first. Disconnected hosts stay listed with `online:false`, empty `direct_endpoints` and `last_seen_unix`; `?online_only=true` hides them. Hubs started with `--mode signaling-only` (`SKYLATCH_HUB_MODE`) answer `connect_device` with `direct_hint` and `relay_disabled` instead of relaying; connecting to an offline device returns `device_offline` |
 | `GET /ws/host` | first message | Host registration socket |
 | `GET /ws/client` | first message | Client session socket |
 

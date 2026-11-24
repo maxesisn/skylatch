@@ -100,12 +100,14 @@ impl Registry {
     fn insert_host(
         &self,
         account: &str,
-        info: DeviceInfo,
+        mut info: DeviceInfo,
         tx: mpsc::Sender<HostCommand>,
         cancel: Option<oneshot::Sender<()>>,
         enrolled: bool,
     ) -> u64 {
         let conn_id = self.next_id();
+        info.online = true;
+        info.last_seen_unix = Some(unix_now());
         let key = (account.to_string(), info.device_id.clone());
         let old = self.lock().insert(
             key,
@@ -163,14 +165,24 @@ impl Registry {
     }
 
     /// Removes the device if `conn_id` is still its current connection.
-    pub fn unregister(&self, account: &str, device_id: &str, conn_id: u64) {
+    pub fn unregister(&self, account: &str, device_id: &str, conn_id: u64) -> Option<DeviceInfo> {
         let key = (account.to_string(), device_id.to_string());
         let mut map = self.lock();
         if map.get(&key).is_some_and(|d| d.conn_id == conn_id) {
-            if let Some(session) = map.remove(&key).and_then(|d| d.session) {
-                notify_closed(&session, "host_disconnected");
+            let device = map.remove(&key)?;
+            if let Some(session) = &device.session {
+                notify_closed(session, "host_disconnected");
             }
+            return Some(device.info);
         }
+        None
+    }
+
+    /// The live record of a connected device.
+    pub fn info(&self, account: &str, device_id: &str) -> Option<DeviceInfo> {
+        self.lock()
+            .get(&(account.to_string(), device_id.to_string()))
+            .map(|d| d.info.clone())
     }
 
     pub fn touch(&self, account: &str, device_id: &str, conn_id: u64) {
@@ -204,11 +216,12 @@ impl Registry {
         {
             if d.conn_id == conn_id {
                 d.info.direct_endpoints = endpoints;
+                d.info.last_seen_unix = Some(unix_now());
             }
         }
     }
 
-    /// Devices of `account`, sorted by id.
+    /// Connected devices of `account`, sorted by id.
     pub fn list(&self, account: &str) -> Vec<DeviceInfo> {
         let mut out: Vec<DeviceInfo> = self
             .lock()
@@ -366,6 +379,12 @@ impl Registry {
     }
 }
 
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 fn notify_closed(session: &Session, reason: &str) {
     let _ = session
         .to_client
@@ -393,6 +412,8 @@ mod tests {
             room: None,
             slot: None,
             hardware_model: None,
+            online: true,
+            last_seen_unix: None,
         }
     }
 
@@ -429,9 +450,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let old = reg.register("a", info("d"), tx.clone());
         let new = reg.register("a", info("d"), tx);
-        reg.unregister("a", "d", old);
         assert_eq!(reg.list("a").len(), 1);
-        reg.unregister("a", "d", new);
+        assert!(reg.unregister("a", "d", old).is_none());
+        assert!(reg.unregister("a", "d", new).is_some());
         assert!(reg.list("a").is_empty());
     }
 

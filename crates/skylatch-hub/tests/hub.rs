@@ -108,6 +108,8 @@ fn device(id: &str) -> DeviceInfo {
         room: Some("Office".into()),
         slot: Some(3),
         hardware_model: None,
+        online: true,
+        last_seen_unix: None,
     }
 }
 
@@ -138,7 +140,7 @@ async fn healthz_and_auth() {
 }
 
 #[tokio::test]
-async fn host_registration_is_listed_and_removed() {
+async fn host_registration_is_listed_and_marked_offline() {
     let addr = start().await;
     let mut host = register_host(addr, "tok-a", "box-1").await;
     let reply: HubToHost = recv_json(&mut host).await;
@@ -174,7 +176,9 @@ async fn host_registration_is_listed_and_removed() {
     let (status, body) = http_get(addr, "/api/v1/devices", Some("tok-a")).await;
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let devices: Vec<DeviceInfo> = serde_json::from_value(v["devices"].clone()).unwrap();
+    let mut devices: Vec<DeviceInfo> = serde_json::from_value(v["devices"].clone()).unwrap();
+    assert!(devices[0].last_seen_unix.is_some());
+    devices[0].last_seen_unix = None;
     let mut expected = device("box-1");
     expected.direct_endpoints = vec![endpoint];
     assert_eq!(devices, [expected]);
@@ -186,12 +190,15 @@ async fn host_registration_is_listed_and_removed() {
     drop(host);
     for _ in 0..50 {
         let (_, body) = http_get(addr, "/api/v1/devices", Some("tok-a")).await;
-        if body.contains("\"devices\":[]") {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if v["devices"][0]["online"] == false {
+            assert_eq!(v["devices"][0]["device_id"], "box-1");
+            assert_eq!(v["devices"][0]["direct_endpoints"], serde_json::json!([]));
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("device was not removed after disconnect");
+    panic!("device was not marked offline after disconnect");
 }
 
 #[tokio::test]
@@ -228,7 +235,11 @@ async fn client_lists_connects_and_relays_both_ways() {
     );
     send_json(&mut client, &ClientToHub::ListDevices).await;
     match recv_json::<HubToClient>(&mut client).await {
-        HubToClient::Devices { devices } => assert_eq!(devices, [device("box-1")]),
+        HubToClient::Devices { mut devices } => {
+            assert!(devices[0].last_seen_unix.is_some());
+            devices[0].last_seen_unix = None;
+            assert_eq!(devices, [device("box-1")]);
+        }
         other => panic!("unexpected {other:?}"),
     }
 

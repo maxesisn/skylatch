@@ -96,6 +96,8 @@ fn device(endpoints: Vec<DirectEndpoint>) -> DeviceInfo {
         room: None,
         slot: None,
         hardware_model: None,
+        online: true,
+        last_seen_unix: None,
     }
 }
 
@@ -279,10 +281,10 @@ async fn discovers_registered_devices_and_rejects_bad_auth() {
     let info = device(vec![endpoint(7001)]);
     let _host = register(&hub, info.clone()).await;
     let url = hub.url.replacen("ws://", "http://", 1);
-    assert_eq!(
-        deadline(list_devices(&url, HUB_TOKEN)).await.unwrap(),
-        vec![info]
-    );
+    let mut listed = deadline(list_devices(&url, HUB_TOKEN)).await.unwrap();
+    assert!(listed[0].last_seen_unix.is_some());
+    listed[0].last_seen_unix = None;
+    assert_eq!(listed, vec![info]);
     assert!(
         matches!(deadline(list_devices(&hub.url, "not-the-test-token")).await,
         Err(ClientError::Hub { code, .. }) if code == "unauthorized")
@@ -639,9 +641,10 @@ async fn hub_c_abi_discovery_connect_send_and_destroy() {
             CStr::from_ptr(error.as_ptr()).to_string_lossy()
         );
         assert_eq!(error[0], 0);
-        let devices =
+        let mut devices =
             serde_json::from_slice::<Vec<DeviceInfo>>(CStr::from_ptr(json).to_bytes()).unwrap();
         skylatch_free_string(json);
+        devices[0].last_seen_unix = None;
         assert_eq!(devices, vec![info]);
         assert!(skylatch_list_devices_json(
             url.as_ptr(),

@@ -2,10 +2,10 @@
 
 use crate::api;
 use crate::auth::{Auth, AuthError};
-use crate::config::HubConfig;
+use crate::config::{HubConfig, HubMode};
 use crate::registry::{ClientOut, HostCommand, OpenError, Registry, CLIENT_QUEUE, HOST_QUEUE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -60,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/pairing-codes", post(api::create_code))
         .route("/api/v1/enroll", post(api::enroll))
         .route("/api/v1/devices/{device_id}/token", delete(api::revoke))
+        .route("/api/v1/devices/{device_id}", delete(api::delete_device))
         .route("/api/v1/direct-sessions", post(api::direct_session))
         .route(
             "/api/v1/layout",
@@ -78,13 +79,21 @@ pub fn router(state: AppState) -> Router {
 struct Health {
     status: &'static str,
     version: &'static str,
+    mode: &'static str,
 }
 
-async fn healthz() -> Json<Health> {
+async fn healthz(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        mode: state.config.mode.as_str(),
     })
+}
+
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    online_only: bool,
 }
 
 #[derive(Serialize)]
@@ -100,7 +109,11 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_devices(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: HeaderMap,
+) -> Response {
     let Some(account) = bearer(&headers).and_then(|t| state.auth.account(&state.config, t)) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -109,10 +122,11 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
         )
             .into_response();
     };
-    Json(DeviceList {
-        devices: state.registry.list(&account),
-    })
-    .into_response()
+    let mut devices = state.auth.devices(&state.registry, &account);
+    if query.online_only {
+        devices.retain(|d| d.online);
+    }
+    Json(DeviceList { devices }).into_response()
 }
 
 fn text<T: Serialize>(value: &T) -> Message {
@@ -180,6 +194,9 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
                 return;
             }
         };
+    state
+        .auth
+        .remember_online(&state.registry, &account, &device_id);
     tracing::info!(%account, %device_id, "host registered");
     let pump = async {
         let interval = state.config.heartbeat_interval;
@@ -206,6 +223,7 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
                             }
                             Ok(HostToHub::DirectEndpoints { endpoints }) => {
                                 state.registry.set_endpoints(&account, &device_id, conn_id, endpoints);
+                                state.auth.remember_online(&state.registry, &account, &device_id);
                             }
                             Ok(HostToHub::DirectAccess { key }) => {
                                 if is_token(&key) {
@@ -247,7 +265,9 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
         _ = cancelled => {},
         _ = pump => {},
     }
-    state.registry.unregister(&account, &device_id, conn_id);
+    state
+        .auth
+        .host_disconnected(&state.registry, &account, &device_id, conn_id);
     let _ = timeout(
         Duration::from_millis(250),
         socket.send(Message::Close(None)),
@@ -303,12 +323,21 @@ async fn handle_client(state: AppState, mut socket: WebSocket) {
                     Message::Text(t) => {
                         let reply = match serde_json::from_str::<ClientToHub>(t.as_str()) {
                             Ok(ClientToHub::ListDevices) => vec![text(&HubToClient::Devices {
-                                devices: state.registry.list(&account),
+                                devices: state.auth.devices(&state.registry, &account),
                             })],
                             Ok(ClientToHub::ConnectDevice { device_id }) => {
                                 if let Some((dev, sid)) = current.take() {
                                     state.registry.close_session(&account, &dev, &sid, true);
                                 }
+                                let live = state.registry.info(&account, &device_id);
+                                if state.config.mode == HubMode::SignalingOnly && live.is_some() {
+                                    let mut reply = Vec::new();
+                                    if let Some(info) = live.filter(|d| !d.direct_endpoints.is_empty()) {
+                                        reply.push(text(&HubToClient::DirectHint { device_id, endpoints: info.direct_endpoints }));
+                                    }
+                                    reply.push(client_error("relay_disabled", "this hub only brokers direct connections; connect to the device directly"));
+                                    reply
+                                } else {
                                 match state.registry.open_session(&account, &device_id, out_tx.clone()) {
                                     Ok((session_id, endpoints)) => {
                                         current = Some((device_id.clone(), session_id.clone()));
@@ -317,9 +346,13 @@ async fn handle_client(state: AppState, mut socket: WebSocket) {
                                             text(&HubToClient::RelayStream { session_id, device_id }),
                                         ]
                                     }
+                                    Err(OpenError::NotFound) if state.auth.is_known(&account, &device_id) => {
+                                        vec![client_error("device_offline", "device is offline")]
+                                    }
                                     Err(OpenError::NotFound) => vec![client_error("not_found", "no such device")],
                                     Err(OpenError::Busy) => vec![client_error("busy", "device already has a session")],
                                     Err(OpenError::Unavailable) => vec![client_error("unavailable", "device is not reachable")],
+                                }
                                 }
                             }
                             Ok(ClientToHub::Disconnect) => {

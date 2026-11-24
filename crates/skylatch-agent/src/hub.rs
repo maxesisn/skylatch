@@ -90,6 +90,8 @@ pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         slot: cli.slot,
         hardware_model: cli.model.clone().or(hardware.hardware_model),
         direct_endpoints: endpoints,
+        online: true,
+        last_seen_unix: None,
     };
     let engine = Arc::new(Mutex::new(match (&cli.engine_bin, &cli.engine_url) {
         (Some(bin), _) => EngineSource::spawn(bin.clone(), cli.engine_port, cli.engine_args()),

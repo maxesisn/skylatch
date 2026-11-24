@@ -314,7 +314,7 @@ async function act(button, action) {
   finally { button.disabled = false; }
 }
 async function signin(value) {
-  const {devices} = await request('devices', 'GET', undefined, value);
+  const {devices} = await request('devices?online_only=true', 'GET', undefined, value);
   token = value;
   session++;
   draw(devices);
@@ -357,7 +357,7 @@ for (const [button, field] of [['copy', 'command'], ['copy-linux', 'command-linu
 }
 async function refresh() {
   const accountSession = session;
-  const {devices} = await request('devices');
+  const {devices} = await request('devices?online_only=true');
   if (accountSession === session) draw(devices);
 }
 $('refresh').addEventListener('click', () => act($('refresh'), refresh));
