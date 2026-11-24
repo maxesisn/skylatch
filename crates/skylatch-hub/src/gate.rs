@@ -3,7 +3,8 @@
 //! H.264 delta frames depend on their predecessors. When a client cannot keep up the hub must
 //! drop frames, but then every later delta frame is undecodable until the next keyframe. The gate
 //! therefore drops whole runs: after the first dropped frame it discards deltas until a keyframe
-//! arrives, and asks the host for a keyframe. Keyframes and non-video messages wait for room.
+//! arrives, and asks the host for a keyframe. Audio frames stand alone, so a congested client
+//! loses only the packets that do not fit. Keyframes and other messages wait for room.
 
 use skylatch_proto::nsl1::{Header, MessageType};
 
@@ -46,12 +47,15 @@ impl FrameGate {
         if header.total_len() != message.len() {
             return Verdict::Drop;
         }
+        match header.msg_type {
+            MessageType::Frame => {}
+            MessageType::AudioFrame if congested => return Verdict::Drop,
+            MessageType::AudioFrame => return Verdict::Forward,
+            _ => return Verdict::ForwardReliable,
+        }
         if header.is_keyframe() {
             self.waiting_keyframe = false;
             self.dropped_since_request = 0;
-            return Verdict::ForwardReliable;
-        }
-        if header.msg_type != MessageType::Frame {
             return Verdict::ForwardReliable;
         }
         if self.waiting_keyframe {
@@ -139,6 +143,49 @@ mod tests {
         assert_eq!(g.decide(&notice, false), Verdict::ForwardReliable);
         assert_eq!(g.decide(&notice, true), Verdict::ForwardReliable);
         assert!(!g.waiting_keyframe());
+    }
+
+    fn audio(sequence: u32) -> Bytes {
+        Message::AudioFrame {
+            generation: 1,
+            sequence,
+            capture_us: 0,
+            data: Bytes::from_static(&[0xfc]),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn audio_frames_drop_alone_under_congestion() {
+        let mut g = FrameGate::new();
+        let config = Message::AudioConfig {
+            generation: 1,
+            format: skylatch_proto::nsl1::AudioFormat::opus(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(g.decide(&config, true), Verdict::ForwardReliable);
+        assert_eq!(g.decide(&audio(1), false), Verdict::Forward);
+        assert_eq!(g.decide(&audio(2), true), Verdict::Drop);
+        assert!(!g.waiting_keyframe());
+        assert_eq!(g.decide(&frame(1, false), false), Verdict::Forward);
+        assert_eq!(g.decide(&audio(3), false), Verdict::Forward);
+    }
+
+    #[test]
+    fn audio_frames_pass_while_video_waits_for_a_keyframe() {
+        let mut g = FrameGate::new();
+        assert_eq!(
+            g.decide(&frame(1, false), true),
+            Verdict::DropAndRequestKeyframe
+        );
+        for sequence in 1..=REREQUEST_AFTER * 2 {
+            assert_eq!(g.decide(&audio(sequence), false), Verdict::Forward);
+        }
+        assert!(g.waiting_keyframe());
+        assert_eq!(g.decide(&frame(2, false), false), Verdict::Drop);
+        assert_eq!(g.decide(&frame(3, true), false), Verdict::ForwardReliable);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Skylatch uses two planes over WebSocket (and, for the direct path, the same framing over TCP):
 
-- **Data plane** — binary `NSL1` messages: video, ACKs, input, cursor, monitor selection, and bidirectional clipboard data.
+- **Data plane** — binary `NSL1` messages: video, ACKs, input, cursor, monitor selection, bidirectional clipboard data, and Opus audio.
 - **Control plane** — JSON text messages between host/client and the hub.
 
 The WebSocket subprotocol for the data plane is `nsl1`. One WebSocket message carries exactly one
@@ -52,7 +52,9 @@ it once per stream, after the first message from the host, to ask whether the ho
 type 9. A host that does replies on the stream with an input response with sequence 0 and status 0;
 status 2 means it does not. Older hosts ignore the query and close a stream that sends type 9,
 so until the reply arrives the viewer folds precise scrolling into type 6 notches. Viewers that never
-send the query never receive an input response on the stream.
+send the query never receive an input response on the stream. Status 0 also tells the viewer that
+the host understands [audio control](#audio) (Type 22); v0.1 hosts never answer and close a stream
+that sends it.
 
 **Cursor.** At most 256 × 256 pixels, straight-alpha RGBA row by row, hotspot inside the image.
 Eight zero bytes restore the local arrow; a fully transparent image hides the cursor. No ACK.
@@ -106,6 +108,9 @@ invalid JSON.
 | 17 | `MonitorList` | host → viewer | UTF-8 JSON encoding of `MonitorInfo[]`, at most 64 KiB |
 | 18 | `SelectMonitor` | viewer → host | Non-empty UTF-8 monitor ID, at most 256 bytes |
 | 19 | `ClipboardData` | host ↔ viewer | UTF-8 text, at most 1 MiB (1,048,576 bytes) |
+| 20 | `AudioConfig` | host → viewer | UTF-8 JSON `AudioFormat` object, at most 4 KiB (4,096 bytes) |
+| 21 | `AudioFrame` | host → viewer | capture time u64 (µs) and one Opus packet, at most 16 KiB (16,384 bytes) in total |
+| 22 | `AudioControl` | viewer → host | one byte: 0 disables audio, 1 enables it |
 
 `MonitorInfo` is a JSON object with the following required fields (member order is not significant):
 
@@ -127,7 +132,37 @@ sizes. `primary` identifies the host's primary display and `active` indicates th
 display. The `SelectMonitor` payload is the raw UTF-8 bytes of the selected `id`; it
 has no JSON or NUL terminator. `ClipboardData` is the raw UTF-8 text bytes, including an empty
 payload to clear the text clipboard. Type 19 is used in both directions and replaces the HTTP-only
-clipboard transfer for an active session. None of Types 17–19 carries an ACK.
+clipboard transfer for an active session. None of Types 17–22 carries an ACK.
+
+#### Audio
+
+`AudioFrame` is the only SL1 type with a nonzero sequence: it starts at 1 for the first packet of a
+stream and grows by one per packet, so a gap tells the viewer how many packets were lost. Its
+payload is the capture time (the same clock as frame capture times) followed by the raw Opus packet,
+which must not be empty. `AudioFormat` has the required members below; viewers ignore extra members
+and stay silent for a format they cannot decode:
+
+```json
+{"codec": "opus", "sample_rate": 48000, "channels": 2, "frame_ms": 20}
+```
+
+Hosts send 48 kHz stereo Opus (`OPUS_APPLICATION_AUDIO`, 96 kbit/s VBR) in 20 ms packets, captured
+as a loopback of the desktop's default sound output, and capture only while a viewer listens.
+
+Audio is off until the viewer asks for it, so a viewer that never asks receives no Type 20 or 21:
+
+1. A viewer that wants audio waits for the [smooth-wheel query](#message-types) reply with status 0,
+   then sends `AudioControl` 1. It never sends Type 22 to a host that did not reply, so v0.1 hosts
+   keep streaming.
+2. The host answers with `AudioConfig` and then streams `AudioFrame` messages. A host that cannot
+   capture audio (`--no-audio`, no sound device or audio service) sends nothing and keeps video
+   running.
+3. `AudioControl` 0 stops audio; packets already in flight may still arrive. `AudioControl` 1
+   restarts it with a new `AudioConfig`.
+
+The hub forwards `AudioConfig` reliably. Under backpressure it drops `AudioFrame` messages on their
+own: audio loss never interrupts video and never requests a keyframe. Viewers conceal short gaps
+with Opus packet loss concealment and keep at most a short playback buffer.
 
 ## Control plane: JSON over WSS
 
@@ -287,9 +322,9 @@ Hub to host:
 | `request_keyframe` | `session_id` | The hub dropped frames for a slow client; emit a keyframe |
 | `error` | `code`, `message` | Rejection, for example `unauthorized` or `invalid` |
 
-For the active session, the hub relays `NSL1` frames, cursors, monitor lists, and clipboard messages
-from the host, and ACKs, input, monitor selections, and clipboard data from the viewer. Only delta
-video frames may be dropped under backpressure; a stalled peer that cannot accept a reliable message
+For the active session, the hub relays `NSL1` frames, cursors, monitor lists, clipboard messages and
+audio from the host, and ACKs, input, monitor selections, clipboard data and audio control from the
+viewer. Only delta video frames and audio frames may be dropped under backpressure; a stalled peer that cannot accept a reliable message
 within the relay's queue deadline can be disconnected.
 
 ### Client ↔ hub (`/ws/client`)
