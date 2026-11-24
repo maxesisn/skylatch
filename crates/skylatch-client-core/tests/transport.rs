@@ -1005,3 +1005,57 @@ async fn layout_round_trips_through_the_hub() {
     ));
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_requests_do_not_stall_behind_parked_caller_runtime() {
+    use skylatch_client_core::{create_pairing_code, get_layout, put_layout, WorkspaceLayout};
+    let listener = loopback().await;
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let config = HubConfig::new(vec![(ACCOUNT.into(), HUB_TOKEN.into())]);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(AppState::new(config)))
+            .await
+            .unwrap();
+    });
+
+    // Simulate desktop-ui's LiveHandle worker: a current_thread runtime opens a keep-alive
+    // connection via get_layout(), then parks its thread in a blocking wait for 2 seconds.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let url1 = url.clone();
+    let parked = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(get_layout(&url1, HUB_TOKEN)).unwrap();
+        done_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(3));
+    });
+    done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    // Now a second short-lived current_thread runtime saves layout & mints a pairing code.
+    let url2 = url.clone();
+    let elapsed = tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(put_layout(&url2, HUB_TOKEN, &WorkspaceLayout::default()))
+            .unwrap();
+        rt.block_on(create_pairing_code(&url2, HUB_TOKEN)).unwrap();
+        start.elapsed()
+    })
+    .await
+    .unwrap();
+
+    let _ = release_tx.send(());
+    parked.join().unwrap();
+    server.abort();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "HTTP requests stalled behind parked caller runtime: took {elapsed:?}"
+    );
+}
