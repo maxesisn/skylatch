@@ -10,7 +10,12 @@
 use crate::iso::geom::{polygons_overlap, rect_poly, rects_overlap};
 use crate::iso::*;
 use skylatch_proto::control::{DeviceFormFactor, DeviceInfo};
+use skylatch_proto::layout::{FurnitureKind, WorkspaceLayout};
 use std::collections::BTreeMap;
+
+#[path = "scene_layout.rs"]
+mod layout;
+pub use layout::*;
 
 // ───────────────────────────── layout constants ─────────────────────────────
 
@@ -32,7 +37,7 @@ pub const NAME_PAD: f32 = 22.0;
 const NAME_MAX_W: f32 = 140.0;
 
 pub const PANEL_W: f32 = 232.0;
-pub const PANEL_H: f32 = 118.0;
+pub const PANEL_H: f32 = 134.0;
 
 /// Minimum clickable extent of any hit target, in scene units.
 pub const MIN_HIT_W: f32 = 84.0;
@@ -146,13 +151,48 @@ pub struct RackInfo {
     pub devs: Vec<usize>,
 }
 
+/// What a snap slot accepts: the laptop bay of an L-desk, a general desk seat, a rack bay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotKind {
+    Laptop,
+    Seat,
+    Blade,
+}
+
+impl SlotKind {
+    /// Whether a target of this form may stand in a slot of this kind.
+    pub fn accepts(self, form: Form) -> bool {
+        match self {
+            SlotKind::Laptop => form == Form::Laptop,
+            SlotKind::Seat => matches!(form, Form::Monitor | Form::Laptop),
+            SlotKind::Blade => form == Form::Vm,
+        }
+    }
+}
+
+/// One drop target of a piece of furniture, occupied or not. `poly` is the footprint where a
+/// machine of that slot stands (desk surface, or the rack bay), in scene units.
+#[derive(Clone, Debug)]
+pub struct SnapSlot {
+    pub furniture_id: String,
+    pub slot: u32,
+    pub kind: SlotKind,
+    pub poly: Vec<P2>,
+    pub anchor: P2,
+    /// first target of the machine standing here
+    pub occupied_by: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     pub backdrop: Vec<Prim>,
     pub items: Vec<Prim>,
     pub screens: Vec<ScreenGeom>,
     pub labels: Vec<LabelSpec>,
-    pub rack: Option<RackInfo>,
+    /// mini racks with a VM preview panel (a desk's sidecar, a free-standing rack, the VM Rack)
+    pub racks: Vec<RackInfo>,
+    /// every slot of every piece of furniture (layout rooms only)
+    pub snaps: Vec<SnapSlot>,
 }
 
 fn mv(p: &mut P2, dx: f32, dy: f32) {
@@ -193,6 +233,21 @@ impl Scene {
         self.screens.iter().any(|s| s.dev == dev)
     }
 
+    /// The first rack of the scene.
+    #[cfg(test)]
+    pub fn rack(&self) -> Option<&RackInfo> {
+        self.racks.first()
+    }
+
+    fn append(&mut self, o: Scene) {
+        self.backdrop.extend(o.backdrop);
+        self.items.extend(o.items);
+        self.screens.extend(o.screens);
+        self.labels.extend(o.labels);
+        self.racks.extend(o.racks);
+        self.snaps.extend(o.snaps);
+    }
+
     fn shift(&mut self, dx: f32, dy: f32) {
         for pr in self.backdrop.iter_mut().chain(self.items.iter_mut()) {
             pr.pts.iter_mut().for_each(|p| mv(p, dx, dy));
@@ -205,9 +260,13 @@ impl Scene {
         for l in &mut self.labels {
             mv(&mut l.anchor, dx, dy);
         }
-        if let Some(r) = &mut self.rack {
+        for r in &mut self.racks {
             r.bbox.x += dx;
             r.bbox.y += dy;
+        }
+        for sn in &mut self.snaps {
+            sn.poly.iter_mut().for_each(|p| mv(p, dx, dy));
+            mv(&mut sn.anchor, dx, dy);
         }
     }
 }
@@ -264,6 +323,10 @@ pub struct Machine {
     pub screens: Vec<Screen>,
     pub link: Link,
     pub capture: String,
+    /// vendor / model string reported by the agent (`Mac mini (Apple M4)`)
+    pub hardware_model: Option<String>,
+    /// this machine is the one the launcher runs on
+    pub is_local: bool,
 }
 
 impl Machine {
@@ -279,10 +342,17 @@ pub struct Device {
     pub key: String,
     /// hub device ID (what the native client is asked to connect to)
     pub machine_id: String,
+    /// machine name (the footer headline)
     pub title: String,
-    /// always-visible scene label
+    /// which screen of a multi-screen machine (`屏 2`), empty otherwise
+    pub part: String,
+    /// always-visible scene label: the machine name, cut to fit
     pub label: String,
+    /// resolution class shown beside the name (`5K`, `2K 竖`), empty for laptops and VMs
+    pub tag: String,
+    /// screen chip text (`屏 1`) and its secondary text (`5K`)
     pub chip: String,
+    pub chip_tag: String,
     pub os: String,
     /// native pixel size (drives the true-aspect on-scene screen)
     pub rw: u32,
@@ -294,6 +364,19 @@ pub struct Device {
     pub content: Content,
     /// the host is a mini PC (drawn with a small box next to the keyboard)
     pub mini: bool,
+    pub hardware_model: Option<String>,
+    pub is_local: bool,
+}
+
+impl Device {
+    /// Machine name plus screen number, for messages (`Studio-PC 屏 2`).
+    pub fn full_title(&self) -> String {
+        if self.part.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{} {}", self.title, self.part)
+        }
+    }
 }
 
 pub fn link_text(l: Link) -> String {
@@ -301,7 +384,7 @@ pub fn link_text(l: Link) -> String {
     match l {
         Link::Direct(v) => format!("直连{}", ms(v)),
         Link::Relay(v) => format!("中继{}", ms(v)),
-        Link::Standby(Some(v)) => format!("待机 · 中继 {v}ms"),
+        Link::Standby(Some(v)) => format!("待机（中继 {v}ms）"),
         Link::Standby(None) => "待机".to_string(),
         Link::Offline => "离线".to_string(),
     }
@@ -396,22 +479,39 @@ pub fn res_tag(w: u32, h: u32, laptop: bool) -> String {
     }
 }
 
-/// `name` + `suffix` within the label width: a long name is cut with an ellipsis, the
-/// suffix (resolution tag) always survives.
-fn fit_label(name: &str, suffix: &str) -> String {
-    let fits = |s: &str| text_w(s, NAME_SIZE, false) + NAME_PAD <= NAME_MAX_W;
-    if fits(&format!("{name}{suffix}")) {
-        return format!("{name}{suffix}");
+/// Label name-row sizes: the resolution tag and the `本机` chip sit beside the name.
+pub const TAG_SIZE: f32 = 9.5;
+pub const TAG_GAP: f32 = 5.0;
+pub const LOCAL_CHIP_W: f32 = 29.0;
+
+/// Width of a label's name row: dot, name, optional tag and optional `本机` chip.
+pub fn label_width(name: &str, tag: &str, local: bool) -> f32 {
+    let mut w = text_w(name, NAME_SIZE, false) + NAME_PAD;
+    if !tag.is_empty() {
+        w += TAG_GAP + text_w(tag, TAG_SIZE, false);
+    }
+    if local {
+        w += TAG_GAP + LOCAL_CHIP_W;
+    }
+    w
+}
+
+/// `name` within the label width next to `tag` and the `本机` chip: a long name is cut with an
+/// ellipsis, the tag always survives.
+fn fit_label(name: &str, tag: &str, local: bool) -> String {
+    let fits = |s: &str| label_width(s, tag, local) <= NAME_MAX_W;
+    if fits(name) {
+        return name.to_string();
     }
     let mut out = String::new();
     for c in name.chars() {
-        let next = format!("{out}{c}…{suffix}");
+        let next = format!("{out}{c}…");
         if !fits(&next) {
             break;
         }
         out.push(c);
     }
-    format!("{out}…{suffix}")
+    format!("{out}…")
 }
 
 fn vm_content(m: &Machine) -> Content {
@@ -457,32 +557,38 @@ fn make_devices(m: &Machine, out: &mut Vec<Device>) -> Vec<usize> {
     let mut idx = Vec::new();
     for (i, s) in all.iter().take(n).enumerate() {
         let tag = res_tag(s.w, s.h, laptop) + if s.h > s.w { " 竖" } else { "" };
-        let (title, label, chip) = if vm {
+        let local = m.is_local;
+        let (part, label_tag, chip, chip_tag) = if vm {
             let first = m.capture.split_whitespace().next().unwrap_or("虚拟");
             (
-                m.name.clone(),
-                fit_label(&m.name, ""),
-                format!("虚拟屏 · {first}"),
+                String::new(),
+                String::new(),
+                "虚拟屏".to_string(),
+                first.to_string(),
             )
         } else if laptop {
             (
-                m.name.clone(),
-                fit_label(&m.name, ""),
-                format!("屏 {} · {tag}", i + 1),
+                String::new(),
+                String::new(),
+                format!("屏 {}", i + 1),
+                tag.clone(),
             )
         } else if multi {
             (
-                format!("{} · 屏 {} ({tag})", m.name, i + 1),
-                fit_label(&m.name, &format!(" · {tag}")),
-                format!("屏 {} · {tag}", i + 1),
+                format!("屏 {}", i + 1),
+                tag.clone(),
+                format!("屏 {}", i + 1),
+                tag.clone(),
             )
         } else {
             (
-                format!("{} · {tag}", m.name),
-                fit_label(&m.name, &format!(" · {tag}")),
-                format!("屏 {} · {tag}", i + 1),
+                String::new(),
+                tag.clone(),
+                format!("屏 {}", i + 1),
+                tag.clone(),
             )
         };
+        let (title, label) = (m.name.clone(), fit_label(&m.name, &label_tag, local));
         let res = match s.hz {
             Some(hz) => format!("{}×{} @ {hz}", s.w, s.h),
             None => format!("{}×{}", s.w, s.h),
@@ -503,8 +609,11 @@ fn make_devices(m: &Machine, out: &mut Vec<Device>) -> Vec<usize> {
             key: format!("{}#{}", m.id, s.id),
             machine_id: m.id.clone(),
             title,
+            part,
             label,
+            tag: label_tag,
             chip,
+            chip_tag,
             os: m.os.clone(),
             rw: s.w.max(1),
             rh: s.h.max(1),
@@ -520,6 +629,8 @@ fn make_devices(m: &Machine, out: &mut Vec<Device>) -> Vec<usize> {
             },
             content,
             mini: m.kind == DeviceFormFactor::Mini,
+            hardware_model: m.hardware_model.clone(),
+            is_local: m.is_local,
         });
     }
     idx
@@ -547,7 +658,11 @@ fn capture_name(os: &str) -> &'static str {
 
 /// Maps hub device records to scene machines. `prefer_direct` decides whether an advertised
 /// direct endpoint is shown as a direct route.
-pub fn machines_from_devices(devs: &[DeviceInfo], prefer_direct: bool) -> Vec<Machine> {
+pub fn machines_from_devices(
+    devs: &[DeviceInfo],
+    prefer_direct: bool,
+    local_id: Option<&str>,
+) -> Vec<Machine> {
     devs.iter()
         .map(|d| {
             let room = d
@@ -601,6 +716,13 @@ pub fn machines_from_devices(devs: &[DeviceInfo], prefer_direct: bool) -> Vec<Ma
                     Link::Relay(None)
                 },
                 capture: capture_name(&d.os).to_string(),
+                hardware_model: d
+                    .hardware_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(String::from),
+                is_local: local_id.is_some_and(|id| id == d.device_id),
             }
         })
         .collect()
@@ -613,7 +735,7 @@ pub fn build_scene_from_devices(devs: &[DeviceInfo]) -> Scenes {
 }
 
 pub fn build_scene_from_devices_with(devs: &[DeviceInfo], prefer_direct: bool) -> Scenes {
-    build_scene(&machines_from_devices(devs, prefer_direct))
+    build_scene(&machines_from_devices(devs, prefer_direct, None))
 }
 
 /// The built-in interactive demo fleet shown when no hub is configured.
@@ -642,12 +764,14 @@ pub fn demo_machines() -> Vec<Machine> {
                 screens,
                 link,
                 capture: capture.into(),
+                hardware_model: None,
+                is_local: false,
             }
         };
     use DeviceFormFactor::*;
     let office = "办公室工位";
     let home = "家里书房";
-    vec![
+    let mut fleet = vec![
         m(
             "demo-thinkpad",
             "ThinkPad-X1",
@@ -668,7 +792,7 @@ pub fn demo_machines() -> Vec<Machine> {
             1,
             vec![scr("display-1", 5120, 2880), scr("display-2", 1440, 2560)],
             Link::Direct(Some(1)),
-            "DXGI · NVENC",
+            "DXGI / NVENC",
         ),
         m(
             "demo-mac-mini",
@@ -736,7 +860,17 @@ pub fn demo_machines() -> Vec<Machine> {
             Link::Offline,
             "X11",
         ),
-    ]
+    ];
+    for (id, model) in [
+        ("demo-thinkpad", "ThinkPad X1 Carbon Gen 12"),
+        ("demo-mac-mini", "Mac mini (Apple M4)"),
+        ("demo-macbook", "MacBook Air (Apple M4)"),
+    ] {
+        if let Some(m) = fleet.iter_mut().find(|m| m.id == id) {
+            m.hardware_model = Some(model.into());
+        }
+    }
+    fleet
 }
 
 // ───────────────────────────── builder ─────────────────────────────
@@ -1526,8 +1660,8 @@ struct RackSpec {
     floor: f32,
     k: f32,
     tick: f32,
-    /// (device, height in rack units) top to bottom
-    blades: Vec<(usize, f32)>,
+    /// (device or an empty bay, height in rack units) top to bottom
+    blades: Vec<(Option<usize>, f32)>,
 }
 
 impl RackSpec {
@@ -1537,10 +1671,10 @@ impl RackSpec {
 }
 
 /// The topmost blade is a 2U server, the rest are 1U.
-fn blade_units(devs: &[usize]) -> Vec<(usize, f32)> {
+fn blade_units(devs: &[usize]) -> Vec<(Option<usize>, f32)> {
     devs.iter()
         .enumerate()
-        .map(|(i, &d)| (d, if i == 0 { 38.0 } else { 24.0 }))
+        .map(|(i, &d)| (Some(d), if i == 0 { 38.0 } else { 24.0 }))
         .collect()
 }
 
@@ -1660,15 +1794,32 @@ fn blade(
     });
 }
 
+/// A bay without a machine: just the rack ears and the opening, drawn faintly.
+fn empty_bay(b: &mut Builder, r: &RackSpec, h0: f32, h1: f32) {
+    let k = r.k;
+    let (w, d) = r.extent();
+    let front = Quad3::new(
+        p3(r.u0, r.v0 + d, h0),
+        p3(w, 0.0, 0.0),
+        p3(0.0, 0.0, h1 - h0),
+    );
+    let bh = h1 - h0;
+    b.rect_in(&front, 0.0, 0.0, w, bh, None, Some(FINE));
+    for x in [7.0 * k, w - 7.0 * k] {
+        b.line_in(&front, &[(x, 0.0), (x, bh)], FINE);
+    }
+}
+
 /// Isometric monochrome mini rack: a base plate, a 1U switch and individually clickable VM
-/// blades, topped by a plate. Returns the rack's screen-space bounds.
+/// blades, topped by a plate. Returns the rack's screen-space bounds and the footprint and
+/// middle of every bay (machine or empty), top to bottom.
 fn rack(
     b: &mut Builder,
     sc: &mut Vec<ScreenGeom>,
     lb: &mut Vec<LabelSpec>,
     devs: &[Device],
     r: &RackSpec,
-) -> Rect2 {
+) -> (Rect2, Vec<(Vec<P2>, P2)>) {
     let k = r.k;
     let first = b.prims.len();
     let (w, d) = r.extent();
@@ -1698,11 +1849,32 @@ fn rack(
     b.line_in(&front, &[(w - 7.0 * k, 0.0), (w - 7.0 * k, sh)], FINE);
     h += sh + gap;
     // blades, bottom to top
+    let mut bays = Vec::new();
     for &(dev, units) in r.blades.iter().rev() {
         let bh = units * k;
-        blade(b, sc, lb, devs, r, dev, h, h + bh);
+        match dev {
+            Some(dev) => blade(b, sc, lb, devs, r, dev, h, h + bh),
+            None => empty_bay(b, r, h, h + bh),
+        }
+        // front and side faces: stacked bays never share area; the anchor is the middle of
+        // the front face
+        bays.push((
+            [
+                p3(u0, v1, h),
+                p3(u1, v1, h),
+                p3(u1, v0, h),
+                p3(u1, v0, h + bh),
+                p3(u1, v1, h + bh),
+                p3(u0, v1, h + bh),
+            ]
+            .iter()
+            .map(|&p| project(p))
+            .collect(),
+            project(p3((u0 + u1) * 0.5, v1, h + bh * 0.5)),
+        ));
         h += bh + gap;
     }
+    bays.reverse();
     // top plate
     b.cuboid(
         u0 - 3.0 * k,
@@ -1712,7 +1884,8 @@ fn rack(
         h,
         h + 6.0 * k,
     );
-    Rect2::of_points(b.prims[first..].iter().flat_map(|p| p.pts.iter())).unwrap()
+    let bbox = Rect2::of_points(b.prims[first..].iter().flat_map(|p| p.pts.iter())).unwrap();
+    (bbox, bays)
 }
 
 // ───────────────────────────── desk scenes ─────────────────────────────
@@ -1880,8 +2053,8 @@ fn build_room(devs: &[Device], plan: &RoomPlan) -> (Scene, Vec<usize>) {
     add_screen_labels(&mut s, &lifts);
     // mini rack beside the right wing
     if let Some(r) = &rack_spec {
-        let bbox = rack(&mut b, &mut s.screens, &mut s.labels, devs, r);
-        s.rack = Some(RackInfo {
+        let (bbox, _) = rack(&mut b, &mut s.screens, &mut s.labels, devs, r);
+        s.racks.push(RackInfo {
             bbox,
             panel: PanelSide::Above,
             devs: plan.rack.clone(),
@@ -1969,8 +2142,8 @@ fn build_hero(devs: &[Device], blades: &[usize]) -> (Scene, Vec<usize>) {
     s.backdrop = std::mem::take(&mut bd.prims);
 
     let mut b = Builder::new();
-    let bbox = rack(&mut b, &mut s.screens, &mut s.labels, devs, &hero);
-    s.rack = Some(RackInfo {
+    let (bbox, _) = rack(&mut b, &mut s.screens, &mut s.labels, devs, &hero);
+    s.racks.push(RackInfo {
         bbox,
         panel: PanelSide::Left,
         devs: blades.to_vec(),
@@ -2328,12 +2501,24 @@ pub enum DeskKind {
     VmRack,
 }
 
+/// Summary of one piece of furniture of a layout room, as drawn.
+#[derive(Clone, Debug)]
+pub struct FurnitureInfo {
+    pub id: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub kind: FurnitureKind,
+    /// world footprint `(u0, v0, u1, v1)` after clearing overlaps
+    pub rect: (f32, f32, f32, f32),
+    pub slots: u32,
+    pub empty: u32,
+}
+
 /// One tab: a room's desk (plus sidecar rack) or the VM Rack, and the matching shelf.
 #[derive(Clone, Debug)]
 pub struct Desk {
     pub name: String,
-    /// corner caption, e.g. `DESK 01 · 3 SCREENS · 4 VM`
-    pub sub: String,
+    /// corner caption pieces, e.g. `["DESK 01", "3 SCREENS", "4 VM"]`
+    pub sub: Vec<String>,
     pub kind: DeskKind,
     pub scene: Scene,
     pub shelf: Scene,
@@ -2343,6 +2528,11 @@ pub struct Desk {
     pub shelf_devs: Vec<usize>,
     /// machines of this room that do not fit the desk and only appear on the shelf
     pub hidden: usize,
+    /// the room of the saved layout this tab shows (layout arrangements only)
+    pub room_id: Option<String>,
+    pub furniture: Vec<FurnitureInfo>,
+    /// top drawing margin that keeps the always-visible labels clear of the window chrome
+    pub top_margin: f32,
     shelf_bounds: Rect2,
 }
 
@@ -2351,8 +2541,12 @@ pub struct Scenes {
     pub desks: Vec<Desk>,
     pub desk_bounds: Rect2,
     pub shelf_bounds: Rect2,
-    /// drawing margins of the desk views (the top one grows with stacked labels)
-    pub margin: (f32, f32, f32, f32),
+    /// The effective layout (saved arrangement plus automatic placements of new machines);
+    /// `None` while the automatic arrangement is drawn.
+    pub layout: Option<WorkspaceLayout>,
+    /// Tabs share one view box (automatic arrangement: they line up) or each frames itself
+    /// (arranged rooms differ in size).
+    shared_view: bool,
 }
 
 impl Default for Scenes {
@@ -2363,6 +2557,9 @@ impl Default for Scenes {
 
 /// Window sizes covering the minimum window up to a 5K-class maximised window.
 const HEADROOM_WINDOWS: [(f32, f32); 3] = [(960.0, 640.0), (1280.0, 800.0), (1600.0, 900.0)];
+
+/// Height of the arrange-mode toolbar under the header.
+pub const TOOLBAR_H: f32 = 72.0;
 
 /// Reserved UI chrome inside the stage: corner tag, legend, key hints.
 pub fn chrome_rects(sw: f32, sh: f32) -> Vec<Rect2> {
@@ -2392,8 +2589,93 @@ fn sort_key(m: &Machine) -> (u32, &str) {
     (m.slot.unwrap_or(u32::MAX), m.id.as_str())
 }
 
-/// Builds the scene for `machines`: one desk per room that owns physical machines, a VM Rack
-/// tab when any VM / server exists, and a shelf per tab.
+fn vm_order(machines: &[Machine]) -> impl Fn(&usize, &usize) -> std::cmp::Ordering + '_ {
+    move |a, b| {
+        let (ma, mb) = (&machines[*a], &machines[*b]);
+        (ma.kind != DeviceFormFactor::Server, sort_key(ma))
+            .cmp(&(mb.kind != DeviceFormFactor::Server, sort_key(mb)))
+    }
+}
+
+/// The VM Rack tab: one large rack holding `vms` (at most `MAX_HERO_BLADES` blades).
+fn vm_rack_desk(
+    devices: &[Device],
+    machines: &[Machine],
+    targets: &[Vec<usize>],
+    vms: &[usize],
+) -> Desk {
+    let mut all_vms = vms.to_vec();
+    all_vms.sort_by(|a, b| {
+        let (ma, mb) = (&machines[*a], &machines[*b]);
+        (
+            ma.kind != DeviceFormFactor::Server,
+            ma.room.to_lowercase(),
+            sort_key(ma),
+        )
+            .cmp(&(
+                mb.kind != DeviceFormFactor::Server,
+                mb.room.to_lowercase(),
+                sort_key(mb),
+            ))
+    });
+    let blades: Vec<usize> = all_vms
+        .iter()
+        .take(MAX_HERO_BLADES)
+        .map(|&m| targets[m][0])
+        .collect();
+    let (scene, nav) = build_hero(devices, &blades);
+    let shelf_devs: Vec<usize> = all_vms
+        .iter()
+        .flat_map(|&m| targets[m].iter().copied())
+        .collect();
+    let (shelf, shelf_bounds) = build_shelf(devices, &shelf_devs);
+    Desk {
+        name: "VM Rack".into(),
+        sub: Vec::new(),
+        kind: DeskKind::VmRack,
+        scene,
+        shelf,
+        devs: nav,
+        shelf_devs,
+        hidden: all_vms.len().saturating_sub(MAX_HERO_BLADES),
+        room_id: None,
+        furniture: Vec::new(),
+        top_margin: MARGIN.1,
+        shelf_bounds,
+    }
+}
+
+/// The bare L-desk shown when there is nothing to draw yet.
+fn empty_desk(devices: &[Device]) -> Desk {
+    let mut scene = Scene::default();
+    let mut bd = Builder::new();
+    let dd = DeskDims {
+        ur: UR_MIN,
+        vl: VL_MIN,
+    };
+    l_desk(&mut bd, dd);
+    desk_dots(&mut bd, dd);
+    scene.backdrop = bd.prims;
+    let (shelf, shelf_bounds) = build_shelf(devices, &[]);
+    Desk {
+        name: "Default".into(),
+        sub: Vec::new(),
+        kind: DeskKind::Room,
+        scene,
+        shelf,
+        devs: vec![],
+        shelf_devs: vec![],
+        hidden: 0,
+        room_id: None,
+        furniture: Vec::new(),
+        top_margin: MARGIN.1,
+        shelf_bounds,
+    }
+}
+
+/// Builds the scene for `machines`: one desk per room that owns physical machines, a shelf per
+/// tab, and a VM Rack tab only for VMs that have no desk of their own or overflow their
+/// room's sidecar rack.
 pub fn build_scene(machines: &[Machine]) -> Scenes {
     let mut devices = Vec::new();
     let targets: Vec<Vec<usize>> = machines
@@ -2413,19 +2695,17 @@ pub fn build_scene(machines: &[Machine]) -> Scenes {
             e.0.push(i);
         }
     }
-    let vm_order = |a: &usize, b: &usize| {
-        let (ma, mb) = (&machines[*a], &machines[*b]);
-        (ma.kind != DeviceFormFactor::Server, sort_key(ma))
-            .cmp(&(mb.kind != DeviceFormFactor::Server, sort_key(mb)))
-    };
 
     let mut desks: Vec<Desk> = Vec::new();
-    for ((_, name), (mut phys, mut vms)) in rooms.clone() {
+    // VMs the desks do not show: rooms without a desk, rooms with more VMs than the sidecar holds
+    let mut rack_only: Vec<usize> = Vec::new();
+    for ((_, name), (mut phys, mut vms)) in rooms {
         if phys.is_empty() {
+            rack_only.extend(vms);
             continue;
         }
         phys.sort_by(|a, b| sort_key(&machines[*a]).cmp(&sort_key(&machines[*b])));
-        vms.sort_by(vm_order);
+        vms.sort_by(vm_order(machines));
         let mut plan = RoomPlan::default();
         for &mi in phys.iter().take(MAX_PHYSICAL) {
             if machines[mi].kind == DeviceFormFactor::Laptop {
@@ -2442,6 +2722,7 @@ pub fn build_scene(machines: &[Machine]) -> Scenes {
             plan.rack = vms.iter().map(|&m| targets[m][0]).collect();
         } else {
             hidden += vms.len();
+            rack_only.extend(vms.iter().copied());
         }
         let (scene, nav) = build_room(&devices, &plan);
         let shelf_devs: Vec<usize> = phys
@@ -2452,96 +2733,41 @@ pub fn build_scene(machines: &[Machine]) -> Scenes {
         let (shelf, shelf_bounds) = build_shelf(&devices, &shelf_devs);
         desks.push(Desk {
             name,
-            sub: String::new(),
+            sub: Vec::new(),
             kind: DeskKind::Room,
             scene,
             shelf,
             devs: nav,
             shelf_devs,
             hidden,
+            room_id: None,
+            furniture: Vec::new(),
+            top_margin: MARGIN.1,
             shelf_bounds,
         });
     }
 
-    let mut all_vms: Vec<usize> = rooms
-        .values()
-        .flat_map(|(_, v)| v.iter().copied())
-        .collect();
-    all_vms.sort_by(|a, b| {
-        let (ma, mb) = (&machines[*a], &machines[*b]);
-        (
-            ma.kind != DeviceFormFactor::Server,
-            ma.room.to_lowercase(),
-            sort_key(ma),
-        )
-            .cmp(&(
-                mb.kind != DeviceFormFactor::Server,
-                mb.room.to_lowercase(),
-                sort_key(mb),
-            ))
-    });
-    if !all_vms.is_empty() {
-        let blades: Vec<usize> = all_vms
-            .iter()
-            .take(MAX_HERO_BLADES)
-            .map(|&m| targets[m][0])
-            .collect();
-        let (mut scene, nav) = build_hero(&devices, &blades);
+    if !rack_only.is_empty() {
+        let mut desk = vm_rack_desk(&devices, machines, &targets, &rack_only);
         // the VM scene is centred on the other desks so the tabs line up
         if let Some(ob) = desks
             .iter()
             .map(|d| d.scene.bounds())
             .reduce(|a, b| a.union(b))
         {
-            let vb = scene.bounds();
-            scene.shift(
+            let vb = desk.scene.bounds();
+            desk.scene.shift(
                 (ob.x + ob.w * 0.5) - (vb.x + vb.w * 0.5),
                 (ob.y + ob.h * 0.5) - (vb.y + vb.h * 0.5),
             );
         }
-        let shelf_devs: Vec<usize> = all_vms
-            .iter()
-            .flat_map(|&m| targets[m].iter().copied())
-            .collect();
-        let (shelf, shelf_bounds) = build_shelf(&devices, &shelf_devs);
-        let hidden = all_vms.len().saturating_sub(MAX_HERO_BLADES);
-        desks.push(Desk {
-            name: "VM Rack".into(),
-            sub: String::new(),
-            kind: DeskKind::VmRack,
-            scene,
-            shelf,
-            devs: nav,
-            shelf_devs,
-            hidden,
-            shelf_bounds,
-        });
+        desks.push(desk);
     }
 
     if desks.is_empty() {
-        let mut scene = Scene::default();
-        let mut bd = Builder::new();
-        let dd = DeskDims {
-            ur: UR_MIN,
-            vl: VL_MIN,
-        };
-        l_desk(&mut bd, dd);
-        desk_dots(&mut bd, dd);
-        scene.backdrop = bd.prims;
-        let (shelf, shelf_bounds) = build_shelf(&devices, &[]);
-        desks.push(Desk {
-            name: "Default".into(),
-            sub: String::new(),
-            kind: DeskKind::Room,
-            scene,
-            shelf,
-            devs: vec![],
-            shelf_devs: vec![],
-            hidden: 0,
-            shelf_bounds,
-        });
+        desks.push(empty_desk(&devices));
     }
-    Scenes::assemble(devices, desks)
+    Scenes::assemble(devices, desks, None)
 }
 
 impl Scenes {
@@ -2550,7 +2776,15 @@ impl Scenes {
         build_scene(&demo_machines())
     }
 
-    fn assemble(devices: Vec<Device>, mut desks: Vec<Desk>) -> Scenes {
+    /// Finishes the tabs: caption pieces, view boxes and label clearance. `layout` is the
+    /// effective layout when the tabs were built from one (each tab then frames itself).
+    fn assemble(
+        devices: Vec<Device>,
+        mut desks: Vec<Desk>,
+        layout: Option<WorkspaceLayout>,
+    ) -> Scenes {
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut rack_no = 0;
         for (i, d) in desks.iter_mut().enumerate() {
             let vm = d.scene.screens.iter().filter(|g| g.blade).count();
@@ -2558,18 +2792,22 @@ impl Scenes {
             d.sub = match d.kind {
                 DeskKind::VmRack => {
                     rack_no += 1;
-                    format!("RACK {rack_no:02} · {} VM BLADES", d.shelf_devs.len())
+                    vec![
+                        format!("RACK {rack_no:02}"),
+                        format!("{} VM BLADES", d.shelf_devs.len()),
+                    ]
                 }
-                DeskKind::Room if vm == 0 => format!(
-                    "DESK {:02} · {scr} SCREEN{}",
-                    i + 1,
-                    if scr == 1 { "" } else { "S" }
-                ),
-                DeskKind::Room => format!(
-                    "DESK {:02} · {scr} SCREEN{} · {vm} VM",
-                    i + 1,
-                    if scr == 1 { "" } else { "S" }
-                ),
+                DeskKind::Room => {
+                    let head = if layout.is_some() { "ROOM" } else { "DESK" };
+                    let mut v = vec![
+                        format!("{head} {:02}", i + 1),
+                        plural(scr, "SCREEN", "SCREENS"),
+                    ];
+                    if vm > 0 {
+                        v.push(format!("{vm} VM"));
+                    }
+                    v
+                }
             };
         }
         let desk_bounds = desks
@@ -2582,42 +2820,48 @@ impl Scenes {
             .map(|d| d.shelf_bounds)
             .reduce(|a, b| a.union(b))
             .unwrap();
-        let mut sc = Scenes {
+        let shared_view = layout.is_none();
+        if shared_view {
+            let refs: Vec<&Desk> = desks.iter().collect();
+            let top = Scenes::top_margin(desk_bounds, &refs, &devices);
+            desks.iter_mut().for_each(|d| d.top_margin = top);
+        } else {
+            for d in desks.iter_mut() {
+                d.top_margin = Scenes::top_margin(d.scene.bounds(), &[&*d], &devices);
+            }
+        }
+        Scenes {
             devices,
             desks,
             desk_bounds,
             shelf_bounds,
-            margin: MARGIN,
-        };
-        sc.margin.1 = sc.top_margin();
-        sc
+            layout,
+            shared_view,
+        }
     }
 
     /// Top margin that keeps every always-visible label clear of the window chrome even when
     /// crowded labels have to stack above their screens.
-    fn top_margin(&self) -> f32 {
+    fn top_margin(bounds: Rect2, desks: &[&Desk], devices: &[Device]) -> f32 {
         let mut top = MARGIN.1;
         for _ in 0..4 {
             let mut need: f32 = 0.0;
             for &(w, h) in &HEADROOM_WINDOWS {
-                let (sw, sh) = stage_size(w, h);
-                let fit = Fit::new(
-                    self.desk_bounds,
-                    sw,
-                    sh,
-                    (MARGIN.0, top, MARGIN.2, MARGIN.3),
-                );
-                let chrome: Vec<Rect2> = chrome_rects(sw, sh)
-                    .into_iter()
-                    .filter(|c| c.y < sh * 0.5)
-                    .collect();
-                for d in &self.desks {
-                    for lb in layout_labels(&d.scene, &self.devices, &fit, (sw, sh)) {
-                        let r = lb.rect();
-                        need = need.max(4.0 - r.y);
-                        for c in &chrome {
-                            if rects_overlap(r, *c) {
-                                need = need.max(c.y + c.h + 2.0 - r.y);
+                for toolbar in [0.0, TOOLBAR_H] {
+                    let (sw, sh) = stage_size(w, h - toolbar);
+                    let fit = Fit::new(bounds, sw, sh, (MARGIN.0, top, MARGIN.2, MARGIN.3));
+                    let chrome: Vec<Rect2> = chrome_rects(sw, sh)
+                        .into_iter()
+                        .filter(|c| c.y < sh * 0.5)
+                        .collect();
+                    for d in desks {
+                        for lb in layout_labels(&d.scene, devices, &fit, (sw, sh)) {
+                            let r = lb.rect();
+                            need = need.max(4.0 - r.y);
+                            for c in &chrome {
+                                if rects_overlap(r, *c) {
+                                    need = need.max(c.y + c.h + 2.0 - r.y);
+                                }
                             }
                         }
                     }
@@ -2642,13 +2886,19 @@ impl Scenes {
         if shelf { &d.shelf_devs } else { &d.devs }
     }
 
-    /// The exact transform the app uses for a stage of `sw x sh` logical px.
-    pub fn fit(&self, shelf: bool, sw: f32, sh: f32) -> Fit {
+    /// The exact transform the app uses for tab `desk` in a stage of `sw x sh` logical px: the
+    /// default camera, which frames all furniture of the room and keeps its labels clear.
+    pub fn fit(&self, shelf: bool, desk: usize, sw: f32, sh: f32) -> Fit {
         if shelf {
-            Fit::new(self.shelf_bounds, sw, sh, SHELF_MARGIN)
-        } else {
-            Fit::new(self.desk_bounds, sw, sh, self.margin)
+            return Fit::new(self.shelf_bounds, sw, sh, SHELF_MARGIN);
         }
+        let d = &self.desks[desk.min(self.desks.len() - 1)];
+        let bounds = if self.shared_view {
+            self.desk_bounds
+        } else {
+            d.scene.bounds()
+        };
+        Fit::new(bounds, sw, sh, (MARGIN.0, d.top_margin, MARGIN.2, MARGIN.3))
     }
 
     /// First desk whose isometric scene shows `dev` (room desks before the VM Rack).
@@ -2698,12 +2948,19 @@ pub fn text_w(s: &str, size: f32, mono: bool) -> f32 {
         .sum()
 }
 
+/// Separates the pieces of a label's detail row; the view draws them as two runs of text.
+pub const DETAIL_SEP: char = '\u{2003}';
+
 pub fn detail_text(d: &Device) -> String {
     format!(
-        "{} · {}",
+        "{}{DETAIL_SEP}{}",
         d.res.split(" @").next().unwrap_or(&d.res),
         route_short(d.link)
     )
+}
+
+fn name_row_w(d: &Device) -> f32 {
+    label_width(&d.label, &d.tag, d.is_local)
 }
 
 #[derive(Clone, Debug)]
@@ -2729,7 +2986,7 @@ impl LabelBox {
 }
 
 fn above_box(devs: &[Device], l: &LabelSpec, a: P2, lift: f32) -> LabelBox {
-    let name_w = text_w(&devs[l.dev].label, NAME_SIZE, false) + NAME_PAD;
+    let name_w = name_row_w(&devs[l.dev]);
     let detail_txt = detail_text(&devs[l.dev]);
     let detail_w = text_w(&detail_txt, DETAIL_SIZE, true) + 8.0;
     let bottom = a.y - lift;
@@ -2786,31 +3043,60 @@ pub fn layout_labels(
         .collect();
     let mut out: Vec<Option<LabelBox>> = vec![None; scene.labels.len()];
     let mut taken: Vec<Rect2> = Vec::new();
-    if let Some(p) = panel_rect(scene, fit, stage) {
-        taken.push(p);
+    taken.extend(panel_rects(scene, fit, stage));
+    // rack labels first: top to bottom, a crowded one slides down off its neighbour (its
+    // leader then runs slanted)
+    let mut side: Vec<usize> = (0..scene.labels.len())
+        .filter(|&i| matches!(scene.labels[i].kind, LabelKind::Side { .. }))
+        .collect();
+    side.sort_by(|&x, &y| {
+        fit.apply(scene.labels[x].anchor)
+            .y
+            .partial_cmp(&fit.apply(scene.labels[y].anchor).y)
+            .unwrap()
+    });
+    for i in side {
+        let l = &scene.labels[i];
+        let LabelKind::Side { tick } = l.kind else {
+            continue;
+        };
+        let a = fit.apply(l.anchor);
+        let name_w = name_row_w(&devs[l.dev]);
+        let mut dy = 0.0;
+        let lb = loop {
+            let name = Rect2 {
+                x: a.x + tick,
+                y: a.y - NAME_H * 0.5 + dy,
+                w: name_w,
+                h: NAME_H,
+            };
+            let lb = LabelBox {
+                dev: l.dev,
+                kind: l.kind,
+                name,
+                detail: None,
+                leader: Some((a, P2::new(a.x + tick, a.y + dy))),
+            };
+            let r = lb.rect();
+            let clash = taken.iter().any(|t| rects_overlap(r, *t))
+                || polys
+                    .iter()
+                    .any(|(_, p)| polygons_overlap(&rect_poly(r), p));
+            if !clash || dy > 240.0 {
+                break lb;
+            }
+            dy += 2.0;
+        };
+        taken.push(lb.rect());
+        out[i] = Some(lb);
     }
     for (i, l) in scene.labels.iter().enumerate() {
         let a = fit.apply(l.anchor);
-        let name_w = text_w(&devs[l.dev].label, NAME_SIZE, false) + NAME_PAD;
+        let name_w = name_row_w(&devs[l.dev]);
         let detail_txt = detail_text(&devs[l.dev]);
         let detail_w = text_w(&detail_txt, DETAIL_SIZE, true) + 8.0;
         let lb = match l.kind {
-            LabelKind::Above { .. } => continue,
-            LabelKind::Side { tick } => {
-                let name = Rect2 {
-                    x: a.x + tick,
-                    y: a.y - NAME_H * 0.5,
-                    w: name_w,
-                    h: NAME_H,
-                };
-                LabelBox {
-                    dev: l.dev,
-                    kind: l.kind,
-                    name,
-                    detail: None,
-                    leader: Some((a, P2::new(a.x + tick, a.y))),
-                }
-            }
+            LabelKind::Above { .. } | LabelKind::Side { .. } => continue,
             LabelKind::Below { gap } => {
                 let name = Rect2 {
                     x: a.x - name_w * 0.5,
@@ -2878,26 +3164,61 @@ pub fn layout_labels(
     out.into_iter().flatten().collect()
 }
 
-/// Stage-px rectangle of the VM preview panel of a rack scene (clamped into the stage).
-pub fn panel_rect(scene: &Scene, fit: &Fit, stage: (f32, f32)) -> Option<Rect2> {
-    let rack = scene.rack.as_ref()?;
+/// Stage-px rectangle of a rack's VM preview panel on `side`, before it is kept in the stage.
+fn panel_at(rack: &RackInfo, side: PanelSide, fit: &Fit) -> Rect2 {
     let tl = fit.apply(P2::new(rack.bbox.x, rack.bbox.y));
     let br = fit.apply(P2::new(
         rack.bbox.x + rack.bbox.w,
         rack.bbox.y + rack.bbox.h,
     ));
-    let (x, y) = match rack.panel {
+    let (x, y) = match side {
         PanelSide::Above => (tl.x, tl.y - 26.0 - PANEL_H),
         PanelSide::Left => (tl.x - 30.0 - PANEL_W, (tl.y + br.y) * 0.5 - PANEL_H * 0.5),
     };
-    let x = x.clamp(8.0, (stage.0 - 8.0 - PANEL_W).max(8.0));
-    let y = y.clamp(8.0, (stage.1 - 8.0 - PANEL_H).max(8.0));
-    Some(Rect2 {
+    Rect2 {
         x,
         y,
         w: PANEL_W,
         h: PANEL_H,
-    })
+    }
+}
+
+/// Stage-px rectangles of the VM preview panels of every rack of `scene`. A panel goes on the
+/// rack's preferred side, or on the first other side where it covers no screen and none of the
+/// window chrome and stays inside the stage; failing that it is pushed into the stage. Only the
+/// panel of the hovered or selected rack is ever shown, so panels may overlap one another.
+pub fn panel_rects(scene: &Scene, fit: &Fit, stage: (f32, f32)) -> Vec<Rect2> {
+    let polys: Vec<Vec<P2>> = scene
+        .screens
+        .iter()
+        .map(|g| g.hit.iter().map(|&p| fit.apply(p)).collect())
+        .collect();
+    let chrome = chrome_rects(stage.0, stage.1);
+    let mut out: Vec<Rect2> = Vec::new();
+    for rack in &scene.racks {
+        let clean = |r: Rect2| {
+            r.x >= 8.0
+                && r.y >= 8.0
+                && r.x + r.w <= stage.0 - 8.0
+                && r.y + r.h <= stage.1 - 8.0
+                && !polys.iter().any(|p| polygons_overlap(&rect_poly(r), p))
+                && !chrome.iter().any(|c| rects_overlap(r, *c))
+        };
+        let chosen = [rack.panel, PanelSide::Above, PanelSide::Left]
+            .into_iter()
+            .map(|side| panel_at(rack, side, fit))
+            .find(|&r| clean(r))
+            .unwrap_or_else(|| {
+                let r = panel_at(rack, rack.panel, fit);
+                Rect2 {
+                    x: r.x.clamp(8.0, (stage.0 - 8.0 - PANEL_W).max(8.0)),
+                    y: r.y.clamp(8.0, (stage.1 - 8.0 - PANEL_H).max(8.0)),
+                    ..r
+                }
+            });
+        out.push(chosen);
+    }
+    out
 }
 
 #[cfg(test)]

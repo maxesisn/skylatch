@@ -107,6 +107,24 @@ pub fn agent_json_path(platform: Platform, env: config::Env) -> Option<PathBuf> 
     config::path_for(platform, env).map(|p| p.with_file_name("agent.json"))
 }
 
+/// `agent.json` of this machine, where the platform keeps it.
+pub fn agent_config_path() -> Option<PathBuf> {
+    agent_json_path(Platform::current(), &config::process_env)
+}
+
+/// The hub device ID this machine enrolled with, when `agent.json` is for `hub_url`. This is how
+/// the launcher knows which device on the desk is the machine it runs on.
+pub fn local_device_id(path: &Path, hub_url: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        hub_url: String,
+        device_id: String,
+    }
+    let saved: Saved = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let id = saved.device_id.trim();
+    (!id.is_empty() && hub_key(&saved.hub_url) == hub_key(hub_url)).then(|| id.to_string())
+}
+
 /// What the local `agent.json` says about a hub.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Enrollment {
@@ -462,7 +480,7 @@ pub struct SystemBackend {
 impl SystemBackend {
     pub fn new() -> SystemBackend {
         SystemBackend {
-            agent_json: agent_json_path(Platform::current(), &config::process_env),
+            agent_json: agent_config_path(),
         }
     }
 }
@@ -532,7 +550,7 @@ impl Backend for SystemBackend {
 /// One-line reason for a failed `join`, from the agent's error output.
 pub fn describe_join_failure(stderr: &str) -> String {
     if stderr.contains("already enrolled") || stderr.contains("409") {
-        return "本机已在该 Hub 登记过 · 请先在 Hub 控制台吊销旧的设备令牌".into();
+        return "本机已在该 Hub 登记过，请先在 Hub 控制台吊销旧的设备令牌".into();
     }
     if stderr.contains("invalid or expired") || stderr.contains("401") {
         return "配对码无效或已过期".into();

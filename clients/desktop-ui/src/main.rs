@@ -11,6 +11,7 @@ mod config;
 mod host_mgr;
 mod iso;
 mod live;
+mod mark;
 mod onboard;
 mod onboard_view;
 mod scene;
@@ -26,10 +27,12 @@ use gpui::prelude::*;
 use gpui::{
     App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, FocusHandle,
     FontWeight, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    PathBuilder, Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, canvas, div, fill, point, px, size,
+    MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div, fill,
+    point, px, size,
 };
 use skylatch_proto::control::DeviceInfo;
+use skylatch_proto::layout::{FurnitureKind, WorkspaceLayout};
 
 use config::{Config, Effective};
 use host_mgr::{HostManager, HostStatus};
@@ -75,15 +78,19 @@ THIS MACHINE
 
 KEYS
     Left / Right / Tab   cycle screens (Shift+Tab reverses)
-    1 .. 9               switch desk / VM Rack tab
+    1 .. 9               switch room / VM Rack tab
     V                    toggle Desk / Shelf view
     T                    toggle Light / Dark mode
     R                    refresh the device list
     H                    open / close the Hub settings drawer
+    E                    arrange the workstation (drag machines, add furniture and rooms)
+    0                    reset the camera (auto-fit of the whole room)
     Enter                take over the selected screen (starts the native client)
 
 MOUSE
     hover a screen or a rack blade to preview it, click to select, double-click to take over.
+    Scroll wheel zooms around the pointer, dragging empty floor (or the right / middle button)
+    pans. While arranging, drag a machine onto any empty slot; the layout is saved to the hub.
 
 ENVIRONMENT
     SKYLATCH_HUB, SKYLATCH_TOKEN   hub URL and token (override the saved settings)
@@ -163,6 +170,71 @@ fn mtxt(s: impl Into<SharedString>, size: f32, color: Hsla) -> gpui::Div {
         .child(s)
 }
 
+/// A key cap, e.g. `Enter`.
+fn keycap(k: &str, pal: &Pal) -> gpui::Div {
+    div()
+        .h(px(18.0))
+        .min_w(px(18.0))
+        .px(px(5.0))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(rgba(pal.hair, 1.0))
+        .bg(rgba(pal.surface, 1.0))
+        .child(mtxt(k.to_string(), 10.0, rgba(pal.ink, 1.0)))
+}
+
+/// A key cap followed by what the key does.
+fn key_hint(k: &str, label: &str, pal: &Pal) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(keycap(k, pal))
+        .child(txt(label.to_string(), 11.0, rgba(pal.muted, 1.0)))
+}
+
+/// A row of key hints; the gaps between them replace separators.
+pub(crate) fn hint_row(items: &[(&str, &str)], pal: &Pal) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(14.0))
+        .children(items.iter().map(|(k, l)| key_hint(k, l, pal)))
+}
+
+/// A small outlined pill next to a headline (`本机`, `5K`, `DESK 01`).
+fn badge(text: impl Into<SharedString>, color: Hsla, border: Hsla, size: f32) -> gpui::Div {
+    div()
+        .h(px(size + 6.0))
+        .px(px(6.0))
+        .flex()
+        .flex_none()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(border)
+        .child(txt(text, size, color))
+}
+
+/// The `本机` chip that marks the machine the launcher runs on.
+fn local_chip(pal: &Pal) -> gpui::Div {
+    let c = rgba(pal.accent, 1.0);
+    div()
+        .h(px(13.0))
+        .px(px(4.0))
+        .flex()
+        .flex_none()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(rgba(pal.accent, 0.6))
+        .child(txt("本机", 9.0, c))
+}
+
 fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
@@ -203,6 +275,22 @@ struct PaintData {
     /// 0..1.6 while the latch pulse plays
     connect_t: Option<f32>,
     sel: Option<usize>,
+    /// arrange mode: bright floor grid, dashed empty slots
+    edit: bool,
+    /// the machine being dragged
+    ghost: Option<Ghost>,
+    /// the slot a drop would land in, `(furniture id, slot)`
+    drop_target: Option<(String, u32)>,
+}
+
+/// A machine dragged to a new slot: its screens follow the pointer.
+#[derive(Clone)]
+struct Ghost {
+    devs: Vec<usize>,
+    form: Form,
+    /// pointer travel since the press, in stage px
+    dx: f32,
+    dy: f32,
 }
 
 /// Colour, width and optional (dash, gap) of a canvas stroke.
@@ -308,8 +396,12 @@ fn paint_stage(window: &mut Window, bounds: Bounds<Pixels>, d: &PaintData) {
     let (w, h) = (f(bounds.size.width), f(bounds.size.height));
     let pal = &d.pal;
 
-    // dot-matrix paper, fading gently towards the edges
-    let dot = 1.5f32;
+    // dot-matrix paper, fading gently towards the edges; brighter while arranging
+    let (dot, boost) = if d.edit {
+        (2.0f32, 2.4f32)
+    } else {
+        (1.5f32, 1.0f32)
+    };
     let (cx, cy) = (w * 0.5, h * 0.5);
     let maxd = (cx * cx + cy * cy).sqrt();
     let mut y = DOT_STEP * 0.5;
@@ -317,7 +409,7 @@ fn paint_stage(window: &mut Window, bounds: Bounds<Pixels>, d: &PaintData) {
         let mut x = DOT_STEP * 0.5;
         while x < w {
             let dd = (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / maxd).min(1.0);
-            let a = 1.0 - 0.55 * dd * dd;
+            let a = (1.0 - 0.55 * dd * dd) * boost;
             let r = Bounds::new(
                 point(px(snap(ox + x - dot * 0.5)), px(snap(oy + y - dot * 0.5))),
                 size(px(dot), px(dot)),
@@ -342,6 +434,76 @@ fn paint_stage(window: &mut Window, bounds: Bounds<Pixels>, d: &PaintData) {
 
     paint_prims(window, &scene.backdrop, &map_static, pal, 1.0);
     paint_prims(window, &scene.items, &map_items, pal, d.item_a);
+
+    // arrange mode: every empty slot is a dashed drop target, compatible ones light up while
+    // a machine is dragged, the one under the pointer glows
+    if d.edit {
+        for sn in &scene.snaps {
+            let empty = sn.occupied_by.is_none();
+            let fits = d.ghost.as_ref().is_some_and(|g| sn.kind.accepts(g.form));
+            let target = d
+                .drop_target
+                .as_ref()
+                .is_some_and(|(f, s)| *f == sn.furniture_id && *s == sn.slot);
+            if !(empty || target && fits) {
+                continue;
+            }
+            let pts: Vec<Point<Pixels>> = sn.poly.iter().map(|&p| map_items(p)).collect();
+            let (fill_a, stroke) = if target && fits {
+                (0.22, (rgba(pal.accent, d.item_a), 2.0, None))
+            } else if fits {
+                (
+                    0.07,
+                    (rgba(pal.accent, 0.9 * d.item_a), 1.4, Some((6.0, 4.0))),
+                )
+            } else {
+                (0.0, (rgba(pal.ink, 0.55 * d.item_a), 1.2, Some((6.0, 4.0))))
+            };
+            paint_poly(
+                window,
+                &pts,
+                (fill_a > 0.0).then(|| rgba(pal.accent, fill_a * d.item_a)),
+                Some(stroke),
+                true,
+            );
+            if empty {
+                // a plus at the middle of the slot
+                let c = map_items(sn.anchor);
+                let col = if fits { pal.accent } else { pal.muted };
+                for (ax, ay) in [(1.0, 0.0), (0.0, 1.0)] {
+                    paint_poly(
+                        window,
+                        &[
+                            point(px(f(c.x) - 5.0 * ax), px(f(c.y) - 5.0 * ay)),
+                            point(px(f(c.x) + 5.0 * ax), px(f(c.y) + 5.0 * ay)),
+                        ],
+                        None,
+                        Some((rgba(col, 0.8 * d.item_a), 1.4, None)),
+                        false,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(g) = &d.ghost {
+        for sg in scene.screens.iter().filter(|s| g.devs.contains(&s.dev)) {
+            let pts: Vec<Point<Pixels>> = sg
+                .bezel
+                .iter()
+                .map(|&p| {
+                    let q = map_items(p);
+                    point(px(f(q.x) + g.dx), px(f(q.y) + g.dy))
+                })
+                .collect();
+            paint_poly(
+                window,
+                &pts,
+                Some(rgba(pal.accent, 0.18)),
+                Some((rgba(pal.accent, 1.0), 1.6, Some((5.0, 3.5)))),
+                true,
+            );
+        }
+    }
 
     // dynamic screen states: hover wash, selection tint, accent bezel, latch corners
     for sg in &scene.screens {
@@ -497,31 +659,29 @@ fn paint_stage(window: &mut Window, bounds: Bounds<Pixels>, d: &PaintData) {
     }
 }
 
+/// The Carbon Precision Lock-Bolt: open-right housing, cobalt bolt, vertical latch handle (see
+/// `mark.rs`, the same shapes as `assets/icon/skylatch.svg`).
 fn paint_mark(window: &mut Window, b: Bounds<Pixels>, pal: &Pal) {
-    // lock-bolt mark: square housing, bolt shaft sliding into the right wall
     let (ox, oy) = (f(b.origin.x), f(b.origin.y));
-    let p = |x: f32, y: f32| point(px(ox + x), px(oy + y));
+    let k = f(b.size.width).min(f(b.size.height)) / mark::WINDOW.1;
+    let at = |(x, y): (f32, f32)| {
+        point(
+            px(ox + (x - mark::WINDOW.0) * k),
+            px(oy + (y - mark::WINDOW.0) * k),
+        )
+    };
+    let housing: Vec<Point<Pixels>> = mark::housing_path().into_iter().map(at).collect();
     paint_poly(
         window,
-        &[p(2.0, 2.0), p(20.0, 2.0), p(20.0, 20.0), p(2.0, 20.0)],
+        &housing,
         None,
-        Some((rgba(pal.ink, 1.0), 1.6, None)),
-        true,
+        Some((rgba(pal.ink, 1.0), mark::HOUSING_WIDTH * k, None)),
+        false,
     );
-    paint_poly(
-        window,
-        &[p(6.0, 8.0), p(17.0, 8.0), p(17.0, 14.0), p(6.0, 14.0)],
-        Some(rgba(pal.accent, 1.0)),
-        None,
-        true,
-    );
-    paint_poly(
-        window,
-        &[p(5.0, 6.0), p(8.0, 6.0), p(8.0, 16.0), p(5.0, 16.0)],
-        Some(rgba(pal.ink, 1.0)),
-        None,
-        true,
-    );
+    for (shape, col) in [(mark::BOLT, pal.accent), (mark::HANDLE, pal.ink)] {
+        let pts: Vec<Point<Pixels>> = mark::rrect_outline(shape).into_iter().map(at).collect();
+        paint_poly(window, &pts, Some(rgba(col, 1.0)), None, true);
+    }
 }
 
 // ───────────────────────────── app state ─────────────────────────────
@@ -559,7 +719,7 @@ struct Drawer {
 
 const DRAWER_X: f32 = 150.0;
 const DRAWER_W: f32 = 448.0;
-const DRAWER_H: f32 = 330.0;
+const DRAWER_H: f32 = 352.0;
 const MAX_URL_LEN: usize = 256;
 const MAX_TOKEN_LEN: usize = 512;
 /// How long the copy button shows "已复制".
@@ -578,6 +738,60 @@ struct Banner {
     text: String,
     at: Instant,
     error: bool,
+}
+
+/// A pan in progress (wheel zoom has no state): the press point and the camera at that time.
+#[derive(Clone, Copy)]
+struct PanDrag {
+    from: Point<Pixels>,
+    cam: Camera,
+}
+
+/// Pointer travel (px) before a press on a machine becomes a drag.
+const DRAG_SLOP: f32 = 5.0;
+
+/// A machine picked up in arrange mode.
+struct DeviceDrag {
+    machine_id: String,
+    /// every screen of the machine
+    devs: Vec<usize>,
+    form: Form,
+    start: Point<Pixels>,
+    pos: Point<Pixels>,
+    active: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputKind {
+    Rename,
+    NewRoom,
+}
+
+/// The inline text field of the arrange toolbar.
+struct EditInput {
+    kind: InputKind,
+    text: String,
+}
+
+const MAX_INPUT_LEN: usize = 40;
+
+/// How the last attempt to save the arrangement went.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum LayoutStatus {
+    Idle,
+    Saving,
+    Saved,
+    /// no hub: the arrangement only lives until the launcher closes
+    LocalOnly,
+    Failed(String),
+}
+
+struct SaveState {
+    /// the request on its way to the hub
+    inflight: Option<std::sync::mpsc::Receiver<Result<WorkspaceLayout, String>>>,
+    /// a newer arrangement waits for the request in flight to finish
+    dirty: bool,
+    status: LayoutStatus,
 }
 
 struct Proto {
@@ -618,6 +832,25 @@ struct Proto {
     host_seen: HostStatus,
     /// A tray icon exists: closing the window hides it instead of quitting.
     tray_active: bool,
+    /// Zoom and pan of the isometric canvas over the automatic fit.
+    cam: Camera,
+    pan_drag: Option<PanDrag>,
+    /// The automatic fit of the last frame, before the camera.
+    fit_base: Fit,
+    /// Arrange mode (整理工位): machines can be dragged, furniture added.
+    edit: bool,
+    /// something was changed since arrange mode opened
+    edit_dirty: bool,
+    /// The arrangement saved on the hub (empty: the automatic one).
+    layout: WorkspaceLayout,
+    layout_before_edit: Option<WorkspaceLayout>,
+    drag: Option<DeviceDrag>,
+    edit_input: Option<EditInput>,
+    save: SaveState,
+    /// The hub device ID of the machine this launcher runs on.
+    local_id: Option<String>,
+    /// Where this machine's `agent.json` lives (read for `local_id`).
+    agent_json: Option<PathBuf>,
 }
 
 /// What the shell around the view has to do after a tray action.
@@ -695,6 +928,26 @@ impl Proto {
             host: None,
             host_seen: HostStatus::Off,
             tray_active: false,
+            cam: Camera::default(),
+            pan_drag: None,
+            fit_base: Fit {
+                scale: 1.0,
+                tx: 0.0,
+                ty: 0.0,
+            },
+            edit: false,
+            edit_dirty: false,
+            layout: WorkspaceLayout::default(),
+            layout_before_edit: None,
+            drag: None,
+            edit_input: None,
+            save: SaveState {
+                inflight: None,
+                dirty: false,
+                status: LayoutStatus::Idle,
+            },
+            local_id: None,
+            agent_json: None,
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -713,6 +966,7 @@ impl Proto {
             self.live_connect(cx);
         }
         self.sync_host();
+        self.refresh_local_id();
     }
 
     // ───────────── hosting this machine, tray ─────────────
@@ -746,8 +1000,8 @@ impl Proto {
         self.sync_host();
         let text = match (on, self.eff.live()) {
             (true, true) => "已允许远端接管本机",
-            (true, false) => "已允许远端接管本机 · 登录 Hub 后生效",
-            (false, _) => "已暂停本机被控 · 其他设备无法再连接本机",
+            (true, false) => "已允许远端接管本机，登录 Hub 后生效",
+            (false, _) => "已暂停本机被控，其他设备无法再连接本机",
         };
         self.say(text, false);
         self.kick();
@@ -893,8 +1147,12 @@ impl Proto {
             return;
         }
         let changed = d != self.desk || self.shelf;
+        if d != self.desk {
+            self.cam.reset();
+        }
         self.desk = d;
         self.shelf = false;
+        self.drag = None;
         if !self.sel.is_some_and(|s| self.nav().contains(&s)) {
             self.sel = self.scenes.default_selection(d);
         }
@@ -907,7 +1165,13 @@ impl Proto {
     }
 
     fn toggle_view(&mut self) {
+        if !self.shelf && self.edit {
+            // the shelf is not arranged: leave arrange mode first
+            self.exit_edit();
+        }
         self.shelf = !self.shelf;
+        self.drag = None;
+        self.pan_drag = None;
         if !self.sel.is_some_and(|s| self.nav().contains(&s)) {
             self.sel = self.nav().first().copied();
         }
@@ -925,6 +1189,7 @@ impl Proto {
             && let Some(d) = self.scenes.desk_of(dev)
         {
             self.desk = d;
+            self.cam.reset();
             self.view_t = 0.0;
         }
         self.sel = Some(dev);
@@ -946,13 +1211,24 @@ impl Proto {
 
     // ───────────── devices from the hub ─────────────
 
-    /// Replaces the scene, keeping the selection (by device key) and the tab (by name).
-    fn install_scenes(&mut self, new: Scenes) {
+    /// Replaces the scene, keeping the selection (by device key) and the tab (by room, else
+    /// by name). `animate` plays the fade-in of a new scene; arrange edits skip it.
+    fn install_scenes(&mut self, new: Scenes, animate: bool) {
         let key = self.sel.map(|s| self.scenes.devices[s].key.clone());
-        let desk_name = self.scenes.desks.get(self.desk).map(|d| d.name.clone());
+        let tab = self
+            .scenes
+            .desks
+            .get(self.desk)
+            .map(|d| (d.room_id.clone(), d.name.clone()));
         self.scenes = Arc::new(new);
-        self.desk = desk_name
-            .and_then(|n| self.scenes.desks.iter().position(|d| d.name == n))
+        self.desk = tab
+            .and_then(|(room, name)| {
+                self.scenes
+                    .desks
+                    .iter()
+                    .position(|d| room.is_some() && d.room_id == room)
+                    .or_else(|| self.scenes.desks.iter().position(|d| d.name == name))
+            })
             .unwrap_or(0);
         self.reset_animation_state();
         self.hover = None;
@@ -969,21 +1245,77 @@ impl Proto {
         if let Some(s) = self.sel {
             self.sel_t[s] = 1.0;
         }
-        self.view_t = 0.0;
+        self.view_t = if animate { 0.0 } else { 1.0 };
         self.kick();
     }
 
+    /// The scene of the current devices and arrangement. `--demo` arranges the built-in fleet.
+    fn build_scenes(&self) -> Scenes {
+        let layout = (!self.layout.rooms.is_empty()).then_some(&self.layout);
+        if self.demo_fleet() {
+            build_scene_with_layout_machines(&demo_machines(), layout)
+        } else {
+            build_scene_with_layout_opts(
+                &self.devices,
+                layout,
+                self.local_id.as_deref(),
+                self.eff.prefer_direct,
+            )
+        }
+    }
+
+    /// `--demo` without any real device list: the built-in fleet is on the desk.
+    fn demo_fleet(&self) -> bool {
+        self.eff.demo && !self.eff.live() && self.devices.is_empty()
+    }
+
+    fn rebuild_scenes(&mut self, animate: bool) {
+        let new = self.build_scenes();
+        self.install_scenes(new, animate);
+    }
+
+    /// Reads which hub device this machine is, from the agent's `agent.json`. Returns whether
+    /// it changed.
+    fn refresh_local_id(&mut self) -> bool {
+        let id = match (&self.agent_json, self.eff.live()) {
+            (Some(path), true) => {
+                host_mgr::local_device_id(path, &config::normalize_hub_url(&self.eff.hub_url))
+            }
+            _ => None,
+        };
+        let changed = id != self.local_id;
+        self.local_id = id;
+        changed
+    }
+
     /// Rebuilds the scene from a fresh device list (no-op when nothing changed).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_devices(&mut self, devs: Vec<DeviceInfo>) {
+        self.apply_state(devs, None);
+    }
+
+    /// Applies a device list and, when given, the arrangement fetched with it. A fetched
+    /// arrangement is ignored while one of ours is still on its way to the hub or being dragged.
+    fn apply_state(&mut self, devs: Vec<DeviceInfo>, layout: Option<WorkspaceLayout>) {
+        let local_changed = self.refresh_local_id();
+        let layout_changed = layout.is_some_and(|l| {
+            let busy = self.save.inflight.is_some() || self.save.dirty || self.drag.is_some();
+            let new = !busy && !self.edit && l != self.layout;
+            if new {
+                self.layout = l;
+            }
+            new
+        });
         if devs == self.devices
+            && !local_changed
+            && !layout_changed
             && self.hub != HubState::Connecting
             && self.scenes.devices.is_empty() == devs.is_empty()
         {
             return;
         }
         self.devices = devs;
-        let new = build_scene_from_devices_with(&self.devices, self.eff.prefer_direct);
-        self.install_scenes(new);
+        self.rebuild_scenes(!layout_changed);
     }
 
     fn live_target(&self) -> HubTarget {
@@ -1043,7 +1375,7 @@ impl Proto {
             match r.devices {
                 Ok(devs) => {
                     let count = devs.len();
-                    self.apply_devices(devs);
+                    self.apply_state(devs, r.layout);
                     self.hub = HubState::Online { count };
                 }
                 Err(msg) => self.hub = HubState::Failed(msg),
@@ -1076,11 +1408,11 @@ impl Proto {
             self.say("正在刷新设备列表…", false);
         } else if self.eff.demo {
             self.say(
-                "演示模式 · 数据为内置示例，点击 Hub 状态可连接真实 Hub",
+                "演示模式：数据为内置示例，点击 Hub 状态可连接真实 Hub",
                 false,
             );
         } else {
-            self.say("尚未连接 Hub · 请先登录或直接连接主机", false);
+            self.say("尚未连接 Hub，请先登录或直接连接主机", false);
         }
         self.kick();
     }
@@ -1207,9 +1539,11 @@ impl Proto {
         self.pair.reset();
         // whatever was on the desk before (demo fleet, previous hub) does not exist here
         self.devices.clear();
-        self.install_scenes(build_scene(&[]));
+        self.forget_arrangement();
+        self.install_scenes(build_scene(&[]), true);
         self.live_connect(cx);
         self.sync_host();
+        self.refresh_local_id();
     }
 
     /// Forgets the hub (and `--demo`): back to the first-run onboarding.
@@ -1230,9 +1564,10 @@ impl Proto {
         self.drawer.token.clear();
         self.pair.reset();
         self.onb = Onboarding::new();
-        self.install_scenes(build_scene(&[]));
+        self.forget_arrangement();
+        self.install_scenes(build_scene(&[]), true);
         self.sync_host();
-        self.say("已退出 · 已清除保存的 Hub 地址与 Token", false);
+        self.say("已退出，已清除保存的 Hub 地址与 Token", false);
     }
 
     // ───────────── first-run onboarding ─────────────
@@ -1323,7 +1658,7 @@ impl Proto {
         match result {
             Ok(()) => {
                 self.onb.error = None;
-                self.say(format!("已启动 skylatch-client · 直连 {url}"), false);
+                self.say(format!("已启动 skylatch-client，直连 {url}"), false);
             }
             Err(e) => self.onb.error = Some(e),
         }
@@ -1404,7 +1739,7 @@ impl Proto {
                         self.stored.host_enabled = self.onb.host_enabled;
                         self.onb = Onboarding::new();
                         self.adopt_hub(url, token, cx);
-                        self.say("已登录 · 正在加载设备…", false);
+                        self.say("已登录，正在加载设备…", false);
                     }
                     Err(msg) => {
                         self.onb.busy = false;
@@ -1454,6 +1789,10 @@ impl Proto {
             Some((_, Err(TryRecvError::Empty))) | None => {}
         }
 
+        if self.pump_save() {
+            changed = true;
+        }
+
         // local agent: repaint the chip and tell the user about problems once per change
         let host_now = self.host_status();
         if host_now != self.host_seen {
@@ -1462,7 +1801,7 @@ impl Proto {
                     self.say(why.clone(), matches!(host_now, HostStatus::Retrying(_)));
                 }
                 HostStatus::Running if self.stored.host_enabled => {
-                    self.say("本机已就绪 · 可被其他设备连接", false);
+                    self.say("本机已就绪，可被其他设备连接", false);
                 }
                 _ => {}
             }
@@ -1516,10 +1855,21 @@ impl Proto {
             self.say("没有可接管的设备", true);
             return;
         };
-        let (title, link) = {
+        let (title, link, local) = {
             let d = &self.scenes.devices[sel];
-            (d.title.clone(), d.link)
+            (d.full_title(), d.link, d.is_local)
         };
+        if local {
+            // the machine the launcher runs on is never taken over from itself
+            self.say("这是本机，不能接管自己", false);
+            self.kick();
+            return;
+        }
+        if self.edit {
+            self.say("整理工位中，点「完成」后再接管", false);
+            self.kick();
+            return;
+        }
         self.connect_at = Some(Instant::now());
         if self.eff.live() {
             let result = self.launch_plan().and_then(|(exe, args)| {
@@ -1528,29 +1878,514 @@ impl Proto {
             });
             match result {
                 Ok(()) => self.say(
-                    format!("门闩已扣合 · 已启动 skylatch-client · {title}"),
+                    format!("门闩已扣合，已启动 skylatch-client：{title}"),
                     false,
                 ),
-                Err(e) => self.say(format!("门闩已扣合 · {e}"), true),
+                Err(e) => self.say(format!("门闩已扣合，{e}"), true),
             }
         } else if link == Link::Offline {
             self.say(
-                format!("门闩已扣合 · {title} 当前离线 · 已排队，上线后自动接管"),
+                format!("门闩已扣合，{title} 当前离线，已排队，上线后自动接管"),
                 false,
             );
         } else {
-            self.say(format!("门闩已扣合 · 正在接管 {title} · 演示模式"), false);
+            self.say(format!("门闩已扣合，正在接管 {title}（演示模式）"), false);
         }
         self.kick();
+    }
+
+    // ───────────── camera ─────────────
+
+    /// Top edge of the stage in window px: below the header and, while arranging, the toolbar.
+    fn stage_top(&self) -> f32 {
+        HEADER_H + if self.edit { TOOLBAR_H } else { 0.0 }
+    }
+
+    /// A window position in stage px.
+    fn stage_pt(&self, pos: Point<Pixels>) -> P2 {
+        P2::new(f(pos.x), f(pos.y) - self.stage_top())
+    }
+
+    /// The fit of the last frame seen through the camera. Hit testing, labels, panels and
+    /// painting all use this one transform.
+    fn apply_camera(&mut self) {
+        self.fit = if self.shelf {
+            self.fit_base
+        } else {
+            self.fit_base.with_camera(&self.cam, self.stage)
+        };
+    }
+
+    fn reset_camera(&mut self) {
+        self.cam.reset();
+        self.apply_camera();
+        self.kick();
+    }
+
+    /// Scroll wheel: zoom around the pointer (forward zooms in).
+    fn zoom_wheel(&mut self, dy: f32, pos: Point<Pixels>) {
+        if self.shelf || self.pair.open || self.drawer.open {
+            return;
+        }
+        let at = self.stage_pt(pos);
+        self.cam.zoom_at((dy * 0.0022).exp(), at, self.stage);
+        self.apply_camera();
+        self.kick();
+    }
+
+    // ───────────── pointer on the stage ─────────────
+
+    fn pointer_in_stage(&self, pos: Point<Pixels>) -> bool {
+        let p = self.stage_pt(pos);
+        p.x >= 0.0 && p.y >= 0.0 && p.x <= self.stage.0 && p.y <= self.stage.1
+    }
+
+    /// Left press: select (double-click takes over), or pick a machine up while arranging, or
+    /// start panning from empty floor.
+    fn stage_press(&mut self, pos: Point<Pixels>, clicks: usize) {
+        match self.hit(pos) {
+            Some(dv) => {
+                self.select(dv);
+                if self.edit {
+                    if !self.shelf {
+                        let d = &self.scenes.devices[dv];
+                        let devs = (0..self.scenes.devices.len())
+                            .filter(|&i| self.scenes.devices[i].machine_id == d.machine_id)
+                            .collect();
+                        self.drag = Some(DeviceDrag {
+                            machine_id: d.machine_id.clone(),
+                            devs,
+                            form: d.form,
+                            start: pos,
+                            pos,
+                            active: false,
+                        });
+                    }
+                } else if clicks >= 2 {
+                    self.connect();
+                }
+            }
+            None => self.start_pan(pos),
+        }
+    }
+
+    fn start_pan(&mut self, pos: Point<Pixels>) {
+        if !self.shelf && !self.pair.open && self.pointer_in_stage(pos) {
+            self.pan_drag = Some(PanDrag {
+                from: pos,
+                cam: self.cam,
+            });
+        }
+    }
+
+    /// Pointer move; `pressed` is the button held, if any.
+    fn stage_move(&mut self, pos: Point<Pixels>, pressed: Option<MouseButton>) -> bool {
+        let before = (self.hover, self.drag.as_ref().map(|d| d.active), self.cam);
+        if let Some(pd) = self.pan_drag {
+            if pressed.is_some() {
+                self.cam = pd.cam;
+                self.cam
+                    .pan_by(f(pos.x) - f(pd.from.x), f(pos.y) - f(pd.from.y), self.stage);
+                self.apply_camera();
+                self.hover = None;
+                self.kick();
+                return true;
+            }
+            self.pan_drag = None;
+        }
+        if let Some(dr) = &mut self.drag {
+            if pressed == Some(MouseButton::Left) {
+                dr.pos = pos;
+                let (dx, dy) = (f(pos.x) - f(dr.start.x), f(pos.y) - f(dr.start.y));
+                if !dr.active && (dx * dx + dy * dy).sqrt() > DRAG_SLOP {
+                    dr.active = true;
+                }
+                if dr.active {
+                    self.hover = None;
+                    self.kick();
+                    return true;
+                }
+            } else {
+                // the button was released outside the window
+                self.drag = None;
+            }
+        }
+        let h = self.hit(pos);
+        if h != self.hover {
+            self.hover = h;
+            self.kick();
+        }
+        before != (self.hover, self.drag.as_ref().map(|d| d.active), self.cam)
+    }
+
+    /// Any button released: a dragged machine lands, a pan ends.
+    fn stage_release(&mut self, button: MouseButton, pos: Point<Pixels>) {
+        if button == MouseButton::Left
+            && let Some(dr) = self.drag.take()
+            && dr.active
+        {
+            self.drop_machine(&dr, pos);
+        }
+        self.pan_drag = None;
+        self.kick();
+    }
+
+    /// The slot a machine of `form` dropped at `pos` would land in: a free compatible slot
+    /// under the pointer; an occupied one only when nothing free is there.
+    fn slot_at(&self, pos: Point<Pixels>, form: Form) -> Option<&SnapSlot> {
+        let p = self.fit.invert(self.stage_pt(pos));
+        let hits: Vec<&SnapSlot> = self
+            .scene()
+            .snaps
+            .iter()
+            .rev()
+            .filter(|sn| sn.kind.accepts(form) && point_in_polygon(p, &sn.poly))
+            .collect();
+        hits.iter()
+            .find(|sn| sn.occupied_by.is_none())
+            .or(hits.first())
+            .copied()
+    }
+
+    fn drop_machine(&mut self, dr: &DeviceDrag, pos: Point<Pixels>) {
+        let Some(room_id) = self
+            .scenes
+            .desks
+            .get(self.desk)
+            .and_then(|d| d.room_id.clone())
+        else {
+            return;
+        };
+        let Some((furniture, slot, occupant)) = self
+            .slot_at(pos, dr.form)
+            .map(|sn| (sn.furniture_id.clone(), sn.slot, sn.occupied_by))
+        else {
+            self.say("松手的位置放不下这台设备", true);
+            return;
+        };
+        if let Some(o) = occupant {
+            if dr.devs.contains(&o) {
+                return; // dropped where it already stands
+            }
+            self.say("那个位置已经有设备了，请放到虚线框里", true);
+            return;
+        }
+        let (machine, form) = (dr.machine_id.clone(), dr.form);
+        self.edit_layout(|l, online| {
+            move_device(l, &machine, form, &room_id, &furniture, slot, online)
+        });
+    }
+
+    /// The slot highlighted under a dragged machine.
+    fn drop_target(&self) -> Option<(String, u32)> {
+        let dr = self.drag.as_ref().filter(|d| d.active)?;
+        self.slot_at(dr.pos, dr.form)
+            .filter(|sn| sn.occupied_by.is_none())
+            .map(|sn| (sn.furniture_id.clone(), sn.slot))
+    }
+
+    // ───────────── arranging the workstation ─────────────
+
+    /// The arrange button and the `E` key exist while a hub is signed in or in `--demo`.
+    fn can_arrange(&self) -> bool {
+        self.eff.live() || self.eff.demo
+    }
+
+    fn toggle_edit(&mut self) {
+        if self.edit {
+            self.exit_edit();
+        } else {
+            self.enter_edit();
+        }
+        self.kick();
+    }
+
+    fn enter_edit(&mut self) {
+        if !self.can_arrange() || self.edit {
+            return;
+        }
+        if self.scenes.devices.is_empty() {
+            self.say("还没有设备可以整理", false);
+            return;
+        }
+        if self.shelf {
+            self.toggle_view();
+        }
+        self.drawer.open = false;
+        self.edit = true;
+        self.edit_dirty = false;
+        self.layout_before_edit = Some(self.layout.clone());
+        if self.layout.rooms.is_empty() {
+            // the automatic arrangement becomes an explicit one that can be edited
+            self.layout = match self.demo_fleet() {
+                true => materialize_layout(&demo_machines()),
+                false => materialize_for(&self.devices, self.local_id.as_deref()),
+            };
+            self.rebuild_scenes(false);
+        }
+    }
+
+    fn exit_edit(&mut self) {
+        if !self.edit {
+            return;
+        }
+        self.edit = false;
+        self.drag = None;
+        self.edit_input = None;
+        let before = self.layout_before_edit.take();
+        if !self.edit_dirty
+            && let Some(before) = before
+            && before != self.layout
+        {
+            // nothing was changed: back to what was there (the automatic arrangement)
+            self.layout = before;
+            self.rebuild_scenes(false);
+        }
+    }
+
+    /// Applies `op` to a copy of the effective arrangement; on success it becomes the layout,
+    /// the scene is rebuilt and the hub is asked to save it.
+    fn edit_layout(
+        &mut self,
+        op: impl FnOnce(&mut WorkspaceLayout, &dyn Fn(&str) -> bool) -> Result<(), String>,
+    ) -> bool {
+        let Some(mut l) = self.scenes.layout.clone() else {
+            return false;
+        };
+        let online: std::collections::HashSet<String> = self
+            .scenes
+            .devices
+            .iter()
+            .map(|d| d.machine_id.clone())
+            .collect();
+        match op(&mut l, &|id: &str| online.contains(id)) {
+            Ok(()) => {
+                self.layout = l;
+                self.edit_dirty = true;
+                self.rebuild_scenes(false);
+                self.request_save();
+                self.kick();
+                true
+            }
+            Err(e) => {
+                self.say(e, true);
+                self.kick();
+                false
+            }
+        }
+    }
+
+    fn current_room_id(&self) -> Option<String> {
+        self.scenes.desks.get(self.desk)?.room_id.clone()
+    }
+
+    fn arrange_add(&mut self, kind: FurnitureKind) {
+        let Some(room) = self.current_room_id() else {
+            return;
+        };
+        let taken: Vec<_> = self.scenes.desks[self.desk]
+            .furniture
+            .iter()
+            .map(|f| f.rect)
+            .collect();
+        self.edit_layout(|l, _| add_furniture(l, &room, kind, &taken).map(|_| ()));
+    }
+
+    /// Whether the room on screen has a piece of furniture that can go.
+    fn removable_furniture(&self) -> Option<String> {
+        let d = self.scenes.desks.get(self.desk)?;
+        (d.furniture.len() > 1)
+            .then(|| d.furniture.iter().rev().find(|f| f.empty == f.slots))
+            .flatten()
+            .map(|f| f.id.clone())
+    }
+
+    fn arrange_remove_empty(&mut self) {
+        let (Some(room), Some(id)) = (self.current_room_id(), self.removable_furniture()) else {
+            return;
+        };
+        self.edit_layout(|l, online| remove_furniture(l, &room, &id, online));
+    }
+
+    fn open_input(&mut self, kind: InputKind) {
+        let text = match kind {
+            InputKind::NewRoom => String::new(),
+            InputKind::Rename => match self.sel {
+                Some(s) => self.scenes.devices[s].title.clone(),
+                None => return,
+            },
+        };
+        self.edit_input = Some(EditInput { kind, text });
+        self.kick();
+    }
+
+    fn input_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        let m = &ks.modifiers;
+        match ks.key.as_str() {
+            "escape" => self.edit_input = None,
+            "enter" => self.commit_input(),
+            "backspace" => {
+                if let Some(i) = &mut self.edit_input {
+                    i.text.pop();
+                }
+            }
+            "v" if m.secondary() => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    self.input_text(text.trim());
+                }
+            }
+            key => {
+                if m.control || m.alt || m.platform {
+                    return;
+                }
+                let typed = ks
+                    .key_char
+                    .clone()
+                    .or_else(|| (key.chars().count() == 1).then(|| key.to_string()));
+                if let Some(t) = typed {
+                    self.input_text(&t);
+                }
+            }
+        }
+        self.kick();
+    }
+
+    fn input_text(&mut self, text: &str) {
+        if let Some(i) = &mut self.edit_input {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                if i.text.chars().count() < MAX_INPUT_LEN {
+                    i.text.push(c);
+                }
+            }
+        }
+    }
+
+    fn commit_input(&mut self) {
+        let Some(input) = self.edit_input.take() else {
+            return;
+        };
+        match input.kind {
+            InputKind::Rename => {
+                let Some(machine) = self.sel.map(|s| self.scenes.devices[s].machine_id.clone())
+                else {
+                    return;
+                };
+                if !self.edit_layout(|l, _| rename_device(l, &machine, &input.text)) {
+                    self.edit_input = Some(input);
+                }
+            }
+            InputKind::NewRoom => {
+                let name = input.text.trim().to_string();
+                if name.is_empty() {
+                    self.say("请填写房间名称", true);
+                    self.edit_input = Some(input);
+                    return;
+                }
+                if !self.edit_layout(|l, _| add_room(l, &name).map(|_| ())) {
+                    self.edit_input = Some(input);
+                } else if let Some(i) = self.scenes.desks.iter().position(|d| d.name == name) {
+                    self.set_desk(i);
+                }
+            }
+        }
+    }
+
+    /// 恢复自动布局: forget the arrangement everywhere.
+    fn reset_layout(&mut self) {
+        self.layout = WorkspaceLayout::default();
+        self.layout_before_edit = None;
+        self.edit = false;
+        self.edit_dirty = false;
+        self.drag = None;
+        self.edit_input = None;
+        self.rebuild_scenes(false);
+        self.request_save();
+        self.say("已恢复自动布局", false);
+        self.kick();
+    }
+
+    /// 移到房间: the selected machine takes the first open slot of another room.
+    fn move_selected_to_room(&mut self, room_id: String) {
+        let Some(sel) = self.sel else { return };
+        let (machine, form, key) = {
+            let d = &self.scenes.devices[sel];
+            (d.machine_id.clone(), d.form, d.key.clone())
+        };
+        if self.edit_layout(|l, online| move_to_room(l, &machine, form, &room_id, online))
+            && let Some(dv) = self.scenes.find(&key)
+        {
+            self.sel = Some(dv);
+            self.select(dv);
+        }
+    }
+
+    fn forget_arrangement(&mut self) {
+        self.layout = WorkspaceLayout::default();
+        self.layout_before_edit = None;
+        self.edit = false;
+        self.edit_dirty = false;
+        self.drag = None;
+        self.pan_drag = None;
+        self.edit_input = None;
+        self.save = SaveState {
+            inflight: None,
+            dirty: false,
+            status: LayoutStatus::Idle,
+        };
+        self.cam.reset();
+    }
+
+    // ───────────── saving the arrangement ─────────────
+
+    /// Saves `self.layout` on the hub in the background, one request at a time; edits made
+    /// meanwhile are sent when the request in flight is done.
+    fn request_save(&mut self) {
+        if !self.eff.live() {
+            self.save.status = LayoutStatus::LocalOnly;
+            return;
+        }
+        if self.save.inflight.is_some() {
+            self.save.dirty = true;
+            return;
+        }
+        self.start_save();
+    }
+
+    fn start_save(&mut self) {
+        let t = self.live_target();
+        self.save.inflight = Some(live::save_layout(&t.url, &t.token, &self.layout));
+        self.save.dirty = false;
+        self.save.status = LayoutStatus::Saving;
+    }
+
+    /// Applies the answer of the save request, and sends the next one if edits piled up.
+    fn pump_save(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let answer = self.save.inflight.as_ref().map(|rx| rx.try_recv());
+        let outcome = match answer {
+            Some(Ok(r)) => r.map(|_| ()),
+            Some(Err(TryRecvError::Disconnected)) => Err("保存请求未能完成".to_string()),
+            Some(Err(TryRecvError::Empty)) | None => return false,
+        };
+        self.save.inflight = None;
+        match outcome {
+            Ok(()) => self.save.status = LayoutStatus::Saved,
+            Err(msg) => {
+                self.say(format!("布局保存失败：{msg}"), true);
+                self.save.status = LayoutStatus::Failed(msg);
+            }
+        }
+        if self.save.dirty {
+            self.start_save();
+        }
+        true
     }
 
     fn hit(&self, pos: Point<Pixels>) -> Option<usize> {
         if self.pair.open {
             return None;
         }
-        let (sw, sh) = self.stage;
-        let (x, y) = (f(pos.x), f(pos.y) - HEADER_H);
-        if x < 0.0 || y < 0.0 || x > sw || y > sh {
+        if !self.pointer_in_stage(pos) {
             return None;
         }
         if self.drawer.open {
@@ -1560,7 +2395,7 @@ impl Proto {
                 return None;
             }
         }
-        self.scene().hit_test(self.fit.invert(P2::new(x, y)))
+        self.scene().hit_test(self.fit.invert(self.stage_pt(pos)))
     }
 
     fn in_drawer(&self, pos: Point<Pixels>) -> bool {
@@ -1589,6 +2424,11 @@ impl Proto {
             cx.notify();
             return;
         }
+        if self.edit_input.is_some() {
+            self.input_key(ks, cx);
+            cx.notify();
+            return;
+        }
         if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
             return;
         }
@@ -1603,6 +2443,9 @@ impl Proto {
             "t" => self.set_dark(!self.dark),
             "r" => self.refresh(),
             "h" => self.toggle_drawer(),
+            "e" if self.can_arrange() => self.toggle_edit(),
+            "escape" if self.edit => self.exit_edit(),
+            "0" => self.reset_camera(),
             "enter" => self.connect(),
             _ => return,
         }
@@ -1656,6 +2499,386 @@ impl Proto {
                 on(this);
                 cx.notify();
             }))
+            .into_any_element()
+    }
+
+    // ───────────── arrange mode: header button and toolbar ─────────────
+
+    /// 整理工位 in the header: toggles arrange mode (key `E`).
+    fn arrange_button(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let on = self.edit;
+        let (fg, bg, border) = if on {
+            (
+                rgba(pal.on_accent, 1.0),
+                rgba(pal.accent, 1.0),
+                rgba(pal.accent, 1.0),
+            )
+        } else {
+            (rgba(pal.ink, 1.0), rgba(pal.ink, 0.0), rgba(pal.hair, 1.0))
+        };
+        let wash = rgba(pal.wash, 1.0);
+        div()
+            .id("edit-toggle")
+            .debug_selector(|| "edit-toggle".to_string())
+            .mr(px(10.0))
+            .h(px(26.0))
+            .pl(px(12.0))
+            .pr(px(7.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .rounded_full()
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .cursor_pointer()
+            .when(!on, move |d| d.hover(move |s| s.bg(wash)))
+            .child(txt("整理工位", 12.5, fg).font_weight(FontWeight::MEDIUM))
+            .child(
+                div()
+                    .h(px(16.0))
+                    .min_w(px(16.0))
+                    .px(px(4.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .bg(fg.opacity(if on { 0.2 } else { 0.08 }))
+                    .child(mtxt("E", 9.5, fg)),
+            )
+            .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
+                window.focus(&this.focus);
+                this.toggle_edit();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_btn(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        enabled: bool,
+        primary: bool,
+        pal: &Pal,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self) + 'static,
+    ) -> gpui::AnyElement {
+        let (fg, bg, border) = if primary {
+            (
+                rgba(pal.on_accent, 1.0),
+                rgba(pal.accent, 1.0),
+                rgba(pal.accent, 1.0),
+            )
+        } else {
+            (
+                rgba(pal.ink, 1.0),
+                rgba(pal.canvas, 1.0),
+                rgba(pal.hair, 1.0),
+            )
+        };
+        let wash = rgba(pal.wash, 1.0);
+        let accent = rgba(pal.accent, 1.0);
+        div()
+            .id(id)
+            .debug_selector(|| id.to_string())
+            .h(px(26.0))
+            .px(px(11.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .opacity(if enabled { 1.0 } else { 0.4 })
+            .when(enabled, move |d| {
+                d.cursor_pointer().hover(move |s| {
+                    if primary {
+                        s.opacity(0.9)
+                    } else {
+                        s.bg(wash).border_color(accent)
+                    }
+                })
+            })
+            .child(txt(label, 12.0, fg).font_weight(if primary {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            }))
+            .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
+                window.focus(&this.focus);
+                if enabled {
+                    on(this);
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The inline text field of the toolbar with its confirm and cancel buttons.
+    fn tool_input(
+        &self,
+        placeholder: &'static str,
+        pal: &Pal,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(input) = &self.edit_input else {
+            return div().into_any_element();
+        };
+        let empty = input.text.is_empty();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("edit-input")
+                    .debug_selector(|| "edit-input".to_string())
+                    .h(px(26.0))
+                    .w(px(168.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgba(pal.accent, 1.0))
+                    .bg(rgba(pal.canvas, 1.0))
+                    .child(if empty {
+                        txt(placeholder, 12.0, rgba(pal.muted, 0.7))
+                    } else {
+                        txt(input.text.clone(), 12.0, rgba(pal.ink, 1.0))
+                    })
+                    .child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(14.0))
+                            .ml(px(1.0))
+                            .flex_none()
+                            .bg(rgba(pal.accent, 1.0)),
+                    ),
+            )
+            .child(
+                self.tool_btn("edit-input-ok", "确定", true, true, pal, cx, |t| {
+                    t.commit_input()
+                }),
+            )
+            .child(
+                self.tool_btn("edit-input-cancel", "取消", true, false, pal, cx, |t| {
+                    t.edit_input = None
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The arrange toolbar under the header: furniture and rooms on the first row, the
+    /// selected machine on the second.
+    fn edit_toolbar(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = rgba(pal.muted, 1.0);
+        let ink = rgba(pal.ink, 1.0);
+        let row = || {
+            div()
+                .h(px(TOOLBAR_H / 2.0))
+                .w_full()
+                .px(px(26.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+        };
+        let adding_room = self
+            .edit_input
+            .as_ref()
+            .is_some_and(|i| i.kind == InputKind::NewRoom);
+        let renaming = self
+            .edit_input
+            .as_ref()
+            .is_some_and(|i| i.kind == InputKind::Rename);
+        let on_room = self.current_room_id().is_some();
+        let can_remove = self.removable_furniture().is_some();
+        let status = match &self.save.status {
+            LayoutStatus::Idle => (String::new(), muted),
+            LayoutStatus::Saving => ("保存中…".to_string(), rgba(pal.blue, 1.0)),
+            LayoutStatus::Saved => ("已保存到 Hub".to_string(), rgba(pal.green, 1.0)),
+            LayoutStatus::LocalOnly => ("未连接 Hub，仅本次运行有效".to_string(), muted),
+            LayoutStatus::Failed(m) => (format!("保存失败：{}", clip(m, 36)), rgba(pal.warn, 1.0)),
+        };
+
+        let first = row()
+            .child(txt("整理工位", 13.0, ink).font_weight(FontWeight::SEMIBOLD))
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx(px(4.0))
+                    .bg(rgba(pal.hair, 1.0)),
+            )
+            .child(self.tool_btn(
+                "edit-add-ldesk",
+                format!("+ {}", furniture_label(FurnitureKind::LDesk)),
+                on_room,
+                false,
+                pal,
+                cx,
+                |t| t.arrange_add(FurnitureKind::LDesk),
+            ))
+            .child(self.tool_btn(
+                "edit-add-straight",
+                format!("+ {}", furniture_label(FurnitureKind::StraightDesk)),
+                on_room,
+                false,
+                pal,
+                cx,
+                |t| t.arrange_add(FurnitureKind::StraightDesk),
+            ))
+            .child(self.tool_btn(
+                "edit-add-rack",
+                format!("+ {}", furniture_label(FurnitureKind::VmRack)),
+                on_room,
+                false,
+                pal,
+                cx,
+                |t| t.arrange_add(FurnitureKind::VmRack),
+            ))
+            .child(self.tool_btn(
+                "edit-remove-empty",
+                "移除空家具",
+                can_remove,
+                false,
+                pal,
+                cx,
+                |t| t.arrange_remove_empty(),
+            ))
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx(px(4.0))
+                    .bg(rgba(pal.hair, 1.0)),
+            )
+            .child(if adding_room {
+                self.tool_input("房间名称", pal, cx)
+            } else {
+                self.tool_btn(
+                    "edit-add-room",
+                    "+ 新建房间",
+                    true,
+                    false,
+                    pal,
+                    cx,
+                    |t| t.open_input(InputKind::NewRoom),
+                )
+            })
+            .child(div().flex_1())
+            .child(txt(status.0, 11.5, status.1))
+            .child(
+                self.tool_btn("edit-done", "完成", true, true, pal, cx, |t| {
+                    t.exit_edit()
+                }),
+            );
+
+        let selected = self.sel.map(|s| &self.scenes.devices[s]);
+        let here = self.current_room_id();
+        let others: Vec<(usize, String, String)> = self
+            .scenes
+            .desks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                let id = d.room_id.clone()?;
+                (Some(&id) != here.as_ref()).then(|| (i, id, d.name.clone()))
+            })
+            .take(6)
+            .collect();
+        let second = row()
+            .child(match selected {
+                Some(d) => div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(txt("已选", 11.5, muted))
+                    .child(txt(clip(&d.title, 18), 12.5, ink).font_weight(FontWeight::MEDIUM))
+                    .children(d.is_local.then(|| local_chip(pal))),
+                None => div().child(txt("点一台设备再改名或换房间", 11.5, muted)),
+            })
+            .child(if renaming {
+                self.tool_input("设备名称", pal, cx)
+            } else {
+                self.tool_btn(
+                    "edit-rename",
+                    "改名",
+                    selected.is_some(),
+                    false,
+                    pal,
+                    cx,
+                    |t| t.open_input(InputKind::Rename),
+                )
+            })
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx(px(4.0))
+                    .bg(rgba(pal.hair, 1.0)),
+            )
+            .child(txt("移到房间", 11.5, muted))
+            .children(others.into_iter().map(|(i, id, name)| {
+                let label = clip(&name, 10);
+                let sel = selected.is_some();
+                let btn_id: SharedString = format!("edit-room-{i}").into();
+                let probe = btn_id.to_string();
+                div()
+                    .id(btn_id)
+                    .debug_selector(move || probe.clone())
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(pal.hair, 1.0))
+                    .bg(rgba(pal.canvas, 1.0))
+                    .opacity(if sel { 1.0 } else { 0.4 })
+                    .when(sel, |d| {
+                        d.cursor_pointer()
+                            .hover(|s| s.border_color(rgba(pal.accent, 1.0)))
+                    })
+                    .child(txt(label, 12.0, ink))
+                    .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
+                        window.focus(&this.focus);
+                        if sel {
+                            this.move_selected_to_room(id.clone());
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1())
+            .child(self.tool_btn(
+                "edit-reset",
+                "恢复自动布局",
+                true,
+                false,
+                pal,
+                cx,
+                |t| t.reset_layout(),
+            ));
+
+        div()
+            .id("edit-toolbar")
+            .debug_selector(|| "edit-toolbar".to_string())
+            .w_full()
+            .h(px(TOOLBAR_H))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgba(pal.bar, 1.0))
+            .border_b_1()
+            .border_color(rgba(pal.hair, 1.0))
+            .child(first)
+            .child(second)
             .into_any_element()
     }
 
@@ -1737,29 +2960,23 @@ impl Proto {
             .into_any_element()
     }
 
-    /// (dot colour, hollow, label) of the Hub pill.
-    fn hub_pill(&self, pal: &Pal) -> (Hsla, bool, String) {
-        let host = config::hub_host(&self.eff.hub_url);
+    /// (dot colour, hollow, host, status) of the Hub pill.
+    fn hub_pill(&self, pal: &Pal) -> (Hsla, bool, Option<String>, String) {
+        let host = Some(config::hub_host(&self.eff.hub_url));
         match &self.hub {
-            HubState::Demo => (rgba(pal.muted, 0.8), true, "Hub · 本地演示".to_string()),
-            HubState::Unconfigured => (rgba(pal.muted, 0.8), true, "Hub · 未连接".to_string()),
-            HubState::Connecting => (rgba(pal.blue, 1.0), true, format!("Hub · {host} · 连接中…")),
-            HubState::Online { count } => (
-                rgba(pal.green, 1.0),
-                false,
-                format!("Hub · {host} · {count} 台在线"),
-            ),
+            HubState::Demo => (rgba(pal.muted, 0.8), true, None, "本地演示".to_string()),
+            HubState::Unconfigured => (rgba(pal.muted, 0.8), true, None, "未连接".to_string()),
+            HubState::Connecting => (rgba(pal.blue, 1.0), true, host, "连接中…".to_string()),
+            HubState::Online { count } => {
+                (rgba(pal.green, 1.0), false, host, format!("{count} 台在线"))
+            }
             HubState::Failed(msg) => {
                 let short = if msg.contains("Token") {
                     "未授权"
                 } else {
                     "无法连接"
                 };
-                (
-                    rgba(pal.warn, 1.0),
-                    false,
-                    format!("Hub · {host} · {short}"),
-                )
+                (rgba(pal.warn, 1.0), false, host, short.to_string())
             }
         }
     }
@@ -1841,7 +3058,7 @@ impl Proto {
             (None, HubState::Unconfigured) => (String::new(), muted),
             (None, HubState::Connecting) => ("正在连接…".to_string(), rgba(pal.blue, 1.0)),
             (None, HubState::Online { count }) => {
-                (format!("已连接 · {count} 台设备在线"), rgba(pal.green, 1.0))
+                (format!("已连接，{count} 台设备在线"), rgba(pal.green, 1.0))
             }
             (None, HubState::Failed(m)) => (m.clone(), rgba(pal.warn, 1.0)),
         };
@@ -2011,11 +3228,11 @@ impl Proto {
                             })),
                     ),
             )
-            .child(txt(
-                "Tab 切换字段 · Enter 保存 · Esc 关闭 · 设置保存在本机用户配置目录",
-                10.5,
-                muted,
+            .child(hint_row(
+                &[("Tab", "切换字段"), ("Enter", "保存"), ("Esc", "关闭")],
+                pal,
             ))
+            .child(txt("设置保存在本机用户配置目录", 10.5, muted))
             .into_any_element()
     }
 }
@@ -2031,9 +3248,11 @@ impl Render for Proto {
 
         let pal = self.pal();
         let vp = window.viewport_size();
-        let (sw, sh) = stage_size(f(vp.width), f(vp.height));
+        let toolbar_h = if self.edit { TOOLBAR_H } else { 0.0 };
+        let (sw, sh) = stage_size(f(vp.width), f(vp.height) - toolbar_h);
         self.stage = (sw, sh);
-        self.fit = self.scenes.fit(self.shelf, sw, sh);
+        self.fit_base = self.scenes.fit(self.shelf, self.desk, sw, sh);
+        self.apply_camera();
         let fit = self.fit;
 
         let item_a = ease_out(self.view_t);
@@ -2060,7 +3279,7 @@ impl Render for Proto {
         };
 
         // ── header ──
-        let (pill_dot, pill_hollow, pill_label) = self.hub_pill(&pal);
+        let (pill_dot, pill_hollow, pill_host, pill_status) = self.hub_pill(&pal);
         let live_mode = self.eff.live();
         let mark_pal = pal;
         let tabs_active = !self.shelf;
@@ -2125,7 +3344,9 @@ impl Render for Proto {
                             } else {
                                 div().size(px(6.0)).rounded_full().bg(pill_dot)
                             })
-                            .child(mtxt(pill_label, 11.0, muted))
+                            .child(txt("Hub", 11.5, ink).font_weight(FontWeight::MEDIUM))
+                            .children(pill_host.map(|h| mtxt(h, 11.0, muted)))
+                            .child(txt(pill_status, 11.0, rgba(pal.muted, 0.85)))
                             .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
                                 this.toggle_drawer();
                                 cx.notify();
@@ -2191,6 +3412,7 @@ impl Render for Proto {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
+            .children(self.can_arrange().then(|| self.arrange_button(&pal, cx)))
             .child(
                 div()
                     .flex()
@@ -2275,8 +3497,9 @@ impl Render for Proto {
         let scene = self.scene();
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
-        // corner tags
-        let (tag_title, tag_sub) = if self.shelf {
+        // corner tag: the headline, then its pieces (first plain, the rest as small pills)
+        let (tag_title, tag_aside, tag_parts): (String, Option<String>, Vec<String>) = if self.shelf
+        {
             let mut ys: Vec<i32> = scene
                 .labels
                 .iter()
@@ -2285,22 +3508,43 @@ impl Render for Proto {
             ys.sort_unstable();
             ys.dedup();
             (
-                format!("陈列架 · {}", clip(&desk.name, 16)),
-                format!(
-                    "SHELF · {} DEVICES · {} ROW{}",
-                    desk.shelf_devs.len(),
-                    ys.len().max(1),
-                    if ys.len() > 1 { "S" } else { "" }
-                ),
+                "陈列架".to_string(),
+                Some(clip(&desk.name, 16)),
+                vec![
+                    "SHELF".to_string(),
+                    format!("{} DEVICES", desk.shelf_devs.len()),
+                    format!(
+                        "{} ROW{}",
+                        ys.len().max(1),
+                        if ys.len() > 1 { "S" } else { "" }
+                    ),
+                ],
             )
         } else if scenes.devices.is_empty() {
             (
-                "空桌 · Empty desk".to_string(),
-                "EMPTY L-DESK · 0 SCREENS".to_string(),
+                "空桌".to_string(),
+                Some("Empty desk".to_string()),
+                vec!["EMPTY L-DESK".to_string(), "0 SCREENS".to_string()],
             )
         } else {
-            (clip(&desk.name, 18), desk.sub.clone())
+            (clip(&desk.name, 18), None, desk.sub.clone())
         };
+        let mut tag_row = div().flex().items_center().gap(px(6.0));
+        for (i, part) in tag_parts.into_iter().enumerate() {
+            tag_row = tag_row.child(if i == 0 {
+                mtxt(part, 10.5, muted)
+            } else {
+                div()
+                    .h(px(16.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(hair)
+                    .child(mtxt(part, 9.5, muted))
+            });
+        }
         overlays.push(
             div()
                 .absolute()
@@ -2309,8 +3553,15 @@ impl Render for Proto {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(txt(tag_title, 13.5, ink).font_weight(FontWeight::SEMIBOLD))
-                .child(mtxt(tag_sub, 10.5, muted))
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(8.0))
+                        .child(txt(tag_title, 13.5, ink).font_weight(FontWeight::SEMIBOLD))
+                        .children(tag_aside.map(|a| txt(a, 11.5, muted))),
+                )
+                .child(tag_row)
                 .into_any_element(),
         );
         let legend = |role: Role, label: &'static str, hollow: bool| {
@@ -2358,44 +3609,60 @@ impl Render for Proto {
                 )
                 .into_any_element(),
         );
-        let key = |k: &'static str, label: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .h(px(18.0))
-                        .min_w(px(18.0))
-                        .px(px(5.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(hair)
-                        .bg(rgba(pal.surface, 1.0))
-                        .child(mtxt(k, 10.0, ink)),
-                )
-                .child(txt(label, 11.0, muted))
-        };
         overlays.extend((!self.onboarding_active()).then(|| {
-            div()
+            let mut hints = vec![
+                ("←→", "切换屏幕"),
+                ("1-9", "工位"),
+                ("V", "陈列架"),
+                ("T", "主题"),
+                ("R", "刷新"),
+                ("H", "Hub"),
+            ];
+            if self.can_arrange() {
+                hints.push(("E", if self.edit { "完成" } else { "整理" }));
+            }
+            if !self.edit {
+                hints.push(("Enter", "接管"));
+            }
+            hint_row(&hints, &pal)
                 .absolute()
                 .left(px(26.0))
                 .bottom(px(16.0))
-                .flex()
-                .items_center()
-                .gap(px(14.0))
-                .child(key("←→", "切换屏幕"))
-                .child(key("1-9", "工位"))
-                .child(key("V", "陈列架"))
-                .child(key("T", "主题"))
-                .child(key("R", "刷新"))
-                .child(key("H", "Hub"))
-                .child(key("Enter", "接管"))
                 .into_any_element()
         }));
+
+        // the camera is off its automatic fit: say so, one click (or 0) brings it back
+        if !self.shelf && !self.cam.is_default() {
+            overlays.push(
+                div()
+                    .id("cam-reset")
+                    .debug_selector(|| "cam-reset".to_string())
+                    .absolute()
+                    .right(px(26.0))
+                    .bottom(px(12.0))
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(hair)
+                    .bg(rgba(pal.bar, 0.95))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(pal.wash, 1.0)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(mtxt(format!("{:.0}%", self.cam.zoom * 100.0), 10.5, muted))
+                    .child(txt("重置视野", 11.5, ink))
+                    .child(keycap("0", &pal))
+                    .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.reset_camera();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         // nothing to draw yet: say why. An unconfigured app shows the onboarding card and an
         // empty hub the first-device card instead.
@@ -2469,16 +3736,30 @@ impl Render for Proto {
                     .border_color(line)
                     .opacity(item_a)
                     .child(dot)
-                    .child(txt(d.label.clone(), NAME_SIZE, col).font_weight(
-                        if self.sel == Some(lb.dev) {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        },
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(TAG_GAP))
+                            .child(txt(d.label.clone(), NAME_SIZE, col).font_weight(
+                                if self.sel == Some(lb.dev) {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                },
+                            ))
+                            .children(
+                                (!d.tag.is_empty())
+                                    .then(|| txt(d.tag.clone(), TAG_SIZE, rgba(pal.muted, 0.8))),
+                            )
+                            .children(d.is_local.then(|| local_chip(&pal))),
+                    )
                     .into_any_element(),
             );
             if let (Some((r, text)), true) = (&lb.detail, t > 0.01) {
+                // resolution and route: two runs of text, the gap between them is the separator
+                let mut parts = text.splitn(2, DETAIL_SEP);
+                let (res, route) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
                 overlays.push(
                     div()
                         .absolute()
@@ -2489,20 +3770,20 @@ impl Render for Proto {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .gap(px(6.0))
                         .opacity(t * item_a)
-                        .child(mtxt(text.clone(), DETAIL_SIZE, muted))
+                        .child(mtxt(res.to_string(), DETAIL_SIZE, muted))
+                        .child(mtxt(route.to_string(), DETAIL_SIZE, rgba(pal.muted, 0.75)))
                         .into_any_element(),
                 );
             }
         }
 
         // dashed VM preview panel for the hovered (else selected) rack blade
-        if let (Some(target), Some(rack), Some(pr)) = (
-            self.hover.or(self.sel),
-            scene.rack.as_ref(),
-            panel_rect(scene, &fit, self.stage),
-        ) && rack.devs.contains(&target)
+        if let Some(target) = self.hover.or(self.sel)
+            && let Some(ri) = scene.racks.iter().position(|r| r.devs.contains(&target))
         {
+            let pr = panel_rects(scene, &fit, self.stage)[ri];
             let d = &scenes.devices[target];
             let a = if self.hover == Some(target) {
                 self.hover_t[target].max(0.001)
@@ -2539,7 +3820,7 @@ impl Render for Proto {
                     .w(px(pr.w))
                     .h(px(pr.h))
                     .px(px(14.0))
-                    .py(px(10.0))
+                    .py(px(8.0))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
@@ -2558,7 +3839,13 @@ impl Render for Proto {
                             .child(dot)
                             .child(
                                 txt(d.label.clone(), 12.5, ink).font_weight(FontWeight::SEMIBOLD),
-                            ),
+                            )
+                            .children(d.is_local.then(|| local_chip(&pal))),
+                    )
+                    .children(
+                        d.hardware_model
+                            .clone()
+                            .map(|m| row("型号", clip(&m, 26), false, ink)),
                     )
                     .child(row("系统", d.os.clone(), false, ink))
                     .child(row("捕获", d.capture.clone(), false, ink))
@@ -2590,6 +3877,14 @@ impl Render for Proto {
             item_dy,
             connect_t,
             sel: self.sel,
+            edit: self.edit && !self.shelf,
+            ghost: self.drag.as_ref().filter(|d| d.active).map(|d| Ghost {
+                devs: d.devs.clone(),
+                form: d.form,
+                dx: f(d.pos.x) - f(d.start.x),
+                dy: f(d.pos.y) - f(d.start.y),
+            }),
+            drop_target: self.drop_target(),
         };
 
         // Window dragging: nothing above the header's `Drag` areas may react to a mouse-down.
@@ -2615,10 +3910,7 @@ impl Render for Proto {
                 }
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                let h = this.hit(ev.position);
-                if h != this.hover {
-                    this.hover = h;
-                    this.kick();
+                if this.stage_move(ev.position, ev.pressed_button) {
                     cx.notify();
                 }
             }))
@@ -2634,15 +3926,59 @@ impl Render for Proto {
                         }
                         return;
                     }
-                    if let Some(dv) = this.hit(ev.position) {
-                        this.select(dv);
-                        if ev.click_count >= 2 {
-                            this.connect();
-                        }
-                        cx.notify();
-                    }
+                    this.stage_press(ev.position, ev.click_count);
+                    cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.start_pan(ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.start_pan(ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                    this.stage_release(MouseButton::Left, ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                    this.stage_release(MouseButton::Left, ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                    this.stage_release(MouseButton::Right, ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                    this.stage_release(MouseButton::Middle, ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                let dy = f(ev.delta.pixel_delta(px(40.0)).y);
+                this.zoom_wheel(dy, ev.position);
+                cx.notify();
+            }))
             .child(
                 canvas(|_, _, _| (), move |b, _, w, _| paint_stage(w, b, &paint))
                     .absolute()
@@ -2681,22 +4017,20 @@ impl Render for Proto {
                     )
             }
             (None, Some(d)) => {
-                let sep = || mtxt("·", 12.0, rgba(pal.muted, 0.6));
+                // resolution, route, capture: the gaps and the weights tell them apart
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
+                    .gap(px(18.0))
                     .child(mtxt(d.res.clone(), 12.0, muted))
-                    .child(sep())
                     .child(txt(link_txt.clone(), 12.5, link_col).font_weight(FontWeight::MEDIUM))
-                    .child(sep())
-                    .child(txt(d.capture.clone(), 12.0, muted))
+                    .child(txt(d.capture.clone(), 12.0, rgba(pal.muted, 0.8)))
             }
             (None, None) => div().child(txt(
                 match &self.hub {
                     HubState::Unconfigured => "连接 Hub 或直连一台主机后，设备会出现在这张桌子上",
                     HubState::Online { count: 0 } => {
-                        "Hub 上暂无在线设备 · 点击顶栏「+ 添加设备」获取配对码"
+                        "Hub 上暂无在线设备，点击顶栏「+ 添加设备」获取配对码"
                     }
                     _ => "按 H 打开 Hub 设置",
                 },
@@ -2729,9 +4063,11 @@ impl Render for Proto {
         let hidden_chip = (!self.shelf && desk.hidden > 0).then(|| {
             chip(
                 "hint-shelf",
-                format!("另有 {} 台设备在陈列架 · 按 V", desk.hidden),
+                format!("另有 {} 台设备在陈列架", desk.hidden),
                 accent,
             )
+            .gap(px(6.0))
+            .child(keycap("V", &pal))
             .cursor_pointer()
             .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
                 this.toggle_view();
@@ -2764,6 +4100,22 @@ impl Render for Proto {
                         )
                         .font_weight(FontWeight::SEMIBOLD),
                     )
+                    .children(
+                        dev.filter(|d| !d.part.is_empty())
+                            .map(|d| txt(d.part.clone(), 12.5, muted)),
+                    )
+                    .children(
+                        dev.filter(|d| !d.tag.is_empty())
+                            .map(|d| badge(d.tag.clone(), muted, hair, 10.5)),
+                    )
+                    .children(
+                        dev.filter(|d| d.is_local)
+                            .map(|_| badge("本机", accent, rgba(pal.accent, 0.6), 10.5)),
+                    )
+                    .children(
+                        dev.and_then(|d| d.hardware_model.clone())
+                            .map(|m| txt(clip(&m, 32), 12.0, rgba(pal.muted, 0.85))),
+                    )
                     .children(hidden_chip)
                     .children(error_chip),
             )
@@ -2788,6 +4140,7 @@ impl Render for Proto {
                     .bg(if on { rgba(pal.accent, 0.10) } else { canvas_c })
                     .cursor_pointer()
                     .hover(move |s| s.border_color(accent))
+                    .gap(px(7.0))
                     .child(
                         txt(c.chip.clone(), 12.5, if on { accent } else { ink }).font_weight(
                             if on {
@@ -2797,6 +4150,15 @@ impl Render for Proto {
                             },
                         ),
                     )
+                    .child(txt(
+                        c.chip_tag.clone(),
+                        11.0,
+                        if on {
+                            rgba(pal.accent, 0.8)
+                        } else {
+                            rgba(pal.muted, 0.9)
+                        },
+                    ))
                     .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                         this.select(i);
                         cx.notify();
@@ -2805,24 +4167,35 @@ impl Render for Proto {
 
         let on_accent = rgba(pal.on_accent, 1.0);
         let btn_hover = rgba(pal.accent.mix(pal.ink, 0.18), 1.0);
-        let enabled = self.sel.is_some();
+        // the machine the launcher runs on is never taken over from itself
+        let is_local = dev.is_some_and(|d| d.is_local);
+        let enabled = self.sel.is_some() && !is_local;
         let button = div()
             .id("connect")
+            .debug_selector(|| "connect".to_string())
             .h(px(40.0))
             .pl(px(20.0))
-            .pr(px(12.0))
+            .pr(px(if is_local { 20.0 } else { 12.0 }))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(12.0))
             .rounded(px(6.0))
-            .bg(accent)
-            .opacity(if enabled { 1.0 } else { 0.4 })
+            .bg(if is_local {
+                rgba(pal.wash, 1.0)
+            } else {
+                accent
+            })
+            .opacity(if self.sel.is_some() { 1.0 } else { 0.4 })
             .when(enabled, |d| {
                 d.cursor_pointer().hover(move |s| s.bg(btn_hover))
             })
-            .child(txt("接管屏幕", 14.0, on_accent).font_weight(FontWeight::SEMIBOLD))
-            .child(
+            .child(if is_local {
+                txt("当前设备", 14.0, muted).font_weight(FontWeight::SEMIBOLD)
+            } else {
+                txt("接管屏幕", 14.0, on_accent).font_weight(FontWeight::SEMIBOLD)
+            })
+            .children((!is_local).then(|| {
                 div()
                     .h(px(20.0))
                     .px(px(6.0))
@@ -2830,8 +4203,8 @@ impl Render for Proto {
                     .items_center()
                     .rounded(px(4.0))
                     .bg(on_accent.opacity(0.18))
-                    .child(mtxt("Enter", 9.5, on_accent)),
-            )
+                    .child(mtxt("Enter", 9.5, on_accent))
+            }))
             .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
                 this.connect();
                 cx.notify();
@@ -2880,6 +4253,7 @@ impl Render for Proto {
             .when(self.hover.is_some(), |d| d.cursor_pointer())
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| this.on_key(ev, cx)))
             .child(header)
+            .children(self.edit.then(|| self.edit_toolbar(&pal, cx)))
             .child(stage)
             .child(footer)
             .children(self.drawer.open.then(|| self.drawer_view(&pal, cx)))
@@ -3005,6 +4379,7 @@ fn main() {
                 let view = cx.new(|cx| {
                     let mut p = Proto::new(cx, stored, eff, config_path);
                     p.attach_host(host_for_window, tray_active);
+                    p.agent_json = host_mgr::agent_config_path();
                     p.start(cx);
                     p
                 });
@@ -3128,8 +4503,13 @@ mod ui_tests {
 
     fn screen_px(view: &Proto, dev: usize) -> Point<Pixels> {
         let c = polygon_center(&view.scene().screen(dev).unwrap().bezel);
-        let p = view.fit.apply(c);
-        point(px(p.x), px(p.y + HEADER_H))
+        win_px(view, c)
+    }
+
+    /// Window position of a scene point, through the fit (and so the camera) of the last frame.
+    fn win_px(view: &Proto, scene_pt: P2) -> Point<Pixels> {
+        let p = view.fit.apply(scene_pt);
+        point(px(p.x), px(p.y + view.stage_top()))
     }
 
     fn key(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext, k: &str) -> usize {
@@ -3225,6 +4605,7 @@ mod ui_tests {
             monitor_list: monitors,
             room: Some(room.into()),
             slot: Some(slot),
+            hardware_model: None,
         }
     }
 
@@ -3294,6 +4675,16 @@ mod ui_tests {
                 vec![mon("d1", 0, 3840, 2160)],
                 false,
             ),
+            // a VM whose room has no desk: the only guest of the VM Rack tab
+            info(
+                "cage",
+                "Cage-VM",
+                Vm,
+                "Cage",
+                0,
+                vec![mon("d1", 0, 1920, 1080)],
+                false,
+            ),
         ]
     }
 
@@ -3317,7 +4708,8 @@ mod ui_tests {
                 .iter()
                 .map(|d| d.name.clone())
                 .collect::<Vec<_>>()),
-            ["办公室工位", "家里书房", "VM Rack"]
+            ["办公室工位", "家里书房"],
+            "every demo VM sits in the office rack: no second VM Rack tab"
         );
 
         // keyboard: Right/Left/Tab cycle every target of the office: laptop, 2 screens, then
@@ -3369,8 +4761,8 @@ mod ui_tests {
         assert_eq!(sel_key(&view, cx), "demo-kylin-vm#display-1");
         draw(cx);
 
-        // tabs 1/2/3 and out-of-range numbers
-        for (k, desk) in [("2", 1usize), ("3", 2), ("1", 0)] {
+        // tabs 1/2 and out-of-range numbers
+        for (k, desk) in [("2", 1usize), ("3", 1), ("1", 0)] {
             cx.simulate_keystrokes(k);
             assert_eq!(view.read_with(cx, |v, _| v.desk), desk, "desk key {k}");
             draw(cx);
@@ -3379,15 +4771,15 @@ mod ui_tests {
         assert_eq!(view.read_with(cx, |v, _| v.desk), 0, "no ninth tab");
 
         // pixel-exact hover + click on every screen and every rack blade of every desk
-        for desk in 0..3 {
-            cx.simulate_keystrokes(["1", "2", "3"][desk]);
+        for desk in 0..2 {
+            cx.simulate_keystrokes(["1", "2"][desk]);
             draw(cx);
             let devs = view.read_with(cx, |v, _| v.nav().to_vec());
             hover_click_all(&view, cx, &devs, &format!("desk {desk}"));
         }
 
         // enter on the offline Kylin blade says so (demo mode never spawns anything)
-        cx.simulate_keystrokes("3");
+        cx.simulate_keystrokes("1");
         draw(cx);
         let kylin = key(&view, cx, "demo-kylin-vm#display-1");
         let p = view.read_with(cx, |v, _| screen_px(v, kylin));
@@ -3437,7 +4829,7 @@ mod ui_tests {
     fn every_desk_shelf_and_both_themes_render(cx: &mut TestAppContext) {
         for dark in [false, true] {
             let (view, cx) = demo_view(cx, dark, false);
-            for key in ["1", "2", "3"] {
+            for key in ["1", "2"] {
                 cx.simulate_keystrokes(key);
                 draw(cx);
                 let (desk, labels, screens) = view.read_with(cx, |v, _| {
@@ -3472,8 +4864,8 @@ mod ui_tests {
             (1080.0, 720.0),
         ] {
             cx.simulate_resize(size(px(w), px(h)));
-            for desk in 0..3 {
-                cx.simulate_keystrokes(["1", "2", "3"][desk]);
+            for desk in 0..2 {
+                cx.simulate_keystrokes(["1", "2"][desk]);
                 draw(cx);
                 let devs = view.read_with(cx, |v, _| v.nav().to_vec());
                 hover_click_all(&view, cx, &devs, &format!("{w}x{h} desk {desk}"));
@@ -3514,7 +4906,7 @@ mod ui_tests {
         assert_eq!(
             names,
             ["Home", "Office", "VM Rack"],
-            "rooms with machines, then the VM Rack"
+            "rooms with desks, then the VM Rack for the VM that has none"
         );
         assert_eq!(sel_key(&view, cx), "mini#d1", "first room, first screen");
 
@@ -3530,11 +4922,11 @@ mod ui_tests {
         assert_eq!((nav, blades), (1 + 2 + 4, 4));
         let devs = view.read_with(cx, |v, _| v.nav().to_vec());
         hover_click_all(&view, cx, &devs, "live office");
-        // the rack panel and the VM Rack tab
+        // the VM Rack tab holds only the VM no desk shows
         cx.simulate_keystrokes("3");
         draw(cx);
         let devs = view.read_with(cx, |v, _| v.nav().to_vec());
-        assert_eq!(devs.len(), 4);
+        assert_eq!(devs.len(), 1);
         hover_click_all(&view, cx, &devs, "live VM Rack");
 
         // the same list again changes nothing (no rebuild, selection untouched)
@@ -3574,7 +4966,10 @@ mod ui_tests {
             draw(cx);
         }
         // the hub drops every device: an empty desk, nothing selected, Enter says so
-        view.update(cx, |v, _| v.apply_devices(Vec::new()));
+        view.update(cx, |v, _| {
+            v.eff.demo = false;
+            v.apply_devices(Vec::new())
+        });
         draw(cx);
         assert_eq!(
             view.read_with(cx, |v, _| (
@@ -3584,7 +4979,7 @@ mod ui_tests {
             )),
             (None, 1, 0)
         );
-        cx.simulate_keystrokes("enter");
+        view.update(cx, |v, _| v.connect());
         assert!(view.read_with(cx, |v, _| v.banner.as_ref().is_some_and(|b| b.error)));
     }
 
@@ -3785,9 +5180,26 @@ mod ui_tests {
     struct FakeHub {
         port: u16,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
+        /// the body of the last `PUT /api/v1/layout`
+        layout: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl FakeHub {
+        fn saved_layout(&self) -> Option<WorkspaceLayout> {
+            self.layout
+                .lock()
+                .unwrap()
+                .as_deref()
+                .map(|b| serde_json::from_str(b).expect("a layout"))
+        }
+
+        fn layout_puts(&self) -> usize {
+            self.log()
+                .iter()
+                .filter(|l| l.starts_with("PUT /api/v1/layout"))
+                .count()
+        }
+
         fn ws_url(&self) -> String {
             format!("ws://127.0.0.1:{}", self.port)
         }
@@ -3807,6 +5219,8 @@ mod ui_tests {
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = requests.clone();
+        let layout = Arc::new(std::sync::Mutex::new(None::<String>));
+        let layout_store = layout.clone();
         std::thread::spawn(move || {
             let codes = ["482-917", "135-790", "264-081", "903-412"];
             let mut issued = 0usize;
@@ -3866,6 +5280,21 @@ mod ui_tests {
                     } else {
                         ("401 Unauthorized", String::new())
                     }
+                } else if first.starts_with("GET /api/v1/layout")
+                    || first.starts_with("PUT /api/v1/layout")
+                {
+                    if !auth.ends_with("Bearer account-token") {
+                        ("401 Unauthorized", String::new())
+                    } else if first.starts_with("PUT") {
+                        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                        *layout_store.lock().unwrap() = Some(body.clone());
+                        ("200 OK", body)
+                    } else {
+                        let body = layout_store.lock().unwrap().clone().unwrap_or_else(|| {
+                            r#"{"version":1,"rooms":[],"placements":[]}"#.to_string()
+                        });
+                        ("200 OK", body)
+                    }
                 } else {
                     ("404 Not Found", String::new())
                 };
@@ -3876,7 +5305,11 @@ mod ui_tests {
                 let _ = s.write_all(reply.as_bytes());
             }
         });
-        FakeHub { port, requests }
+        FakeHub {
+            port,
+            requests,
+            layout,
+        }
     }
 
     fn click_sel(cx: &mut VisualTestContext, selector: &'static str) {
@@ -4504,5 +5937,919 @@ mod ui_tests {
         wait_until("the agent", || fake.running() == 1);
         view.update(cx, |v, _| v.sign_out());
         wait_until("the agent to stop", || fake.running() == 0);
+    }
+    // ───────────── this machine, arranging the workstation, the camera ─────────────
+
+    use gpui::{ScrollDelta, TouchPhase};
+
+    fn wheel(cx: &mut VisualTestContext, at: Point<Pixels>, dy: f32) {
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+    }
+
+    /// Press at `from`, move through `via` to `to`, release there.
+    fn drag(
+        cx: &mut VisualTestContext,
+        button: MouseButton,
+        from: Point<Pixels>,
+        via: &[Point<Pixels>],
+        to: Point<Pixels>,
+    ) {
+        cx.simulate_mouse_down(from, button, Modifiers::none());
+        for p in via.iter().chain(std::iter::once(&to)) {
+            cx.simulate_mouse_move(*p, button, Modifiers::none());
+        }
+        cx.simulate_mouse_up(to, button, Modifiers::none());
+    }
+
+    fn midway(a: Point<Pixels>, b: Point<Pixels>) -> Point<Pixels> {
+        point((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+    }
+
+    fn tab_of(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext, name: &str) -> usize {
+        view.read_with(cx, |v, _| {
+            v.scenes
+                .desks
+                .iter()
+                .position(|d| d.name == name)
+                .unwrap_or_else(|| panic!("no tab {name}"))
+        })
+    }
+
+    fn show_tab(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext, name: &str) {
+        let i = tab_of(view, cx, name);
+        view.update(cx, |v, _| v.set_desk(i));
+        draw(cx);
+    }
+
+    fn placement(v: &Proto, device: &str) -> Option<(String, String, u32)> {
+        v.layout
+            .placements
+            .iter()
+            .find(|p| p.device_id == device)
+            .map(|p| (p.room_id.clone(), p.furniture_id.clone(), p.slot))
+    }
+
+    /// A live view signed in to the fake hub with the demo `fleet()` on the desk.
+    fn live_fleet<'a>(
+        cx: &'a mut TestAppContext,
+        hub: &FakeHub,
+    ) -> (gpui::Entity<Proto>, &'a mut VisualTestContext) {
+        let (view, cx) = live_view(cx, hub);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 8 };
+            v.apply_devices(fleet());
+        });
+        draw(cx);
+        (view, cx)
+    }
+
+    fn write_agent_json(path: &std::path::Path, hub: &str, device: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"hub_url":"{hub}","device_id":"{device}","name":"This PC","device_token":"tok","room":null,"slot":null}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_local_machine_is_marked_cannot_be_taken_over_and_stays_selectable(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-local-{}", std::process::id()));
+        let agent = dir.join("agent.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_agent_json(&agent, "wss://hub.example.test/ws/host", "studio");
+        let fake_client = std::env::current_exe().unwrap();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let stored = Config {
+                hub_url: "https://hub.example.test".into(),
+                token: "tok".into(),
+                ..Config::default()
+            };
+            let eff = Effective {
+                client_bin: Some(fake_client.to_string_lossy().into_owned()),
+                ..Effective::from_config(&stored)
+            };
+            let mut p = Proto::new(cx, stored, eff, None);
+            p.agent_json = Some(agent);
+            window.focus(&p.focus);
+            p
+        });
+        view.update(cx, |v, _| v.apply_devices(fleet()));
+        draw(cx);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.local_id.clone()).as_deref(),
+            Some("studio"),
+            "agent.json of the same hub names this machine"
+        );
+        let (s1, s2, tp) = (
+            key(&view, cx, "studio#d1"),
+            key(&view, cx, "studio#d2"),
+            key(&view, cx, "tp#d1"),
+        );
+        assert!(view.read_with(cx, |v, _| {
+            [s1, s2].iter().all(|&d| v.scenes.devices[d].is_local) && !v.scenes.devices[tp].is_local
+        }));
+        show_tab(&view, cx, "Office");
+
+        // selectable like any other device
+        let p = view.read_with(cx, |v, _| screen_px(v, s1));
+        cx.simulate_click(p, Modifiers::none());
+        assert_eq!(sel_key(&view, cx), "studio#d1");
+        // Enter and a double click never start the client against itself
+        cx.simulate_keystrokes("enter");
+        let banner = view.read_with(cx, |v, _| {
+            v.banner.as_ref().map(|b| (b.text.clone(), b.error))
+        });
+        assert!(
+            banner.is_some_and(|(t, e)| t.contains("本机") && !t.contains("已启动") && !e),
+            "{:?}",
+            view.read_with(cx, |v, _| v.banner.as_ref().map(|b| b.text.clone()))
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.connect_at.is_none()),
+            "no latch pulse either"
+        );
+        view.update(cx, |v, _| v.banner = None);
+        cx.simulate_event(MouseDownEvent {
+            position: p,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        assert!(view.read_with(cx, |v, _| v.connect_at.is_none()));
+        assert!(view.read_with(cx, |v, _| {
+            v.banner.as_ref().is_some_and(|b| b.text.contains("本机"))
+        }));
+        assert_eq!(sel_key(&view, cx), "studio#d1", "still selected");
+        draw(cx);
+        assert!(has_sel(cx, "connect"), "the disabled button is drawn");
+
+        // another device is taken over as always
+        let p = view.read_with(cx, |v, _| screen_px(v, tp));
+        cx.simulate_click(p, Modifiers::none());
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.banner
+                .as_ref()
+                .is_some_and(|b| b.text.contains("已启动") && !b.error)
+                && v.connect_at.is_some()
+        }));
+
+        // an agent.json of another hub (or a missing one) marks nothing
+        write_agent_json(
+            &agent_path(&view, cx),
+            "wss://elsewhere.example.test",
+            "studio",
+        );
+        view.update(cx, |v, _| v.apply_devices(fleet()));
+        assert!(view.read_with(cx, |v, _| v.scenes.devices.iter().all(|d| !d.is_local)));
+        let _ = std::fs::remove_file(agent_path(&view, cx));
+        view.update(cx, |v, _| v.apply_devices(fleet()));
+        assert!(view.read_with(cx, |v, _| v.local_id.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn agent_path(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext) -> PathBuf {
+        view.read_with(cx, |v, _| v.agent_json.clone().expect("agent.json path"))
+    }
+
+    #[gpui::test]
+    fn arrange_mode_is_off_by_default_and_daily_mode_never_moves_anything(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        assert!(
+            has_sel(cx, "edit-toggle"),
+            "the button is in the top bar in demo mode"
+        );
+        assert!(!has_sel(cx, "edit-toolbar"));
+        assert!(!view.read_with(cx, |v, _| v.edit));
+
+        // dragging a machine in daily mode moves nothing and does not pan
+        let dev = key(&view, cx, "demo-studio#display-1");
+        let (from, to) =
+            view.read_with(cx, |v, _| (screen_px(v, dev), point(px(700.0), px(500.0))));
+        drag(cx, MouseButton::Left, from, &[midway(from, to)], to);
+        view.read_with(cx, |v, _| {
+            assert!(v.layout.rooms.is_empty() && !v.edit_dirty && v.drag.is_none());
+            assert!(v.cam.is_default() && v.pan_drag.is_none());
+            assert_eq!(v.sel, Some(dev), "the press still selected it");
+        });
+
+        // E opens it: the automatic arrangement becomes an explicit layout, the toolbar shows
+        cx.simulate_keystrokes("e");
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(v.edit && !v.layout.rooms.is_empty());
+            assert!(v.scenes.layout.is_some() && !v.scene().snaps.is_empty());
+            assert_eq!(
+                v.layout.placements.len(),
+                8,
+                "every demo machine has a seat"
+            );
+        });
+        assert!(has_sel(cx, "edit-toolbar"));
+        for id in [
+            "edit-add-ldesk",
+            "edit-add-straight",
+            "edit-add-rack",
+            "edit-remove-empty",
+            "edit-add-room",
+            "edit-rename",
+            "edit-reset",
+            "edit-done",
+        ] {
+            assert!(has_sel(cx, id), "toolbar button {id}");
+        }
+
+        // Enter and a double click select / say so, they do not take over
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.connect_at.is_none() && v.banner.as_ref().is_some_and(|b| b.text.contains("整理"))
+        }));
+        let p = view.read_with(cx, |v, _| screen_px(v, dev));
+        cx.simulate_event(MouseDownEvent {
+            position: p,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::none());
+        assert!(view.read_with(cx, |v, _| v.connect_at.is_none()));
+
+        // nothing was changed: closing restores the automatic arrangement exactly
+        cx.simulate_keystrokes("e");
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(!v.edit && v.layout.rooms.is_empty() && v.scenes.layout.is_none());
+            assert_eq!(v.scenes.desks.len(), 2);
+        });
+        // Escape closes it too
+        cx.simulate_keystrokes("e");
+        cx.simulate_keystrokes("escape");
+        assert!(!view.read_with(cx, |v, _| v.edit));
+        // the shelf is not arranged: switching to it closes arrange mode
+        cx.simulate_keystrokes("e");
+        cx.simulate_keystrokes("v");
+        assert!(view.read_with(cx, |v, _| v.shelf && !v.edit));
+        cx.simulate_keystrokes("v");
+    }
+
+    #[gpui::test]
+    fn the_arrange_button_needs_a_hub_or_demo(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        assert!(!has_sel(cx, "edit-toggle"), "first run: nothing to arrange");
+        view.update(cx, |v, _| {
+            v.onb.hub_url.clear();
+        });
+        cx.simulate_input("e");
+        assert!(
+            !view.read_with(cx, |v, _| v.edit),
+            "E is just a letter on the sign-in card"
+        );
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        draw(cx);
+        assert!(has_sel(cx, "edit-toggle"), "signed in");
+        // no device yet: it says so instead of opening an empty toolbar
+        cx.simulate_keystrokes("e");
+        assert!(view.read_with(cx, |v, _| !v.edit && v.banner.is_some()));
+    }
+
+    #[gpui::test]
+    fn dragging_a_machine_to_an_empty_slot_snaps_it_there_and_saves_to_the_hub(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        show_tab(&view, cx, "Office");
+        cx.simulate_keystrokes("e");
+        draw(cx);
+        assert!(view.read_with(cx, |v, _| v.edit && v.scenes.desks[v.desk].name == "Office"));
+
+        let studio = key(&view, cx, "studio#d1");
+        let (studio_px, seat_px, furniture, slot) = view.read_with(cx, |v, _| {
+            let sn = v
+                .scene()
+                .snaps
+                .iter()
+                .find(|n| n.occupied_by.is_none() && n.kind == SlotKind::Seat)
+                .expect("an empty seat");
+            (
+                screen_px(v, studio),
+                win_px(v, sn.anchor),
+                sn.furniture_id.clone(),
+                sn.slot,
+            )
+        });
+        let office_id = view.read_with(cx, |v, _| {
+            v.layout
+                .rooms
+                .iter()
+                .find(|r| r.name == "Office")
+                .unwrap()
+                .id
+                .clone()
+        });
+        let before = view.read_with(cx, |v, _| placement(v, "studio"));
+        assert_ne!(before, Some((office_id.clone(), furniture.clone(), slot)));
+
+        // picking up and moving: the ghost follows, the empty slot under it lights up
+        cx.simulate_mouse_down(studio_px, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            midway(studio_px, seat_px),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(seat_px, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(v.drag.as_ref().is_some_and(|d| d.active));
+            assert_eq!(v.drop_target(), Some((furniture.clone(), slot)));
+            assert_eq!(v.hover, None);
+        });
+        cx.simulate_mouse_up(seat_px, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(v.drag.is_none() && v.edit_dirty);
+            assert_eq!(
+                placement(v, "studio"),
+                Some((office_id.clone(), furniture.clone(), slot))
+            );
+            let sn = v
+                .scene()
+                .snaps
+                .iter()
+                .find(|n| n.furniture_id == furniture && n.slot == slot)
+                .unwrap();
+            assert_eq!(
+                sn.occupied_by,
+                Some(studio),
+                "the machine now stands in the slot"
+            );
+            assert_eq!(v.layout, *v.scenes.layout.as_ref().unwrap());
+            assert!(v.layout.validate().is_ok());
+            assert_eq!(v.save.status, LayoutStatus::Saving);
+        });
+        // saved on the hub in the background, with the account token
+        pump_until(&view, cx, "the layout save", |v| {
+            v.save.status == LayoutStatus::Saved
+        });
+        assert_eq!(hub.layout_puts(), 1);
+        assert_eq!(
+            hub.saved_layout(),
+            Some(view.read_with(cx, |v, _| v.layout.clone()))
+        );
+        assert!(
+            hub.log()
+                .iter()
+                .any(|l| l.starts_with("PUT /api/v1/layout") && l.ends_with("Bearer account-token")),
+            "{:?}",
+            hub.log()
+        );
+
+        // refused drops leave everything as it is: an occupied slot, a slot of the wrong kind,
+        // empty floor, and its own slot
+        let snapshot = view.read_with(cx, |v, _| v.layout.clone());
+        let tp = key(&view, cx, "tp#d1");
+        let vm = key(&view, cx, "vm1#d1");
+        let occupied_px = view.read_with(cx, |v, _| {
+            let sn = v
+                .scene()
+                .snaps
+                .iter()
+                .find(|n| n.occupied_by == Some(studio))
+                .unwrap();
+            win_px(v, sn.anchor)
+        });
+        let (tp_px, vm_px) = view.read_with(cx, |v, _| (screen_px(v, tp), screen_px(v, vm)));
+        drag(
+            cx,
+            MouseButton::Left,
+            tp_px,
+            &[midway(tp_px, occupied_px)],
+            occupied_px,
+        );
+        assert!(view.read_with(cx, |v, _| v.banner.as_ref().is_some_and(|b| b.error)));
+        view.update(cx, |v, _| v.banner = None);
+        drag(
+            cx,
+            MouseButton::Left,
+            vm_px,
+            &[midway(vm_px, seat_px)],
+            seat_px,
+        );
+        assert!(view.read_with(cx, |v, _| v.banner.as_ref().is_some_and(|b| b.error)));
+        view.update(cx, |v, _| v.banner = None);
+        let floor = point(px(60.0), px(HEADER_H + TOOLBAR_H + 300.0));
+        drag(cx, MouseButton::Left, tp_px, &[midway(tp_px, floor)], floor);
+        assert!(view.read_with(cx, |v, _| v.banner.as_ref().is_some_and(|b| b.error)));
+        let studio_now = view.read_with(cx, |v, _| screen_px(v, studio));
+        drag(
+            cx,
+            MouseButton::Left,
+            studio_now,
+            &[midway(studio_now, occupied_px)],
+            occupied_px,
+        );
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.layout, snapshot, "no refused drop changed the layout");
+            assert!(v.drag.is_none());
+        });
+        assert_eq!(hub.layout_puts(), 1, "and nothing more was sent");
+
+        // a plain click only selects, even in arrange mode
+        let before = view.read_with(cx, |v, _| v.layout.clone());
+        cx.simulate_click(tp_px, Modifiers::none());
+        assert_eq!(sel_key(&view, cx), "tp#d1");
+        assert_eq!(view.read_with(cx, |v, _| v.layout.clone()), before);
+
+        // zoomed in, a drop still lands exactly where the pointer is
+        let at = view.read_with(cx, |v, _| {
+            point(px(v.stage.0 * 0.5), px(v.stage.1 * 0.5 + v.stage_top()))
+        });
+        wheel(cx, at, 40.0);
+        assert!(view.read_with(cx, |v, _| v.cam.zoom > 1.05));
+        draw(cx);
+        let (tp_px, target, furniture, slot) = view.read_with(cx, |v, _| {
+            let sn = v
+                .scene()
+                .snaps
+                .iter()
+                .find(|n| n.occupied_by.is_none() && n.kind == SlotKind::Seat)
+                .expect("another empty seat");
+            (
+                screen_px(v, tp),
+                win_px(v, sn.anchor),
+                sn.furniture_id.clone(),
+                sn.slot,
+            )
+        });
+        drag(
+            cx,
+            MouseButton::Left,
+            tp_px,
+            &[midway(tp_px, target)],
+            target,
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| placement(v, "tp")),
+            Some((office_id, furniture, slot))
+        );
+        pump_until(&view, cx, "the second save", |v| {
+            v.save.status == LayoutStatus::Saved
+        });
+        assert_eq!(
+            hub.saved_layout(),
+            Some(view.read_with(cx, |v, _| v.layout.clone()))
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edits_are_saved_in_order_and_failures_are_shown(cx: &mut TestAppContext) {
+        // three edits before the first answer: one request in flight, the newest follows it
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        cx.simulate_keystrokes("e");
+        for kind in [
+            FurnitureKind::LDesk,
+            FurnitureKind::StraightDesk,
+            FurnitureKind::VmRack,
+        ] {
+            view.update(cx, |v, _| v.arrange_add(kind));
+        }
+        assert!(view.read_with(cx, |v, _| v.save.inflight.is_some() && v.save.dirty));
+        pump_until(&view, cx, "both saves", |v| {
+            v.save.status == LayoutStatus::Saved && v.save.inflight.is_none() && !v.save.dirty
+        });
+        assert_eq!(
+            hub.layout_puts(),
+            2,
+            "the first and the newest, never out of order"
+        );
+        assert_eq!(
+            hub.saved_layout(),
+            Some(view.read_with(cx, |v, _| v.layout.clone()))
+        );
+
+        // a hub that rejects the token: the arrangement stays on screen, the error is shown
+        view.update(cx, |v, _| v.eff.token = "revoked-token".into());
+        let furniture = view.read_with(cx, |v, _| v.scenes.desks[v.desk].furniture.len());
+        view.update(cx, |v, _| v.arrange_add(FurnitureKind::LDesk));
+        pump_until(&view, cx, "the failed save", |v| {
+            matches!(v.save.status, LayoutStatus::Failed(_))
+        });
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.banner
+                    .as_ref()
+                    .is_some_and(|b| b.error && b.text.contains("保存失败"))
+            );
+            assert_eq!(v.scenes.desks[v.desk].furniture.len(), furniture + 1);
+        });
+        draw(cx);
+        assert!(has_sel(cx, "edit-toolbar"));
+    }
+
+    #[gpui::test]
+    fn the_toolbar_adds_furniture_and_rooms_renames_and_moves_devices_and_resets(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        cx.simulate_keystrokes("e");
+        let count = |view: &gpui::Entity<Proto>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, _| v.scenes.desks[v.desk].furniture.len())
+        };
+        let base = count(&view, cx);
+        assert_eq!(base, 2, "the office desk and its rack");
+        assert_eq!(view.read_with(cx, |v, _| v.removable_furniture()), None);
+
+        // + L形桌 / + 直桌 / + 机柜: each lands on free floor and is saved at once
+        for (id, kind, slots) in [
+            ("edit-add-ldesk", FurnitureKind::LDesk, 4),
+            ("edit-add-straight", FurnitureKind::StraightDesk, 3),
+            ("edit-add-rack", FurnitureKind::VmRack, 4),
+        ] {
+            let n = count(&view, cx);
+            click_sel(cx, id);
+            assert_eq!(count(&view, cx), n + 1, "{id}");
+            view.read_with(cx, |v, _| {
+                let added = v.scenes.desks[v.desk]
+                    .furniture
+                    .iter()
+                    .find(|f| f.kind == kind && f.empty == slots)
+                    .expect("the new piece is empty");
+                assert_eq!(added.slots, slots);
+                assert!(v.layout.validate().is_ok());
+            });
+        }
+        // the new pieces do not overlap anything
+        view.read_with(cx, |v, _| {
+            let f = &v.scenes.desks[v.desk].furniture;
+            for (i, a) in f.iter().enumerate() {
+                for b in f.iter().skip(i + 1) {
+                    let (x, y) = (a.rect, b.rect);
+                    assert!(x.2 <= y.0 || y.2 <= x.0 || x.3 <= y.1 || y.3 <= x.1);
+                }
+            }
+        });
+        // 移除空家具 takes the empty pieces away again, but never the ones with machines
+        assert!(view.read_with(cx, |v, _| v.removable_furniture().is_some()));
+        for _ in 0..3 {
+            click_sel(cx, "edit-remove-empty");
+        }
+        assert_eq!(count(&view, cx), base);
+        assert_eq!(view.read_with(cx, |v, _| v.removable_furniture()), None);
+
+        // + 新建房间: an inline name field; shortcut letters are just text in it
+        click_sel(cx, "edit-add-room");
+        assert!(has_sel(cx, "edit-input"));
+        cx.simulate_keystrokes("enter");
+        assert!(
+            view.read_with(cx, |v, _| v.edit_input.is_some()
+                && v.banner.as_ref().is_some_and(|b| b.error)),
+            "an empty name is refused and the field stays"
+        );
+        cx.simulate_input("Garage e v");
+        assert!(
+            view.read_with(cx, |v, _| v.edit && !v.shelf),
+            "typing never triggers shortcuts"
+        );
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |v, _| {
+            assert!(v.edit_input.is_none());
+            assert_eq!(v.scenes.desks[v.desk].name, "Garage e v");
+            assert_eq!(
+                v.scene().snaps.len(),
+                4,
+                "a new room starts with one empty L-desk"
+            );
+            assert_eq!(v.layout.rooms.len(), 3);
+        });
+        // Escape closes the field first, not arrange mode
+        click_sel(cx, "edit-add-room");
+        cx.simulate_keystrokes("escape");
+        assert!(view.read_with(cx, |v, _| v.edit && v.edit_input.is_none()));
+        // a duplicate name is refused
+        click_sel(cx, "edit-add-room");
+        cx.simulate_input("garage E V");
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| v.layout.rooms.len() == 3
+            && v.edit_input.is_some()));
+        cx.simulate_keystrokes("escape");
+
+        // 改名: the selected machine gets its own name on every screen
+        show_tab(&view, cx, "办公室工位");
+        let studio = key(&view, cx, "demo-studio#display-1");
+        let p = view.read_with(cx, |v, _| screen_px(v, studio));
+        cx.simulate_click(p, Modifiers::none());
+        click_sel(cx, "edit-rename");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.edit_input.as_ref().map(|i| i.text.clone())),
+            Some("Studio-PC".to_string()),
+            "the field starts with the current name"
+        );
+        view.update(cx, |v, _| v.edit_input.as_mut().unwrap().text.clear());
+        cx.simulate_input("Render box");
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |v, _| {
+            let named = v
+                .scenes
+                .devices
+                .iter()
+                .filter(|d| d.machine_id == "demo-studio")
+                .collect::<Vec<_>>();
+            assert_eq!(named.len(), 2);
+            assert!(named.iter().all(|d| d.title == "Render box"));
+            assert_eq!(
+                v.layout
+                    .placements
+                    .iter()
+                    .find(|p| p.device_id == "demo-studio")
+                    .and_then(|p| p.custom_name.as_deref()),
+                Some("Render box")
+            );
+        });
+
+        // 移到房间: the machine takes the first open seat of the other room, the view follows it
+        let home = tab_of(&view, cx, "家里书房");
+        let chip: &'static str = Box::leak(format!("edit-room-{home}").into_boxed_str());
+        click_sel(cx, chip);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.scenes.desks[v.desk].name, "家里书房");
+            assert_eq!(
+                v.sel.map(|s| v.scenes.devices[s].machine_id.as_str()),
+                Some("demo-studio")
+            );
+            assert_eq!(
+                placement(v, "demo-studio").map(|p| p.0),
+                Some("room-2".to_string())
+            );
+            assert!(v.scenes.desks[v.desk].devs.contains(&studio));
+        });
+
+        // 完成 keeps the arrangement
+        click_sel(cx, "edit-done");
+        view.read_with(cx, |v, _| {
+            assert!(!v.edit && v.scenes.layout.is_some());
+            assert_eq!(v.scenes.desks.len(), 3);
+        });
+
+        // 恢复自动布局 forgets it all, the rename included
+        cx.simulate_keystrokes("e");
+        click_sel(cx, "edit-reset");
+        view.read_with(cx, |v, _| {
+            assert!(!v.edit && v.layout.rooms.is_empty() && v.scenes.layout.is_none());
+            assert_eq!(v.scenes.desks.len(), 2);
+            assert!(v.scenes.devices.iter().all(|d| d.title != "Render box"));
+            assert!(
+                v.banner
+                    .as_ref()
+                    .is_some_and(|b| b.text.contains("自动布局"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_layout_fetched_with_the_devices_is_applied_unless_ours_is_in_flight(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = fake_hub();
+        let (view, cx) = live_fleet(cx, &hub);
+        let devs = fleet();
+        let arranged = {
+            let mut l = materialize_for(&devs, None);
+            let online = |_: &str| true;
+            let room = l
+                .rooms
+                .iter()
+                .find(|r| r.name == "Office")
+                .unwrap()
+                .id
+                .clone();
+            let desk = l.rooms.iter().find(|r| r.id == room).unwrap().furniture[0]
+                .id
+                .clone();
+            move_device(&mut l, "studio", Form::Monitor, &room, &desk, 3, &online).unwrap();
+            rename_device(&mut l, "tp", "Der Laptop").unwrap();
+            l
+        };
+        view.update(cx, |v, _| {
+            v.apply_state(devs.clone(), Some(arranged.clone()))
+        });
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.layout, arranged);
+            assert!(v.scenes.layout.is_some());
+            assert!(v.scenes.devices.iter().any(|d| d.title == "Der Laptop"));
+        });
+        // the same layout again: no rebuild
+        let ptr = view.read_with(cx, |v, _| Arc::as_ptr(&v.scenes));
+        view.update(cx, |v, _| {
+            v.apply_state(devs.clone(), Some(arranged.clone()))
+        });
+        assert_eq!(view.read_with(cx, |v, _| Arc::as_ptr(&v.scenes)), ptr);
+
+        // while a save is on its way, or the user is arranging, a fetched layout is ignored
+        let other = WorkspaceLayout::default();
+        view.update(cx, |v, _| v.save.dirty = true);
+        view.update(cx, |v, _| v.apply_state(devs.clone(), Some(other.clone())));
+        assert_eq!(view.read_with(cx, |v, _| v.layout.clone()), arranged);
+        view.update(cx, |v, _| {
+            v.save.dirty = false;
+            v.edit = true;
+        });
+        view.update(cx, |v, _| v.apply_state(devs.clone(), Some(other.clone())));
+        assert_eq!(view.read_with(cx, |v, _| v.layout.clone()), arranged);
+        // idle again: the hub's (now empty) layout wins, back to the automatic arrangement
+        view.update(cx, |v, _| v.edit = false);
+        view.update(cx, |v, _| v.apply_state(devs.clone(), Some(other)));
+        view.read_with(cx, |v, _| {
+            assert!(v.layout.rooms.is_empty() && v.scenes.layout.is_none());
+        });
+        // a failed layout fetch (None) never touches the arrangement
+        view.update(cx, |v, _| v.apply_state(devs, None));
+        assert!(view.read_with(cx, |v, _| v.layout.rooms.is_empty()));
+    }
+
+    #[gpui::test]
+    fn the_wheel_zooms_around_the_pointer_drags_pan_and_zero_resets(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        assert!(view.read_with(cx, |v, _| v.cam.is_default()));
+        assert!(
+            !has_sel(cx, "cam-reset"),
+            "no reset button on the automatic fit"
+        );
+
+        // zoom in around a point of the desk: that point stays under the pointer
+        let studio = key(&view, cx, "demo-studio#display-1");
+        let anchor = view.read_with(cx, |v, _| screen_px(v, studio));
+        let scene_pt = view.read_with(cx, |v, _| {
+            v.fit.invert(P2::new(f(anchor.x), f(anchor.y) - HEADER_H))
+        });
+        wheel(cx, anchor, 40.0);
+        wheel(cx, anchor, 40.0);
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(v.cam.zoom > 1.15 && v.cam.zoom < ZOOM_MAX, "{}", v.cam.zoom);
+            let q = v.fit.apply(scene_pt);
+            assert!((q.x - f(anchor.x)).abs() < 0.5 && (q.y + HEADER_H - f(anchor.y)).abs() < 0.5);
+        });
+        assert!(
+            has_sel(cx, "cam-reset"),
+            "a way back to the automatic fit is shown"
+        );
+
+        // hit-testing, labels and the preview panel all follow the camera
+        view.read_with(cx, |v, _| {
+            for g in &v.scene().screens {
+                let c = win_px(v, polygon_center(&g.bezel));
+                if f(c.x) > 20.0
+                    && f(c.x) < v.stage.0 - 20.0
+                    && f(c.y) > HEADER_H + 20.0
+                    && f(c.y) < HEADER_H + v.stage.1 - 20.0
+                {
+                    assert_eq!(
+                        v.hit(c),
+                        Some(g.dev),
+                        "dev {} at zoom {}",
+                        g.dev,
+                        v.cam.zoom
+                    );
+                }
+            }
+            let boxes = layout_labels(v.scene(), &v.scenes.devices, &v.fit, v.stage);
+            for lb in &boxes {
+                let l = v.scene().labels.iter().find(|l| l.dev == lb.dev).unwrap();
+                let (a, _) = lb.leader.unwrap();
+                let want = v.fit.apply(l.anchor);
+                assert!((a.x - want.x).abs() < 1e-3 && (a.y - want.y).abs() < 1e-3);
+            }
+        });
+        let devs = view.read_with(cx, |v, _| {
+            v.nav()
+                .iter()
+                .copied()
+                .filter(|&d| {
+                    let c = screen_px(v, d);
+                    f(c.x) > 20.0
+                        && f(c.x) < v.stage.0 - 20.0
+                        && f(c.y) > HEADER_H + 20.0
+                        && f(c.y) < HEADER_H + v.stage.1 - 20.0
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(devs.len() >= 2);
+        hover_click_all(&view, cx, &devs, "zoomed");
+
+        // right drag, middle drag and a left drag on empty floor pan; the scene moves with them
+        let c0 = view.read_with(cx, |v, _| v.cam);
+        let (a, b) = (
+            point(px(400.0), px(HEADER_H + 400.0)),
+            point(px(340.0), px(HEADER_H + 380.0)),
+        );
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            let before = view.read_with(cx, |v, _| v.cam.pan);
+            drag(cx, button, a, &[midway(a, b)], b);
+            let after = view.read_with(cx, |v, _| v.cam.pan);
+            assert!(
+                (after.0 - before.0 + 60.0).abs() < 1e-3
+                    && (after.1 - before.1 + 20.0).abs() < 1e-3
+            );
+            drag(cx, button, b, &[], a);
+        }
+        assert!(view.read_with(cx, |v, _| (v.cam.pan.0 - c0.pan.0).abs() < 1e-3));
+        let empty = point(px(8.0), px(HEADER_H + 560.0));
+        let empty2 = point(px(8.0 + 90.0), px(HEADER_H + 560.0 - 30.0));
+        assert!(view.read_with(cx, |v, _| v.hit(empty).is_none()));
+        drag(
+            cx,
+            MouseButton::Left,
+            empty,
+            &[midway(empty, empty2)],
+            empty2,
+        );
+        assert!(
+            view.read_with(cx, |v, _| (v.cam.pan.0 - c0.pan.0 - 90.0).abs() < 1e-3
+                && v.pan_drag.is_none())
+        );
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(!v.cam.is_default());
+        });
+
+        // 0 and the button reset it
+        cx.simulate_keystrokes("0");
+        view.read_with(cx, |v, _| {
+            assert!(v.cam.is_default());
+            let base = v.scenes.fit(false, v.desk, v.stage.0, v.stage.1);
+            assert_eq!(v.fit, base, "back to the automatic fit");
+        });
+        wheel(cx, anchor, 40.0);
+        draw(cx);
+        click_sel(cx, "cam-reset");
+        assert!(view.read_with(cx, |v, _| v.cam.is_default()));
+
+        // the range is 0.6x to 2.4x
+        for _ in 0..60 {
+            wheel(cx, anchor, 80.0);
+        }
+        assert!((view.read_with(cx, |v, _| v.cam.zoom) - ZOOM_MAX).abs() < 1e-4);
+        for _ in 0..120 {
+            wheel(cx, anchor, -80.0);
+        }
+        assert!((view.read_with(cx, |v, _| v.cam.zoom) - ZOOM_MIN).abs() < 1e-4);
+
+        // a new tab opens on its automatic fit; the shelf has no camera
+        draw(cx);
+        cx.simulate_keystrokes("2");
+        assert!(view.read_with(cx, |v, _| v.cam.is_default()));
+        wheel(cx, anchor, 40.0);
+        assert!(view.read_with(cx, |v, _| !v.cam.is_default()));
+        cx.simulate_keystrokes("v");
+        draw(cx);
+        let shelf_fit = view.read_with(cx, |v, _| v.fit);
+        wheel(cx, anchor, 40.0);
+        draw(cx);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.fit),
+            shelf_fit,
+            "the shelf does not zoom"
+        );
+    }
+
+    #[gpui::test]
+    fn the_camera_stays_in_sync_with_resizes(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        let anchor = view.read_with(cx, |v, _| {
+            point(px(v.stage.0 * 0.5), px(HEADER_H + v.stage.1 * 0.5))
+        });
+        wheel(cx, anchor, 40.0);
+        for (w, h) in [(960.0, 640.0), (1600.0, 900.0), (1360.0, 860.0)] {
+            cx.simulate_resize(size(px(w), px(h)));
+            draw(cx);
+            view.read_with(cx, |v, _| {
+                let base = v.scenes.fit(false, v.desk, v.stage.0, v.stage.1);
+                assert_eq!(v.fit, base.with_camera(&v.cam, v.stage), "{w}x{h}");
+                // the middle of the stage is still the zoom centre
+                let c = P2::new(v.stage.0 * 0.5, v.stage.1 * 0.5);
+                let b = base.with_camera(&Camera::default(), v.stage);
+                assert!((b.apply(b.invert(c)).x - c.x).abs() < 1e-3);
+            });
+        }
     }
 }
