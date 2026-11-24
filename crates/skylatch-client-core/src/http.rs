@@ -11,7 +11,7 @@ use skylatch_proto::onboarding::{
 use std::sync::OnceLock;
 use std::time::Duration;
 
-fn http_runtime() -> Result<&'static tokio::runtime::Runtime, ClientError> {
+pub(crate) fn http_runtime() -> Result<&'static tokio::runtime::Runtime, ClientError> {
     // Keep reqwest's connection pool on one dedicated, always-active reactor so a pooled
     // keep-alive socket is never parked on a caller's blocked or dropped current_thread runtime.
     static HTTP_RT: OnceLock<Result<tokio::runtime::Runtime, ()>> = OnceLock::new();

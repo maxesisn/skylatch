@@ -1329,6 +1329,7 @@ dependencies = [
  "futures-util",
  "opusic-sys",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

@@ -11,6 +11,7 @@ mod http;
 pub mod parser;
 mod session;
 mod transport;
+pub mod updater;
 
 pub use audio::AudioPcm;
 pub use config::{ConfigError, ConnectionConfig};

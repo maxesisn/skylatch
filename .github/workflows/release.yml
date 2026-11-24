@@ -49,6 +49,7 @@ jobs:
     runs-on: windows-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      SKYLATCH_BUILD_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - name: Keep shell scripts in LF format for MSYS2
         run: git config --global core.autocrlf false
@@ -125,6 +126,7 @@ jobs:
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      SKYLATCH_BUILD_VERSION: ${{ needs.version.outputs.version }}
       MACOSX_DEPLOYMENT_TARGET: '12.3'
     steps:
       - uses: actions/checkout@v4
@@ -159,6 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      SKYLATCH_BUILD_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
