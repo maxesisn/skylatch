@@ -57,7 +57,7 @@ bundle_imports() {
         base=${dep##*/}
         bundled="$frameworks/$base"
         if [[ ! -f "$bundled" ]]; then
-            lipo -verify_arch "$arch" "$dep"
+            lipo "$dep" -verify_arch "$arch"
             cp -L "$dep" "$bundled"
             chmod u+w "$bundled"
             bundle_imports "$bundled" '@loader_path'
@@ -68,7 +68,7 @@ bundle_imports() {
 }
 
 for name in skylatch-ui skylatch-client skylatch-agent skylatch-host-engine; do
-    lipo -verify_arch "$arch" "$bin_dir/$name"
+    lipo "$bin_dir/$name" -verify_arch "$arch"
     install -m 0755 "$bin_dir/$name" "$macos/$name"
     bundle_imports "$macos/$name" '@loader_path/../Frameworks'
 done
