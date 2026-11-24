@@ -52,7 +52,7 @@ Config parseCli(std::span<const std::string_view> args) {
     for (size_t i = 0; i < args.size(); ++i) {
         const auto option = args[i];
         bool* flag = option == "--list" ? &c.list : option == "--no-direct" ? &c.noDirect :
-                     option == "--no-clipboard" ? &c.noClipboard : nullptr;
+                     option == "--no-clipboard" ? &c.noClipboard : option == "--no-audio" ? &c.noAudio : nullptr;
         if (flag) {
             require(!*flag, "duplicate option; see --help");
             *flag = true;
@@ -80,7 +80,7 @@ Config parseCli(std::span<const std::string_view> args) {
             "endpoint must be a ws:// or wss:// URL without user information");
     if (!c.hub.empty()) {
         require(!c.token.empty(), "--hub requires --token");
-        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.smokeSeconds),
+        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.noAudio && !c.smokeSeconds),
                 "--list cannot be used with session options");
     } else {
         require(!c.list && c.device.empty() && !c.noDirect, "--list, --device and --no-direct require --hub");

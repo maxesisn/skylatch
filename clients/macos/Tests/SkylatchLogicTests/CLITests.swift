@@ -21,6 +21,16 @@ final class CLITests: XCTestCase {
         XCTAssertTrue(c.isSmoke)
     }
 
+    func testNoAudio() throws {
+        let base = ["--hub", "wss://hub.example.com", "--token", "t"]
+        XCTAssertFalse(try CLI.parse(base).noAudio)
+        XCTAssertTrue(try CLI.parse(base + ["--no-audio"]).noAudio)
+        XCTAssertTrue(try CLI.parse(["--direct", "ws://h", "--no-audio"]).noAudio)
+        XCTAssertThrowsError(try CLI.parse(base + ["--no-audio", "--no-audio"]))
+        XCTAssertThrowsError(try CLI.parse(base + ["--list", "--no-audio"]))
+        XCTAssertTrue(CLI.usage.contains("--no-audio"))
+    }
+
     func testHubList() throws {
         let c = try CLI.parse(["--hub", "ws://hub.example.com:8080", "--token", "t", "--list"])
         XCTAssertTrue(c.list)

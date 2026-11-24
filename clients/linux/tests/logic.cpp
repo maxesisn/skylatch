@@ -32,6 +32,7 @@ void cli() {
     const auto hub = parse({"--hub", "ws://hub.example:7000/", "--token", "placeholder", "--device", "desk",
                             "--no-direct", "--no-clipboard", "--smoke-seconds", "86400"});
     CHECK(hub.direct.empty() && !hub.list && hub.device == "desk" && hub.noDirect && hub.noClipboard && hub.smokeSeconds == 86400);
+    CHECK(!hub.noAudio && parse({"--direct", "ws://host.example", "--no-audio"}).noAudio);
     const auto direct = parse({"--direct", "ws://[::1]:7001/stream"});
     CHECK(direct.hub.empty() && direct.token.empty() && direct.direct == "ws://[::1]:7001/stream");
     const std::string hex(64, 'a');
@@ -54,6 +55,8 @@ void cli() {
     rejects({"--direct", "--list"});
     rejects({"--direct", "ws://host.example", "--direct", "ws://host.example"});
     rejects({"--direct", "ws://host.example", "--no-clipboard", "--no-clipboard"});
+    rejects({"--direct", "ws://host.example", "--no-audio", "--no-audio"});
+    rejects({"--hub", "ws://hub.example", "--token", "placeholder", "--list", "--no-audio"});
     rejects({"--direct", "ws://host.example", "--smoke-seconds", "1", "--smoke-seconds", "2"});
     for (auto invalid : {"", "0", "86401", "1.2", "+1", "-1", "1s", "999999999999999999999"})
         rejects({"--direct", "ws://host.example", "--smoke-seconds", invalid});

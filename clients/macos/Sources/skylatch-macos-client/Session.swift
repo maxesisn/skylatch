@@ -60,6 +60,9 @@ final class Session: @unchecked Sendable {
     private var stats = SessionStats()
     private var end: SessionEnd?
     private var thread: Thread?
+    /// Created before connecting and stopped after the core client is destroyed, so audio
+    /// callbacks never outlive it. Nil without audio or without an output device.
+    private let audio: AudioPlayer?
 
     private static let maxQueuedBytes = 32 * 1024 * 1024
     private static let maxClipboardBytes = 1024 * 1024
@@ -69,6 +72,7 @@ final class Session: @unchecked Sendable {
         self.renderer = renderer
         self.delegate = delegate
         self.clipboardEnabled = !config.isSmoke && !config.noClipboard
+        self.audio = config.isSmoke || config.noAudio ? nil : AudioPlayer()
     }
 
     // MARK: Thread-safe accessors
@@ -128,6 +132,7 @@ final class Session: @unchecked Sendable {
         client = nil
         stateLock.unlock()
         skylatch_destroy(active)
+        audio?.stop()
     }
 
     /// True once the host accepted smooth-wheel records (type 9) for this connection.
@@ -233,6 +238,12 @@ final class Session: @unchecked Sendable {
             me.stateLock.lock()
             me.smoothWheel.hostAnswered(sequence: sequence, status: status)
             me.stateLock.unlock()
+        }
+        if audio != nil {
+            callbacks.on_audio_pcm = { ctx, _, sampleRate, channels, pcm, frames in
+                guard let pcm else { return }
+                Session.session(ctx).audio?.push(pcm, frames: frames, channels: Int(channels), sampleRate: sampleRate)
+            }
         }
         callbacks.on_disconnected = { ctx, error in
             let me = Session.session(ctx)

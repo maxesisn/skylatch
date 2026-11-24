@@ -48,6 +48,9 @@ one host is online. Direct tokens, when required by the host, are 64 hex digits.
 Use `--no-direct` in hub mode to force relay and `--no-clipboard` to opt out of
 bidirectional plain-text clipboard sync.
 
+Hosts that support audio stream their sound, which plays through SDL with at most
+about 120 ms queued; `--no-audio` does not ask for it. Older hosts are never asked.
+
 - **F11** toggles borderless fullscreen.
 - **Ctrl+Alt+G** toggles keyboard grab. Desktop shortcuts reach the remote host
   only if the local window system or compositor permits the grab.
