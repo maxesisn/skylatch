@@ -953,9 +953,17 @@ dependencies = [
 name = "skylatch-client-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
+ "futures-util",
+ "rustls",
+ "serde_json",
+ "skylatch-hub",
  "skylatch-proto",
  "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1164,8 +1172,12 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.29.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1289,6 +1301,8 @@ dependencies = [
  "httparse",
  "log",
  "rand",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror",
 ]
