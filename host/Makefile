@@ -14,7 +14,7 @@ BACKEND_DIR_x11 = linux/x11
 BACKEND_PKGS_wayland = wayland-client xkbcommon
 BACKEND_DIR_wayland = linux/wayland
 BACKEND_DIR_windows = windows
-BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt
+BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32
 BACKEND_FLAGS_windows = -DNOMINMAX -D_WIN32_WINNT=0x0A00
 BACKEND_DIR_macos = macos
 BACKEND_FLAGS_macos = -mmacosx-version-min=12.3 -Werror=unguarded-availability-new
@@ -43,7 +43,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/*/*.hpp src/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-png-fit test-input test-backend test-server test-keymap test-macos-keys clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server test-keymap test-macos-keys clean FORCE
 all: skylatch-host-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -121,6 +121,13 @@ build/surface-budget-test: tests/surface-budget-test.cpp src/core/surface-budget
 test-surface-budget: build/surface-budget-test
 	./build/surface-budget-test
 
+build/tile-diff-test: tests/tile-diff-test.cpp src/core/tile-diff.hpp src/core/capture-source.hpp
+	mkdir -p build
+	$(CXX) -Isrc $(CXXFLAGS) tests/tile-diff-test.cpp -o $@
+
+test-tile-diff: build/tile-diff-test
+	./build/tile-diff-test
+
 build/png-fit-test: tests/png-fit-test.cpp src/core/png-fit.hpp src/core/image-scale.hpp src/core/capture-source.hpp
 	mkdir -p build
 	$(CXX) -Isrc $(CXXFLAGS) tests/png-fit-test.cpp -o $@ $(shell pkg-config --cflags --libs zlib)
@@ -141,6 +148,13 @@ build/backend-source-test: tests/backend-source-test.cpp $(CORE_SRCS) $(wildcard
 
 test-backend: build/backend-source-test
 	./build/backend-source-test
+
+build/capture-resize-test: tests/capture-resize-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp)
+	mkdir -p build
+	$(CXX) -Isrc $(CXXFLAGS) tests/capture-resize-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS))
+
+test-capture-resize: build/capture-resize-test
+	./build/capture-resize-test
 
 SERVER_TEST_SRCS = src/server/clipboard.cpp src/server/config.cpp src/server/metrics.cpp src/server/wire.cpp src/server/backend.cpp src/core/input.cpp src/core/wait.cpp $(BACKEND_SRCS)
 
@@ -170,7 +184,7 @@ build/macos-keys-test: tests/macos-keys-test.cpp src/backends/macos/keys.hpp src
 test-macos-keys: build/macos-keys-test
 	./build/macos-keys-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
+test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
 
 clean:
 	rm -rf build skylatch-host-engine

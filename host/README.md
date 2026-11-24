@@ -18,12 +18,18 @@ trimmed build without the upstream web viewer, CLI or SDK.
 | --- | --- |
 | macOS | ScreenCaptureKit |
 | Linux | X11, Wayland |
-| Windows | DXGI desktop duplication; WGC and GDI fallbacks for virtual-GPU VMs |
+| Windows | DXGI desktop duplication; GDI fallback for VMs with no DXGI output (`--capture`) |
 
 - Speaks `NSL1` ([../docs/PROTOCOL.md](../docs/PROTOCOL.md)) on `/stream`, `/control` and `/input`.
 - Normally launched and supervised by `skylatch-agent` (see `crates/skylatch-agent`), which
   bridges it to `skylatch-hub`. The engine itself only listens locally.
-- Supports surfaces above 4096 px and recovers from resolution changes.
+- Supports surfaces above 4096 px (`--max-dimension`, up to 8192; above 4096 the H.264 budget is
+  Level 6.2, so a native 5K display streams unscaled) and follows display resolution changes
+  without a restart: the encoder is rebuilt and the next frame is an IDR at the new size.
+- On Windows, `--capture auto` (the default) uses DXGI desktop duplication and falls back to GDI
+  `BitBlt` capture when DXGI has no output, as in a VM whose only display adapter is a basic one.
+  The GDI path finds damage by comparing 64x64 pixel tiles with the previous frame. `--capture dxgi`
+  and `--capture gdi` force one or the other.
 
 ## Build
 
@@ -32,7 +38,7 @@ The build output is `host/skylatch-host-engine` (git-ignored, as is `host/build/
 
 ```sh
 make -C host            # build host/skylatch-host-engine
-make -C host test       # build and run the unit tests
+make -C host test       # build and run the unit tests (also needs libavcodec, libavutil, libswscale)
 ./host/skylatch-host-engine --help
 ```
 
@@ -42,6 +48,7 @@ Needs macOS 12.3+ and Xcode command line tools (ScreenCaptureKit).
 
 ```sh
 brew install pkgconf x264 libwebsockets openssl
+# for make -C host test: brew install ffmpeg
 make -C host
 ```
 
@@ -56,6 +63,7 @@ both with `BACKENDS="x11 wayland"`.
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config libx264-dev libwebsockets-dev zlib1g-dev \
   libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxtst-dev
+# for make -C host test: libavcodec-dev libavutil-dev libswscale-dev
 make -C host
 # Wayland: add libwayland-dev libxkbcommon-dev wayland-protocols, then BACKENDS=wayland
 ```

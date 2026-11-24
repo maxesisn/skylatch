@@ -1,3 +1,4 @@
+#include "core/backend-options.hpp"
 #include "core/capture-source.hpp"
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -191,7 +192,7 @@ class X11CaptureSource final : public CaptureSource {
 };
 }
 namespace x11 {
-bool initializeNativeBackend(const std::string&, unsigned) {
+bool initializeNativeBackend(const std::string&, unsigned, const BackendOptions&) {
   static std::once_flag once;
   static bool initialized = false;
   std::call_once(once, [] { initialized = XInitThreads() != 0; });

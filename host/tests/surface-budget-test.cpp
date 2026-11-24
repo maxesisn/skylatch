@@ -45,6 +45,15 @@ class SyntheticSource final : public relay::CaptureSource {
     has_sub_rect_ = true;
   }
 
+  /// Changes the size of every later frame; the new image is the solid fill.
+  void resize(int w, int h) {
+    width_ = w;
+    height_ = h;
+    pixels_.assign(size_t(w) * size_t(h) * 4u, 0);
+    has_sub_rect_ = false;
+    fillSolid(40, 120, 200);
+  }
+
   relay::WaitHandle fd() const override { return relay::WaitHandle{}; }
   std::pair<int, int> dimensions() const override { return {width_, height_}; }
   bool drainDamage() override { return true; }
@@ -233,6 +242,65 @@ int main() {
     fitted->captureChanged(false);
     std::vector<DamageRect> rects;
     require(fitted->changedRects(rects) && rects.empty(), "empty source damage must report no stream damage");
+  }
+
+  {
+    // The default budget stays at Level 5.2 and 4096 px; --max-dimension above 4096 raises it to Level 6.2.
+    const SurfaceBudget standard = SurfaceBudget::forFps(60);
+    require(standard.max_dimension == 4096 && standard.max_macroblocks == 36864 &&
+            standard.max_macroblocks_per_sec == 2073600 && standard.max_h264_level_idc == 52,
+            "default budget must stay at Level 5.2 and 4096 px");
+    const SurfaceBudget wide = SurfaceBudget::forFps(60, 8192);
+    require(wide.max_dimension == 8192 && wide.max_macroblocks == 139264 &&
+            wide.max_macroblocks_per_sec == 16711680 && wide.max_h264_level_idc == 62,
+            "8192 px budget must use Level 6.2 limits");
+    require(SurfaceBudget::forFps(60, 4096).max_h264_level_idc == 52, "4096 px must stay Level 5.2");
+    require(SurfaceBudget::forFps(60, 4098).max_h264_level_idc == 62, "any axis above 4096 px needs Level 6.2");
+    require(SurfaceBudget::forFps(60, 100000).max_dimension == 8192, "budget axis is capped at 8192 px");
+
+    const auto native5k = planSurface(5120, 2880, wide, SurfaceScaleMode::exact);
+    require(native5k.state == SurfaceFitState::native && native5k.stream_width == 5120 && native5k.stream_height == 2880 &&
+            !native5k.scaled() && native5k.h264_level_idc <= 62, "5K60 must be native under the 8192 px budget");
+    const auto power5k = planSurface(5120, 2880, wide, SurfaceScaleMode::power_of_two);
+    require(power5k.state == SurfaceFitState::native && power5k.shift == 0, "5K60 must need no mip level under the 8192 px budget");
+    const auto standard5k = planSurface(5120, 2880, standard, SurfaceScaleMode::exact);
+    require(standard5k.scaled() && standard5k.stream_width <= 4096 && standard5k.stream_height <= 4096 &&
+            standard5k.h264_level_idc <= 52, "5K60 must still scale into 4096 px under the default budget");
+    const auto standard4k = planSurface(3840, 2160, standard, SurfaceScaleMode::exact);
+    require(standard4k.state == SurfaceFitState::native && standard4k.h264_level_idc == 52, "4K60 stays native at Level 5.2");
+    const auto uhd8k = planSurface(7680, 4320, wide, SurfaceScaleMode::exact);
+    require(uhd8k.state == SurfaceFitState::native && uhd8k.h264_level_idc == 61, "8K60 fits natively at Level 6.1");
+    const auto huge = planSurface(8192, 4608, wide, SurfaceScaleMode::exact);
+    require(huge.ok() && huge.scaled() && huge.stream_width <= 8192 && huge.frame_macroblocks <= 139264 &&
+            huge.state == SurfaceFitState::scaled_level_budget, "an 8192x4608 surface must scale into the Level 6.2 macroblock budget");
+    const auto wide120 = planSurface(5120, 2880, SurfaceBudget::forFps(120, 8192), SurfaceScaleMode::exact);
+    require(wide120.ok() && wide120.macroblocks_per_sec <= 16711680, "5K120 must fit the Level 6.2 rate");
+
+    auto raw = std::make_unique<SyntheticSource>(5120, 2880);
+    SurfacePlan plan;
+    auto fitted = fitCaptureSourceToBudget(std::move(raw), 60, &plan, 8192);
+    require(!plan.scaled() && fitted->dimensions().first == 5120, "5K source must not be wrapped under the 8192 px budget");
+  }
+  {
+    // A wrapped source follows its inner source when that changes size.
+    auto raw = std::make_unique<SyntheticSource>(5120, 2880);
+    auto* raw_ptr = raw.get();
+    auto fitted = fitCaptureSourceToBudget(std::move(raw), 60);
+    const auto before = fitted->dimensions();
+    require(before.first < 5120, "oversized source must be scaled before the resize");
+    raw_ptr->resize(2560, 1440);
+    fitted->drainDamage();
+    const auto after = fitted->dimensions();
+    require(after.first == 2560 && after.second == 1440, "resized source must now be streamed natively");
+    const auto frame = fitted->captureChanged(false);
+    require(frame.width == 2560 && frame.height == 1440 && frame.data[0] == 40 && frame.data[2] == 200,
+            "frame after the resize must carry the new size and pixels");
+    raw_ptr->resize(6016, 3384);
+    fitted->drainDamage();
+    const auto grown = fitted->dimensions();
+    require(grown.first <= 4096 && grown.second <= 4096 && grown.first > 2560, "grown source must be scaled into the budget");
+    const auto grownFrame = fitted->captureChanged(false);
+    require(grownFrame.width == grown.first && grownFrame.height == grown.second, "scaled frame must match the new plan");
   }
 
   std::puts("surface budget and scaler checks passed");

@@ -34,12 +34,17 @@ enum class SurfaceScaleMode : uint8_t {
   power_of_two,
 };
 
-/** H.264 Level 5.2 decode and hardware-encoder surface envelope parameterized by frame rate. */
+/** H.264 Level 5.2 (Level 6.2 above 4096 px) decode and hardware-encoder surface envelope parameterized by frame rate. */
 struct SurfaceBudget {
   static constexpr int default_max_dimension = 4096;
+  /** Largest --max-dimension the engine accepts; it needs H.264 Level 6.2. */
+  static constexpr int limit_max_dimension = 8192;
   static constexpr uint64_t level52_max_macroblocks = 36864;
   static constexpr uint64_t level52_max_macroblocks_per_sec = 2073600;
   static constexpr uint8_t level52_idc = 52;
+  static constexpr uint64_t level62_max_macroblocks = 139264;
+  static constexpr uint64_t level62_max_macroblocks_per_sec = 16711680;
+  static constexpr uint8_t level62_idc = 62;
 
   int max_dimension = default_max_dimension;
   uint64_t max_macroblocks = level52_max_macroblocks;
@@ -47,10 +52,20 @@ struct SurfaceBudget {
   unsigned fps = 60;
   uint8_t max_h264_level_idc = level52_idc;
 
-  /** Returns the default H.264 Level 5.2 surface budget for the requested stream frame rate. */
-  static constexpr SurfaceBudget forFps(unsigned target_fps) {
+  /**
+   * Returns the surface budget for the requested stream frame rate and longest axis. Up to 4096 px the budget is
+   * H.264 Level 5.2; above it the macroblock and macroblock-rate limits rise to Level 6.2 so a native 5K surface fits.
+   */
+  static constexpr SurfaceBudget forFps(unsigned target_fps, int max_dim = default_max_dimension) {
     SurfaceBudget budget;
     budget.fps = target_fps ? target_fps : 60u;
+    budget.max_dimension = max_dim < min_frame_width ? default_max_dimension
+                           : max_dim > limit_max_dimension ? limit_max_dimension : max_dim;
+    if (budget.max_dimension > default_max_dimension) {
+      budget.max_macroblocks = level62_max_macroblocks;
+      budget.max_macroblocks_per_sec = level62_max_macroblocks_per_sec;
+      budget.max_h264_level_idc = level62_idc;
+    }
     return budget;
   }
 };

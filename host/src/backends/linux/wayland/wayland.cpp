@@ -159,7 +159,7 @@ void Connection::cleanup() {
   display = nullptr;
 }
 
-bool initializeNativeBackend(const std::string& output, unsigned) {
+bool initializeNativeBackend(const std::string& output, unsigned, const BackendOptions&) {
   selectedOutputName = output;
   return true;
 }

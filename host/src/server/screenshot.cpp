@@ -21,8 +21,8 @@ struct Resources {
   std::unique_ptr<CaptureSource> source;
   int width = 0, height = 0;
 
-  void init(const Backend& backend, unsigned fps) {
-    source = fitCaptureSourceToBudget(backend.capture(), fps);
+  void init(const Backend& backend, unsigned fps, int maxDimension) {
+    source = fitCaptureSourceToBudget(backend.capture(), fps, nullptr, maxDimension);
     const auto dimensions = source->dimensions();
     width = dimensions.first;
     height = dimensions.second;
@@ -30,7 +30,15 @@ struct Resources {
 
   std::vector<uint8_t> capture() {
     source->drainDamage();
-    const auto image = source->capture();
+    auto image = source->capture();
+    // The display may have been resized since the last screenshot; a frame matching the source's size is current.
+    auto size = source->dimensions();
+    if (image.width != size.first || image.height != size.second) {
+      image = source->capture();
+      size = source->dimensions();
+    }
+    width = size.first;
+    height = size.second;
     require(image.data && image.width == width && image.height == height && image.stride >= width * 4 &&
             image.stride <= width * 8 && (image.format == PixelFormat::BGRA || image.format == PixelFormat::ARGB),
             "unsupported screenshot frame");
@@ -84,6 +92,7 @@ void Screenshot::run(lws_context* context) {
   auto* server = static_cast<Server*>(lws_context_user(context));
   const auto& backend = backendFor(server->config.backend);
   const unsigned fps = server->config.fps;
+  const int maxDimension = server->config.max_dimension;
   std::unique_ptr<Resources> resources;
   for (;;) {
     {
@@ -97,7 +106,7 @@ void Screenshot::run(lws_context* context) {
     try {
       if (!resources) {
         resources = std::make_unique<Resources>();
-        resources->init(backend, fps);
+        resources->init(backend, fps, maxDimension);
       }
       result = resources->capture();
     } catch (const std::exception& failure) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture-source.hpp"
+#include "surface-budget.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -30,6 +31,8 @@ struct CaptureStats {
 struct CaptureSettings {
   unsigned fps;
   uint64_t min_bitrate, start_bitrate, max_bitrate;
+  /// Longest stream axis in pixels; a source that is larger is scaled down to fit.
+  int max_dimension = SurfaceBudget::default_max_dimension;
 };
 
 class CaptureEncoder {
@@ -48,7 +51,7 @@ class CaptureEncoder {
   void acknowledge(uint32_t generation, uint32_t sequence);
   void setFlowControl(uint32_t generation, unsigned window, uint64_t bitrate, bool paused, uint64_t admit_until_us);
   CaptureStats stats() const;
-  /** Returns the stream width and height after fitting the capture surface to the H.264 budget. */
+  /** Returns the current stream width and height after fitting the capture surface to the H.264 budget; it changes when the source is resized. */
   std::pair<int, int> dimensions() const;
   std::string error() const;
   void stop();

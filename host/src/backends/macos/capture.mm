@@ -4,12 +4,15 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreVideo/CoreVideo.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,6 +26,8 @@ struct CaptureState;
 @interface RelayCaptureOutput : NSObject <SCStreamOutput, SCStreamDelegate> {
  @public
   std::weak_ptr<relay::macos::CaptureState> state;
+  /// Set once the stream this output belongs to was replaced or stopped on purpose; later callbacks are ignored.
+  std::atomic<bool> retired;
 }
 @end
 
@@ -76,22 +81,29 @@ struct CaptureState {
     requireSurfaceSize(display.width, display.height);
     image.resize(size_t(display.width) * display.height * 4);
   }
+  /// The display the image buffer matches; it changes only when the first frame of a resized stream arrives.
   Display display;
+  /// The display a restarted stream is being started for, until its first frame arrives.
+  std::optional<Display> next;
   std::mutex mutex;
   std::condition_variable arrived;
   std::vector<uint8_t> image;
   std::vector<MacCapture*> sources;
   bool haveFrame = false;
   std::string failure;
+  /// Set when ScreenCaptureKit stopped the stream, for example while the display reconfigures.
+  std::atomic<bool> streamStopped{false};
+  unsigned mismatched = 0;
 
   void fail(const std::string& message);
-  void checkDisplay();
+  Display currentDisplay();
+  void expect(const Display& target);
   void frame(CMSampleBufferRef sample);
 };
 
 namespace {
 /// Shares one screen capture stream across capture sources.
-class SharedCapture {
+class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
  public:
   static std::shared_ptr<SharedCapture> shared() {
     static std::mutex mutex;
@@ -112,7 +124,7 @@ class SharedCapture {
   void stop() {
     @autoreleasepool {
       if (timer) { dispatch_source_cancel(timer); timer = nil; }
-      if (started) { started = false; [stream stopCaptureWithCompletionHandler:nil]; }
+      if (started) { started = false; output->retired = true; [stream stopCaptureWithCompletionHandler:nil]; }
     }
   }
   bool failed() const {
@@ -120,6 +132,20 @@ class SharedCapture {
     return !state->failure.empty();
   }
   void start() {
+    @autoreleasepool {
+      queue = dispatch_queue_create("relay.macos.capture", DISPATCH_QUEUE_SERIAL);
+      startStream(state->display);
+      timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+      std::weak_ptr<SharedCapture> weak = shared_from_this();
+      dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+      dispatch_source_set_event_handler(timer, ^{ if (auto current = weak.lock()) current->tick(); });
+      dispatch_resume(timer);
+    }
+  }
+  std::shared_ptr<CaptureState> state;
+ private:
+  /// Starts a screen capture stream sized for target and waits until ScreenCaptureKit confirms it.
+  void startStream(const Display& target) {
     @autoreleasepool {
       auto contentResult = std::make_shared<ContentResult>();
       [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:YES
@@ -136,13 +162,13 @@ class SharedCapture {
       if (contentResult->error) throw std::runtime_error(errorMessage(contentResult->error, "Listing displays for screen capture"));
       SCDisplay* selected = nil;
       for (SCDisplay* candidate in contentResult->content.displays)
-        if (candidate.displayID == state->display.id) { selected = candidate; break; }
+        if (candidate.displayID == target.id) { selected = candidate; break; }
       if (!selected) throw std::runtime_error("The selected display is not available for screen capture");
       lock.unlock();
       SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:selected excludingWindows:@[]];
       SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
-      config.width = state->display.width;
-      config.height = state->display.height;
+      config.width = target.width;
+      config.height = target.height;
       config.pixelFormat = kCVPixelFormatType_32BGRA;
       config.colorSpaceName = kCGColorSpaceSRGB;
       config.showsCursor = NO;
@@ -150,7 +176,7 @@ class SharedCapture {
       config.minimumFrameInterval = kCMTimeZero;
       output = [[RelayCaptureOutput alloc] init];
       output->state = state;
-      queue = dispatch_queue_create("relay.macos.capture", DISPATCH_QUEUE_SERIAL);
+      output->retired = false;
       stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:output];
       NSError* error = nil;
       if (![stream addStreamOutput:output type:SCStreamOutputTypeScreen sampleHandlerQueue:queue error:&error])
@@ -174,27 +200,57 @@ class SharedCapture {
       }
       if (result->error) throw std::runtime_error(errorMessage(result->error, "Starting screen capture"));
       started = true;
-      timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-      std::weak_ptr<CaptureState> weak = state;
-      dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
-      dispatch_source_set_event_handler(timer, ^{ if (auto current = weak.lock()) current->checkDisplay(); });
-      dispatch_resume(timer);
     }
   }
-  std::shared_ptr<CaptureState> state;
- private:
+  /// Stops the running stream and waits briefly for ScreenCaptureKit to confirm; its callbacks are ignored from now on.
+  void stopStream() {
+    @autoreleasepool {
+      if (!started) return;
+      started = false;
+      output->retired = true;
+      dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
+      [stream stopCaptureWithCompletionHandler:^(NSError*) { dispatch_semaphore_signal(stopped); }];
+      dispatch_semaphore_wait(stopped, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+    }
+  }
+  /// Once a second, on the capture queue: restarts the stream when the display changed size or the stream stopped.
+  void tick() {
+    @autoreleasepool {
+      try {
+        if (failed()) return;
+        const Display now = findDisplay();
+        const Display old = state->currentDisplay();
+        const bool changed = now.id != old.id || now.native_width != old.native_width ||
+                             now.native_height != old.native_height || now.width != old.width ||
+                             now.height != old.height || !CGRectEqualToRect(now.bounds, old.bounds);
+        if (changed || state->streamStopped) {
+          std::fprintf(stderr, "capture: %s %dx%d to %dx%d; restarting screen capture\n",
+                       changed ? "display changed from" : "stream stopped, display now", old.width, old.height,
+                       now.width, now.height);
+          stopStream();
+          state->expect(now);
+          state->streamStopped = true;
+          startStream(now);
+          state->streamStopped = false;
+        }
+        trouble = 0;
+      } catch (const std::exception& error) {
+        if (++trouble >= 10) state->fail(error.what());
+      }
+    }
+  }
   SCStream* stream = nil;
   RelayCaptureOutput* output = nil;
   dispatch_queue_t queue = nil;
   dispatch_source_t timer = nil;
   bool started = false;
+  unsigned trouble = 0;
 };
 
 /// Provides frames and damage notifications to one capture consumer.
 class MacCapture final : public CaptureSource {
  public:
-  MacCapture() : shared(SharedCapture::shared()), state(shared->state),
-                 width(state->display.width), height(state->display.height), front(size_t(width) * height * 4) {
+  MacCapture() : shared(SharedCapture::shared()), state(shared->state) {
     if (!ready.valid()) throw std::runtime_error("Creating the capture pipe failed");
     ready.signal();
     std::unique_lock<std::mutex> lock(state->mutex);
@@ -208,13 +264,20 @@ class MacCapture final : public CaptureSource {
       state->sources.erase(std::remove(state->sources.begin(), state->sources.end(), this), state->sources.end());
       throw std::runtime_error(error);
     }
+    width = state->display.width;
+    height = state->display.height;
+    front.resize(size_t(width) * height * 4);
   }
   ~MacCapture() override {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->sources.erase(std::remove(state->sources.begin(), state->sources.end(), this), state->sources.end());
   }
   WaitHandle fd() const override { return ready.handle(); }
-  std::pair<int, int> dimensions() const override { return {width, height}; }
+  /// The size of the image the next capture returns; it changes after the display is resized.
+  std::pair<int, int> dimensions() const override {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return {state->display.width, state->display.height};
+  }
   PixelFormat pixelFormat() const override { return PixelFormat::BGRA; }
   bool drainDamage() override {
     std::lock_guard<std::mutex> lock(mutex);
@@ -224,15 +287,27 @@ class MacCapture final : public CaptureSource {
   FrameView capture() override { return captureChanged(true); }
   FrameView captureChanged(bool full) override {
     std::vector<DamageRect> rects;
+    bool wholeFrame;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      lastFull = full || pendingFull;
+      wholeFrame = full || pendingFull;
       rects.swap(pending);
       pendingFull = false;
-      last = lastFull ? std::vector<DamageRect>{} : rects;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!state->failure.empty()) throw std::runtime_error(state->failure);
+    if (state->display.width != width || state->display.height != height) {
+      // The display was resized: damage from before it is meaningless, so return the whole new image.
+      width = state->display.width;
+      height = state->display.height;
+      front.assign(size_t(width) * height * 4, 0);
+      wholeFrame = true;
+    }
+    {
+      std::lock_guard<std::mutex> own(mutex);
+      lastFull = wholeFrame;
+      last = lastFull ? std::vector<DamageRect>{} : rects;
+    }
     if (lastFull) std::memcpy(front.data(), state->image.data(), front.size());
     else for (const auto& rect : rects)
       for (int y = rect.y; y < rect.y + rect.height; ++y)
@@ -256,7 +331,7 @@ class MacCapture final : public CaptureSource {
  private:
   std::shared_ptr<SharedCapture> shared;
   std::shared_ptr<CaptureState> state;
-  int width, height;
+  int width = 0, height = 0;
   Wake ready;
   std::mutex mutex;
   std::vector<uint8_t> front;
@@ -295,15 +370,14 @@ void CaptureState::fail(const std::string& message) {
   for (auto* source : sources) source->damaged({}, true);
 }
 
-void CaptureState::checkDisplay() {
-  try {
-    const auto now = findDisplay();
-    if (now.id != display.id || now.native_width != display.native_width || now.native_height != display.native_height ||
-        now.width != display.width || now.height != display.height ||
-        !CGRectEqualToRect(now.bounds, display.bounds))
-      fail("The display changed from " + std::to_string(display.width) + "x" + std::to_string(display.height) + " to " +
-           std::to_string(now.width) + "x" + std::to_string(now.height) + " or moved; restart relay to stream it");
-  } catch (const std::exception& error) { fail(error.what()); }
+Display CaptureState::currentDisplay() {
+  std::lock_guard<std::mutex> lock(mutex);
+  return display;
+}
+
+void CaptureState::expect(const Display& target) {
+  std::lock_guard<std::mutex> lock(mutex);
+  next = target;
 }
 
 void CaptureState::frame(CMSampleBufferRef sample) {
@@ -313,11 +387,24 @@ void CaptureState::frame(CMSampleBufferRef sample) {
   NSNumber* status = info[SCStreamFrameInfoStatus];
   if (!status || (status.integerValue != SCFrameStatusComplete && status.integerValue != SCFrameStatusStarted)) return;
   CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
-  if (!buffer || CVPixelBufferGetWidth(buffer) != size_t(display.width) ||
-      CVPixelBufferGetHeight(buffer) != size_t(display.height) || CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_32BGRA) {
-    checkDisplay();
+  if (!buffer || CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_32BGRA)
     throw std::runtime_error("Screen capture returned an invalid image");
+  std::unique_lock<std::mutex> lock(mutex);
+  if (!failure.empty()) return;
+  if (next && CVPixelBufferGetWidth(buffer) == size_t(next->width) && CVPixelBufferGetHeight(buffer) == size_t(next->height)) {
+    // First frame of a restarted stream: the image buffer and the published size switch together.
+    display = *next;
+    next.reset();
+    image.assign(size_t(display.width) * display.height * 4, 0);
+    haveFrame = false;
   }
+  if (CVPixelBufferGetWidth(buffer) != size_t(display.width) || CVPixelBufferGetHeight(buffer) != size_t(display.height)) {
+    // A frame from before the stream was restarted; the display check restarts it and these stop arriving.
+    if (++mismatched > 300) throw std::runtime_error("Screen capture keeps returning images of the wrong size");
+    return;
+  }
+  mismatched = 0;
+  lock.unlock();
   std::vector<DamageRect> rects;
   bool full = !dirtyRects(info[SCStreamFrameInfoDirtyRects], display.width, display.height, rects);
   for (const auto& rect : rects)
@@ -327,7 +414,7 @@ void CaptureState::frame(CMSampleBufferRef sample) {
   const size_t stride = CVPixelBufferGetBytesPerRow(buffer);
   if (!pixels || stride < size_t(display.width) * 4)
     throw std::runtime_error("Screen capture returned an invalid image stride");
-  std::lock_guard<std::mutex> lock(mutex);
+  lock.lock();
   if (!failure.empty()) return;
   full = full || !haveFrame;
   if (full) rects = {{0, 0, display.width, display.height}};
@@ -348,7 +435,7 @@ std::unique_ptr<CaptureSource> makeCaptureSource() { return std::make_unique<Mac
 @implementation RelayCaptureOutput
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type {
   (void)stream;
-  if (type != SCStreamOutputTypeScreen) return;
+  if (type != SCStreamOutputTypeScreen || retired) return;
   @autoreleasepool {
     if (auto current = state.lock()) {
       try { current->frame(sample); }
@@ -358,10 +445,11 @@ std::unique_ptr<CaptureSource> makeCaptureSource() { return std::make_unique<Mac
 }
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
   (void)stream;
+  if (retired) return;
   @autoreleasepool {
     if (auto current = state.lock()) {
-      current->checkDisplay();
-      current->fail(relay::macos::errorMessage(error, "Screen capture stopped"));
+      if (error.code == SCStreamErrorUserDeclined) current->fail(relay::macos::errorMessage(error, "Screen capture stopped"));
+      else current->streamStopped = true;
     }
   }
 }
