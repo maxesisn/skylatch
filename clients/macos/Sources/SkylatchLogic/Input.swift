@@ -55,6 +55,24 @@ public enum Geometry {
         return Viewport(x: ((width - w) / 2).rounded(.down), y: ((height - h) / 2).rounded(.down), width: w, height: h)
     }
 
+    /// Largest content size with the video's exact aspect ratio that fits `maxWidth` x `maxHeight`, then
+    /// clamped up to the window's minimum content size. The limiting side is a whole number of points; the
+    /// other follows the ratio exactly (it may be a half point, which is a whole pixel on a Retina display).
+    /// Nil for an empty video or bounds.
+    public static func aspectFit(videoWidth: Double, videoHeight: Double, maxWidth: Double, maxHeight: Double,
+                                 minWidth: Double = 0, minHeight: Double = 0) -> (width: Double, height: Double)? {
+        guard videoWidth > 0, videoHeight > 0, maxWidth >= 1, maxHeight >= 1 else { return nil }
+        var w: Double, h: Double
+        if maxWidth * videoHeight <= maxHeight * videoWidth {
+            w = maxWidth.rounded(.down)
+            h = w * videoHeight / videoWidth
+        } else {
+            h = maxHeight.rounded(.down)
+            w = h * videoWidth / videoHeight
+        }
+        return (max(w, minWidth, 1), max(h, minHeight, 1))
+    }
+
     /// Maps a coordinate inside `[start, end)` to `0...65535`, clamping to the range.
     public static func normalize(_ p: Double, start: Double, end: Double) -> UInt16 {
         guard end - start > 1 else { return 0 }
@@ -65,8 +83,9 @@ public enum Geometry {
 
 /// Converts scroll deltas into wire wheel steps (multiples of 120).
 public struct WheelAccumulator {
-    /// Points of precise (trackpad) scrolling that make one 120-unit notch.
-    public static let pointsPerNotch = 20.0
+    /// Points of precise (trackpad) scrolling that make one 120-unit notch. Tuned so that two-finger
+    /// scrolling feels natural on Windows and Linux hosts instead of racing ahead of the fingers.
+    public static let pointsPerNotch = 58.0
     private var remainder = 0.0
 
     public init() {}
@@ -100,5 +119,55 @@ public struct WheelAccumulator {
             left -= part
         }
         return out
+    }
+}
+
+/// Detects two presses of one key within a short window with nothing in between (Right Ctrl double-tap).
+public struct DoubleTapDetector {
+    /// Longest gap between the two presses, in nanoseconds.
+    public static let windowNanos: UInt64 = 400_000_000
+    private var firstAt: UInt64?
+
+    public init() {}
+
+    /// Records a press of the watched key at `now` (monotonic nanoseconds). True when it completes a
+    /// double tap; the detector is then disarmed so a third press starts over.
+    public mutating func press(at now: UInt64) -> Bool {
+        if let first = firstAt, now >= first, now - first <= Self.windowNanos {
+            firstAt = nil
+            return true
+        }
+        firstAt = now
+        return false
+    }
+
+    /// Any other key press in between cancels the gesture.
+    public mutating func cancel() { firstAt = nil }
+}
+
+/// Cross-OS Command/Control mapping: the Mac's Cmd drives the remote Ctrl and the Mac's Ctrl drives the
+/// remote GUI (Win) key, so Cmd+C, V, W, T and A work on Windows and Linux hosts.
+public enum ModifierSwap {
+    /// HID usage after the optional swap (LCtrl 224, LGUI 227, RCtrl 228, RGUI 231).
+    public static func map(_ hid: UInt8, enabled: Bool) -> UInt8 {
+        guard enabled else { return hid }
+        switch hid {
+        case 224: return 227
+        case 227: return 224
+        case 228: return 231
+        case 231: return 228
+        default: return hid
+        }
+    }
+
+    /// Hosts that expect Ctrl-based shortcuts.
+    public static func defaultEnabled(forOS os: String?) -> Bool {
+        guard let os = os?.lowercased() else { return false }
+        return os == "windows" || os == "linux"
+    }
+
+    /// An explicit flag wins; otherwise the device's OS decides (direct sessions have no device record).
+    public static func resolve(flag: Bool?, deviceOS: String?) -> Bool {
+        flag ?? defaultEnabled(forOS: deviceOS)
     }
 }

@@ -37,6 +37,18 @@ final class CLITests: XCTestCase {
         XCTAssertThrowsError(try CLI.parse(["--direct", "ws://h", "--no-direct"]))
     }
 
+    func testCmdCtrlSwapOptions() throws {
+        let base = ["--hub", "wss://hub.example.com", "--token", "t"]
+        XCTAssertNil(try CLI.parse(base).swapCmdCtrl)
+        XCTAssertEqual(try CLI.parse(base + ["--swap-cmd-ctrl"]).swapCmdCtrl, true)
+        XCTAssertEqual(try CLI.parse(base + ["--no-swap-cmd-ctrl"]).swapCmdCtrl, false)
+        XCTAssertEqual(try CLI.parse(["--direct", "ws://h", "--swap-cmd-ctrl"]).swapCmdCtrl, true)
+        XCTAssertThrowsError(try CLI.parse(base + ["--swap-cmd-ctrl", "--no-swap-cmd-ctrl"]))
+        XCTAssertThrowsError(try CLI.parse(base + ["--swap-cmd-ctrl", "--swap-cmd-ctrl"]))
+        XCTAssertThrowsError(try CLI.parse(base + ["--list", "--swap-cmd-ctrl"]))
+        XCTAssertTrue(CLI.usage.contains("--swap-cmd-ctrl"))
+    }
+
     func testInvalidArguments() {
         XCTAssertThrowsError(try CLI.parse([]))
         XCTAssertThrowsError(try CLI.parse(["--bogus"]))

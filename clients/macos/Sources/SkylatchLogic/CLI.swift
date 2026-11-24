@@ -10,6 +10,8 @@ public struct Config: Equatable {
     public var list = false
     public var noDirect = false
     public var noClipboard = false
+    /// nil = automatic (on for Windows and Linux devices reached through a hub), otherwise forced.
+    public var swapCmdCtrl: Bool?
     public var help = false
 
     public init() {}
@@ -28,16 +30,21 @@ public enum CLI {
         Usage:
           skylatch-client --hub <ws:// or wss:// URL> --token <token> --list
           skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]
-                          [--no-direct] [--no-clipboard] [--smoke-seconds N]
+                          [--no-direct] [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]
+                          [--smoke-seconds N]
           skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]
-                          [--no-clipboard] [--smoke-seconds N]
+                          [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]
           skylatch-client --help
 
         Without --device, hub mode selects the sole device or opens a picker.
         --no-direct forces the hub relay. --no-clipboard disables text clipboard sync.
         --smoke-seconds runs hidden without input or clipboard sync;
         specify --device if the hub has multiple devices.
-        Cmd+Ctrl+F: toggle native fullscreen.
+        --swap-cmd-ctrl / --no-swap-cmd-ctrl force the Cmd<->Ctrl swap on or off; by default it is on
+        for Windows and Linux devices reached through a hub. The HUD toggles it live.
+        Cmd+Ctrl+F: toggle native fullscreen (fullscreen captures system keys automatically).
+        Double-tap Right Ctrl: toggle system key capture (needs the Accessibility permission).
+        Hold Esc for 1.2 s in fullscreen to leave fullscreen.
         """
 
     /// Accepts ws:// or wss:// URLs with a host and no user information or whitespace.
@@ -75,6 +82,9 @@ public enum CLI {
             case "--no-clipboard":
                 if c.noClipboard { throw UsageError("duplicate option; see --help") }
                 c.noClipboard = true
+            case "--swap-cmd-ctrl", "--no-swap-cmd-ctrl":
+                if c.swapCmdCtrl != nil { throw UsageError("duplicate or conflicting Cmd/Ctrl swap option; see --help") }
+                c.swapCmdCtrl = option == "--swap-cmd-ctrl"
             case "--hub", "--direct", "--token", "--device", "--smoke-seconds":
                 guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
                     throw UsageError("missing option value; see --help")
@@ -112,7 +122,7 @@ public enum CLI {
         }
         if !c.hub.isEmpty {
             if c.token.isEmpty { throw UsageError("--hub requires --token") }
-            if c.list && (!c.device.isEmpty || c.noDirect || c.noClipboard || c.isSmoke) {
+            if c.list && (!c.device.isEmpty || c.noDirect || c.noClipboard || c.isSmoke || c.swapCmdCtrl != nil) {
                 throw UsageError("--list cannot be used with session options")
             }
         } else {

@@ -26,6 +26,10 @@ protocol SessionDelegate: AnyObject {
     func sessionEnded(_ end: SessionEnd)
     func sessionCursor(width: Int, height: Int, xhot: Int, yhot: Int, rgba: [UInt8]?)
     func sessionClipboardText(_ text: String)
+    /// The first decoded picture of this session; `width` and `height` are the stream's pixel size.
+    func sessionFirstFrame(width: Int, height: Int)
+    /// A new SL1 monitor list from the host.
+    func sessionMonitors(_ list: [MonitorEntry])
 }
 
 /// One connection to a host: the core client, the decode/present thread, and the shared statistics.
@@ -139,6 +143,16 @@ final class Session: @unchecked Sendable {
         report("could not queue remote input")
     }
 
+    /// Asks the host to stream another display. False when the request could not be queued.
+    @discardableResult
+    func selectMonitor(_ id: String) -> Bool {
+        stateLock.lock()
+        let active = client
+        stateLock.unlock()
+        guard let active, !isStopping() else { return false }
+        return skylatch_select_monitor(active, id) == SKYLATCH_OK
+    }
+
     func sendClipboard(_ text: String) -> Bool {
         stateLock.lock()
         let active = client
@@ -226,17 +240,25 @@ final class Session: @unchecked Sendable {
         stateLock.unlock()
         if isStopping() { return }
 
-        if clipboardEnabled {
+        if !config.isSmoke {
             var sl1 = SkylatchSl1Callbacks()
-            sl1.on_clipboard_data = { ctx, text, length in
+            sl1.on_monitor_list = { ctx, text, length in
                 let me = Session.session(ctx)
-                guard !me.isStopping(), length <= Session.maxClipboardBytes, text != nil || length == 0 else { return }
-                let bytes = text.map { Array(UnsafeRawBufferPointer(start: $0, count: length)) } ?? []
-                guard let string = String(validatingUTF8Bytes: bytes), !string.contains("\0") else { return }
-                DispatchQueue.main.async { me.delegate?.sessionClipboardText(string) }
+                guard !me.isStopping(), let text, length > 0, length <= 1 << 20,
+                      let list = Monitors.parse(json: Data(bytes: text, count: length)) else { return }
+                DispatchQueue.main.async { me.delegate?.sessionMonitors(list) }
+            }
+            if clipboardEnabled {
+                sl1.on_clipboard_data = { ctx, text, length in
+                    let me = Session.session(ctx)
+                    guard !me.isStopping(), length <= Session.maxClipboardBytes, text != nil || length == 0 else { return }
+                    let bytes = text.map { Array(UnsafeRawBufferPointer(start: $0, count: length)) } ?? []
+                    guard let string = String(validatingUTF8Bytes: bytes), !string.contains("\0") else { return }
+                    DispatchQueue.main.async { me.delegate?.sessionClipboardText(string) }
+                }
             }
             guard skylatch_set_sl1_callbacks(active, &sl1, context) == SKYLATCH_OK else {
-                report("could not register clipboard callback")
+                report("could not register SL1 callbacks")
                 return
             }
         }
@@ -290,12 +312,17 @@ final class Session: @unchecked Sendable {
                 stats.mode = decoder.usesHardware ? "VideoToolbox" : "VideoToolbox-software"
                 stats.decoded += 1
                 stats.decodeUs += result.decodeUs
+                let first = stats.decoded == 1
                 if presented {
                     if stats.presented == 0 { stats.firstPresent = now }
                     stats.presented += 1
                     stats.waitUs += wait
                 }
                 stateLock.unlock()
+                if first && !config.isSmoke {
+                    let width = frame.width, height = frame.height
+                    DispatchQueue.main.async { [weak self] in self?.delegate?.sessionFirstFrame(width: width, height: height) }
+                }
             } catch {
                 // Drop the session and wait for the next keyframe; give up if keyframes keep failing.
                 decoder.invalidate()
