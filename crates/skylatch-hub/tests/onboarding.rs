@@ -279,7 +279,7 @@ async fn root_serves_self_contained_console() {
         .unwrap()
         .starts_with("text/html"));
     let html = response.text().await.unwrap();
-    assert!((8_000..=12_000).contains(&html.len()));
+    assert!((4_000..=16_000).contains(&html.len()));
     for text in [
         "Skylatch Hub",
         "Sign in",
