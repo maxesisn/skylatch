@@ -15,10 +15,13 @@ AppName=Skylatch
 AppVersion={#AppVersion}
 AppPublisher=Skylatch
 AppPublisherURL=https://github.com/maxesisn/skylatch
-DefaultDirName={localappdata}\Programs\Skylatch
+; Per-user installs land in %LOCALAPPDATA%\Programs\Skylatch; an install for all users goes to
+; Program Files and may register the LocalSystem host agent service.
+DefaultDirName={autopf}\Skylatch
 DefaultGroupName=Skylatch
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -32,7 +35,8 @@ WizardStyle=modern
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: "agentlogin"; Description: "Start Skylatch host agent automatically at login"; Flags: unchecked
+Name: "agentlogin"; Description: "Start Skylatch host agent automatically at login"; Flags: unchecked; Check: not IsAdminInstallMode
+Name: "agentservice"; Description: "Run Skylatch host agent as a Windows service (works on UAC prompts and the lock screen)"; Check: IsAdminInstallMode
 
 [Files]
 Source: "{#BinDir}\skylatch-ui.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -54,3 +58,23 @@ Name: "{userdesktop}\Skylatch"; Filename: "{app}\skylatch-ui.exe"; WorkingDir: "
 ; Enroll as the same Windows user. The agent reads its saved configuration at startup.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SkylatchAgent"; ValueData: """{app}\skylatch-agent.exe"" --engine-bin ""{app}\skylatch-host-engine.exe"""; Flags: uninsdeletevalue; Tasks: agentlogin
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "SkylatchAgent"; Flags: deletevalue; Tasks: not agentlogin
+
+[Run]
+Filename: "{app}\skylatch-agent.exe"; Parameters: "service install --start"; StatusMsg: "Starting the Skylatch host agent service..."; Flags: runhidden waituntilterminated; Tasks: agentservice
+Filename: "{app}\skylatch-agent.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; Tasks: not agentservice; Check: IsAdminInstallMode
+
+[UninstallRun]
+Filename: "{app}\skylatch-agent.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "SkylatchAgentService"; Check: IsAdminInstallMode
+
+[Code]
+// The service keeps skylatch-agent.exe and the engine it started open; stop it before files are
+// replaced. `net stop` returns once the service has stopped, and fails harmlessly when it is not
+// installed.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  if IsAdminInstallMode then
+    Exec(ExpandConstant('{sys}\net.exe'), 'stop SkylatchAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;

@@ -3,8 +3,10 @@
 
 pub mod cli;
 pub mod engine;
+mod engine_win_session;
 pub mod hardware;
 pub mod hub;
 
 mod direct;
 pub mod join;
+pub mod service;

@@ -69,6 +69,47 @@ Engine properties carried over and required in v0.1:
 - Viewer feedback: ACKs carry `viewer_wait_us`, so the encoder can pace itself to what the client
   can actually draw.
 
+## Windows service
+
+A host agent running as the signed-in user cannot inject input into UAC prompts, the lock screen
+or windows of elevated and `SYSTEM` processes: UIPI drops its `SendInput`. For those hosts the agent
+runs as the `SkylatchAgent` service (display name *Skylatch Host Agent*, LocalSystem, automatic
+start, restart 5 s / 10 s / 30 s after a failure).
+
+```text
+skylatch-agent.exe service install [--config PATH] [--start] [-- AGENT_OPTIONS...]
+skylatch-agent.exe service uninstall
+skylatch-agent.exe join --system <hub-url> --code <6-digit>
+```
+
+- The service command line is `skylatch-agent.exe service run --config <PATH> [AGENT_OPTIONS]`. Its
+  configuration defaults to `%ProgramData%\Skylatch\agent.json`; `join --system` writes that file
+  after giving the directory a protected ACL (owner Administrators, full control for SYSTEM and
+  Administrators only), so it must run elevated. Without an explicit `--config` the foreground agent
+  keeps using the per-user file, and `--config PATH` selects any other file in either mode.
+- Until the configuration exists the service waits for enrollment. Its log is
+  `%ProgramData%\Skylatch\logs\agent.log` (next to the configuration), and the engine's stdout and
+  stderr go to `logs\engine.log`; each log moves to `<name>.1` beyond 8 MiB.
+- A service runs in Session 0, which has no visible desktop. An agent in Session 0 therefore starts
+  the engine with a copy of its own `SYSTEM` token whose session id is set to the active console
+  session (`WTSGetActiveConsoleSessionId`), on `winsta0\default`, through `CreateProcessAsUserW`. A
+  user token from `WTSQueryUserToken` is not used: UIPI would still block it. The engine attaches
+  its input and GDI capture threads to the current input desktop (`OpenInputDesktop`) itself.
+- Only the log handle is inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). The engine is created
+  suspended and joins a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before it runs, so it ends with
+  the service, even after a crash. Readiness is the same loopback WebSocket probe as for an engine
+  started directly.
+- The agent follows the console session through `SERVICE_CONTROL_SESSIONCHANGE` and a 2 s poll.
+  When it changes (sign-out, user switch, an RDP session returning to the console), the engine is
+  stopped and started in the new session, retrying with a 0.5 s to 30 s backoff. The hub connection
+  stays up and an open client session reopens its stream on the new engine. While no session is
+  attached to the console the engine is left where it is.
+- An agent outside Session 0 starts the engine directly, as on the other platforms.
+
+The installer offers the service when it installs for all users (into Program Files). It stops the
+service before replacing files, runs `service install --start` and removes the service on uninstall.
+A per-user install keeps the optional start at login instead.
+
 ## Native clients: `clients/`
 
 Each client is a thin shell on the platform's native stack. It owns the window, input capture,

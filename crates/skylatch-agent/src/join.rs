@@ -28,6 +28,13 @@ pub struct Join {
     room: Option<String>,
     #[arg(long)]
     slot: Option<u32>,
+    /// Write the configuration to this file instead of the per-user one.
+    #[arg(long, value_name = "PATH", conflicts_with = "system")]
+    config: Option<PathBuf>,
+    /// Write the configuration read by the Windows service (`%ProgramData%\Skylatch\agent.json`),
+    /// readable only by SYSTEM and Administrators. Run from an elevated prompt.
+    #[arg(long)]
+    system: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -65,6 +72,32 @@ pub(crate) fn config_path() -> io::Result<PathBuf> {
             "cannot find user configuration directory",
         )
     })
+}
+
+/// Configuration of the Windows service: `%ProgramData%\Skylatch\agent.json`.
+pub fn system_config_path() -> PathBuf {
+    system_config_path_in(env::var_os("ProgramData").map(PathBuf::from))
+}
+
+fn system_config_path_in(program_data: Option<PathBuf>) -> PathBuf {
+    program_data
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Skylatch")
+        .join("agent.json")
+}
+
+/// The file `join` writes: an explicit path, the service configuration, or the per-user one.
+pub(crate) fn join_target(explicit: Option<PathBuf>, system: bool) -> io::Result<PathBuf> {
+    match (explicit, system) {
+        (Some(path), _) => Ok(path),
+        (None, true) if cfg!(windows) => Ok(system_config_path()),
+        (None, true) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "--system is only available on Windows; use --config PATH",
+        )),
+        (None, false) => config_path(),
+    }
 }
 
 pub(crate) fn load(path: &Path) -> io::Result<Option<SavedConfig>> {
@@ -112,9 +145,21 @@ fn prompt(label: &str) -> io::Result<String> {
 impl Join {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let hub_url = join_url(&self.hub_url)?;
-        let path = config_path()?;
-        let parent = path.parent().expect("the configuration has a parent");
+        let path = join_target(self.config, self.system)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        if self.system {
+            crate::service::restrict_to_admins(parent).map_err(|err| {
+                format!(
+                    "cannot restrict {} to SYSTEM and Administrators ({err}); run from an elevated prompt",
+                    parent.display()
+                )
+            })?;
+        }
         let device_id = self.device_id.unwrap_or_else(|| sanitize_id(&hostname()));
         let name = self.name.unwrap_or_else(hostname);
         let request = if let Some(code) = self.code {
@@ -157,10 +202,62 @@ impl Join {
             slot: self.slot,
         };
         write_private_file(&path, &serde_json::to_vec_pretty(&config)?)?;
-        println!(
-            "Device enrolled for {}. Start skylatch-agent to connect.",
-            result.account
-        );
+        if self.system {
+            println!(
+                "Device enrolled for {}. The SkylatchAgent service connects within a few seconds.",
+                result.account
+            );
+        } else {
+            println!(
+                "Device enrolled for {}. Start skylatch-agent to connect.",
+                result.account
+            );
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_configuration_lives_under_program_data() {
+        assert_eq!(
+            system_config_path_in(Some(PathBuf::from(if cfg!(windows) {
+                r"D:\Data"
+            } else {
+                "/data"
+            }))),
+            PathBuf::from(if cfg!(windows) { r"D:\Data" } else { "/data" })
+                .join("Skylatch")
+                .join("agent.json")
+        );
+        let fallback = PathBuf::from(r"C:\ProgramData")
+            .join("Skylatch")
+            .join("agent.json");
+        assert_eq!(system_config_path_in(None), fallback);
+        assert_eq!(
+            system_config_path_in(Some(PathBuf::from("relative"))),
+            fallback
+        );
+    }
+
+    #[test]
+    fn join_target_prefers_an_explicit_path() {
+        let explicit = PathBuf::from("custom.json");
+        assert_eq!(
+            join_target(Some(explicit.clone()), false).unwrap(),
+            explicit
+        );
+        assert_eq!(join_target(Some(explicit.clone()), true).unwrap(), explicit);
+        if cfg!(windows) {
+            assert_eq!(join_target(None, true).unwrap(), system_config_path());
+        } else {
+            assert_eq!(
+                join_target(None, true).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
     }
 }
