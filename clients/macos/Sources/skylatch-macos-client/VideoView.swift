@@ -14,6 +14,8 @@ final class VideoView: NSView, NSTextInputClient {
     var onResize: (() -> Void)?
     /// Current video size in pixels; input is ignored until the first frame has arrived.
     var videoSize: () -> (width: Int, height: Int) = { (0, 0) }
+    /// True once the host accepted smooth-wheel records for this session.
+    var smoothWheel: () -> Bool = { false }
     /// False after the session ended; all input is dropped.
     var inputEnabled = true
     /// In-window HUD over the video; pointer events it owns are never forwarded to the host.
@@ -32,8 +34,7 @@ final class VideoView: NSView, NSTextInputClient {
     private var modifiers: UInt16 = 0
     private var lastX: UInt16 = 0
     private var lastY: UInt16 = 0
-    private var wheelX = WheelAccumulator()
-    private var wheelY = WheelAccumulator()
+    private var scroll = ScrollEncoder()
     private var rightCtrlTap = DoubleTapDetector()
     private var escapeTimer: Timer?
     /// Key codes whose key-down the system-key tap consumed, so their key-up is consumed too.
@@ -144,10 +145,10 @@ final class VideoView: NSView, NSTextInputClient {
 
     private func send(_ type: UInt8, code: UInt16 = 0, value: UInt32 = 0) {
         guard inputEnabled, let sendRecord else { return }
-        let pointer = type >= InputType.pointerMove && type <= InputType.wheel
+        let pointer = InputType.hasPosition(type), bare = InputType.isBare(type)
         let record = InputRecord.encode(
             type: type, code: code, value: value, x: pointer ? lastX : 0, y: pointer ? lastY : 0,
-            buttons: type >= InputType.releaseAll ? 0 : buttons, modifiers: type >= InputType.releaseAll ? 0 : modifiers)
+            buttons: bare ? 0 : buttons, modifiers: bare ? 0 : modifiers)
         sendRecord(record)
     }
 
@@ -159,8 +160,7 @@ final class VideoView: NSView, NSTextInputClient {
         held.removeAll()
         buttons = 0
         modifiers = 0
-        wheelX.reset()
-        wheelY.reset()
+        scroll.reset()
         if hasMarkedText() { discardComposition() }
         send(InputType.releaseAll)
     }
@@ -216,11 +216,9 @@ final class VideoView: NSView, NSTextInputClient {
     override func scrollWheel(with event: NSEvent) {
         guard ready else { return }
         updatePosition(event)
-        let precise = event.hasPreciseScrollingDeltas
-        let vertical = wheelY.wireNotches(scrollingDelta: Double(event.scrollingDeltaY), precise: precise)
-        let horizontal = wheelX.wireNotches(scrollingDelta: Double(event.scrollingDeltaX), precise: precise)
-        for part in WheelAccumulator.chunks(vertical) { send(InputType.wheel, code: 0, value: UInt32(bitPattern: part)) }
-        for part in WheelAccumulator.chunks(horizontal) { send(InputType.wheel, code: 1, value: UInt32(bitPattern: part)) }
+        let records = scroll.records(deltaX: Double(event.scrollingDeltaX), deltaY: Double(event.scrollingDeltaY),
+                                     precise: event.hasPreciseScrollingDeltas, smooth: smoothWheel())
+        for record in records { send(record.type, code: record.axis, value: UInt32(bitPattern: record.value)) }
     }
 
     // MARK: Keyboard

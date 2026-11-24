@@ -9,6 +9,8 @@
 
 namespace relay {
 enum class InputStatus : uint8_t { ok = 0, invalid = 1, unsupported = 2 };
+/// Largest smooth-wheel (type 9) magnitude, in 1/16 pixel.
+constexpr int32_t max_smooth_wheel = 16384 * 16;
 struct InputEvent {
   uint8_t type = 0, reserved = 0;
   uint16_t code = 0;
@@ -26,10 +28,10 @@ class InputFence {
 };
 /// One queued backend action; the actions posted for a single protocol record form one queue unit.
 struct InputJob {
-  enum class Kind : uint8_t { key, text, button, motion, scroll, locks, flush, fence } kind = Kind::flush;
+  enum class Kind : uint8_t { key, text, button, motion, scroll, smooth_scroll, locks, flush, fence } kind = Kind::flush;
   uint32_t code = 0, codepoint = 0;
   unsigned number = 0;
-  int x = 0, y = 0, notches = 0;
+  int x = 0, y = 0, notches = 0, sixteenths = 0;
   bool press = false;
   size_t dropped = 0;
   std::shared_ptr<InputFence> fence;
@@ -37,6 +39,21 @@ struct InputJob {
   explicit InputJob(Kind value) : kind(value) {}
   /// Completes the fence after the work before it reached the platform, reporting the records dropped from before it.
   void complete() const { if (fence) fence->complete(dropped == 0, dropped); }
+};
+/// Turns scroll deltas into whole platform steps per axis, carrying the remainder into the next delta.
+class ScrollCarry {
+ public:
+  /// Adds delta, in units where `per_step` make one platform step, and returns the whole steps now due.
+  int take(unsigned axis, int64_t delta, int64_t per_step) {
+    int64_t& carry = carries[axis & 1];
+    carry += delta;
+    const int64_t steps = carry / per_step;
+    carry -= steps * per_step;
+    return int(steps);
+  }
+
+ private:
+  int64_t carries[2] = {};
 };
 /// Backend work queue that counts one protocol record as one unit however many actions it posts; not thread safe.
 class InputQueue {
@@ -74,6 +91,8 @@ class InputBackend {
   virtual void move(int x, int y) = 0;
   /// Scrolls notches on axis 0 (vertical) or 1 (horizontal); positive means down or right.
   virtual void scroll(unsigned axis, int notches) = 0;
+  /// Scrolls by 1/16 pixel on axis 0 or 1 with the same sign as scroll, carrying what the platform cannot express.
+  virtual void smoothScroll(unsigned axis, int sixteenths) = 0;
   /// Turns lock keys off, currently Caps Lock.
   virtual void resetLocks() = 0;
   /// Completes mark after every event posted so far, without waiting for it.

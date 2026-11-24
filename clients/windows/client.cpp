@@ -149,6 +149,7 @@ class Client {
     std::atomic<bool> stopping{false};
     std::atomic<bool> resumePending{false}; // Set while a reconnect waits for its first presented frame.
     std::atomic<SkylatchClient*> client{nullptr};
+    std::atomic<bool> smoothWheel{false}; // The host accepted smooth-wheel (type 9) records for this session.
     std::atomic<std::shared_ptr<Renderer>> activeRenderer{};
     std::shared_ptr<Hud> hud; // Null in smoke mode: no HUD, no Direct2D.
     std::thread worker;
@@ -182,7 +183,7 @@ class Client {
     wchar_t highSurrogate{};
     LONG lastMouseX{}, lastMouseY{};
     uint16_t buttons{}, modifiers{}, lastX{}, lastY{};
-    int wheelRemainder[2]{};
+    int wheelRemainder[2]{}, smoothRemainder[2]{};
     std::array<bool, 232> held{};
     static inline Client* hookOwner = nullptr;
 
@@ -200,18 +201,19 @@ class Client {
         PostMessageW(wnd, msgEnded, 0, 0);
     }
     void clearInputState() {
-        held.fill(false); buttons = modifiers = 0; wheelRemainder[0] = wheelRemainder[1] = 0;
+        held.fill(false); buttons = modifiers = 0;
+        wheelRemainder[0] = wheelRemainder[1] = smoothRemainder[0] = smoothRemainder[1] = 0;
         if (GetCapture() == wnd) ReleaseCapture();
     }
     void sendInput(uint8_t type, uint16_t code = 0, uint32_t value = 0) {
         const auto active = client.load();
         if (!active || stopping || config.smoke) return;
-        const bool pointer = type >= 3 && type <= 6;
+        const bool pointer = (type >= 3 && type <= 6) || type == 9, bare = type == 7 || type == 8;
         const auto b = inputRecord(type, code, value, pointer ? lastX : 0, pointer ? lastY : 0,
-            type >= 7 ? 0 : buttons, type >= 7 ? 0 : modifiers);
+            bare ? 0 : buttons, bare ? 0 : modifiers);
         const auto rc = skylatch_send_input(active, b.data());
         if (rc == SKYLATCH_OK || rc == SKYLATCH_ERR_NOT_READY || rc == SKYLATCH_ERR_CLOSED ||
-            (type == 3 && rc == SKYLATCH_ERR_QUEUE_FULL)) return;
+            (type == 3 && rc == SKYLATCH_ERR_QUEUE_FULL) || (type == 9 && rc == SKYLATCH_ERR_UNSUPPORTED)) return;
         report("could not queue remote input");
     }
     void releaseAll() { clearInputState(); sendInput(7); }
@@ -248,6 +250,9 @@ class Client {
             }
             PostMessageW(self.wnd, msgCursor, 0, 0);
         } catch (const std::exception& e) { self.report(e.what()); }
+    }
+    static void onInputResponse(void* ctx, uint32_t sequence, uint8_t status) noexcept {
+        if (!sequence) static_cast<Client*>(ctx)->smoothWheel = status == SKYLATCH_INPUT_ACCEPTED;
     }
     static void onDisconnected(void* ctx, const char* error) noexcept {
         static_cast<Client*>(ctx)->report(error ? error : "Remote session closed", error == nullptr);
@@ -392,7 +397,8 @@ class Client {
                 render = std::make_shared<Renderer>(wnd, hud);
                 activeRenderer.store(render);
             }
-            const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected};
+            smoothWheel = false;
+            const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected, onInputResponse};
             char err[1024]{};
             auto active = config.hub.empty()
                 ? skylatch_connect_direct(config.direct.c_str(), config.token.empty() ? nullptr : config.token.c_str(),
@@ -685,6 +691,16 @@ class Client {
         position(l, true);
         // Vertical is positive up in Win32 and down on the wire; horizontal is positive right in both.
         const int delta = GET_WHEEL_DELTA_WPARAM(w) * (axis ? 1 : -1);
+        if (delta % WHEEL_DELTA && smoothWheel) {
+            // Touchpads and high-resolution wheels report fractions of a notch; one notch is 48 pixels,
+            // so a wheel unit is 48 * 16 / 120 = 32 / 5 sixteenths of a pixel.
+            auto& rest = smoothRemainder[axis];
+            rest += delta * 32;
+            const int sixteenths = rest / 5;
+            rest -= sixteenths * 5;
+            if (sixteenths) sendInput(9, uint16_t(axis), uint32_t(sixteenths));
+            return;
+        }
         auto& rem = wheelRemainder[axis];
         if ((delta < 0 && rem > 0) || (delta > 0 && rem < 0)) rem = 0;
         rem += delta;

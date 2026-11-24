@@ -36,6 +36,11 @@ pub const SKYLATCH_ERR_CLOSED: c_int = -9;
 pub const SKYLATCH_ERR_QUEUE_FULL: c_int = -10;
 pub const SKYLATCH_ERR_NOT_READY: c_int = -11;
 pub const SKYLATCH_ERR_INVALID: c_int = -12;
+pub const SKYLATCH_ERR_UNSUPPORTED: c_int = -13;
+
+pub const SKYLATCH_INPUT_ACCEPTED: u8 = 0;
+pub const SKYLATCH_INPUT_INVALID: u8 = 1;
+pub const SKYLATCH_INPUT_UNSUPPORTED: u8 = 2;
 
 static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -108,6 +113,7 @@ pub struct SkylatchCallbacks {
     pub on_cursor: Option<unsafe extern "C" fn(*mut c_void, u16, u16, u16, u16, *const u8, usize)>,
     pub on_clipboard_notice: Option<unsafe extern "C" fn(*mut c_void)>,
     pub on_disconnected: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+    pub on_input_response: Option<unsafe extern "C" fn(*mut c_void, u32, u8)>,
 }
 
 /// Optional SL1 callbacks, registered independently of the original callback table.
@@ -250,6 +256,11 @@ impl ForeignCallbacks {
                 }
                 Event::MonitorList(monitors) => sl1.dispatch_monitor_list(&monitors),
                 Event::ClipboardData(text) => sl1.dispatch_clipboard(&text),
+                Event::InputResponse { sequence, status } => {
+                    if let Some(f) = self.table.on_input_response {
+                        f(user, sequence, status as u8);
+                    }
+                }
                 Event::Disconnected(result) => {
                     if let Some(f) = self.table.on_disconnected {
                         let error = result.err().map(|err| c_error(&err.to_string()));
@@ -496,6 +507,7 @@ fn send_code(result: Result<(), SendError>) -> i32 {
         Err(SendError::Closed) => SKYLATCH_ERR_CLOSED,
         Err(SendError::QueueFull) => SKYLATCH_ERR_QUEUE_FULL,
         Err(SendError::NotReady) => SKYLATCH_ERR_NOT_READY,
+        Err(SendError::Unsupported) => SKYLATCH_ERR_UNSUPPORTED,
         Err(SendError::InvalidSl1(Nsl1Error::PayloadTooLarge(_))) => SKYLATCH_ERR_TOO_LARGE,
         Err(SendError::InvalidAck | SendError::InvalidInput(_) | SendError::InvalidSl1(_)) => {
             SKYLATCH_ERR_INVALID

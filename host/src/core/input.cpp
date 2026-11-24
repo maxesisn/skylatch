@@ -10,10 +10,11 @@ static_assert(pixelCoordinate(0, 1280) == 0 && pixelCoordinate(65535, 1280) == 1
               pixelCoordinate(65535, 720) == 719 && pixelCoordinate(36459, 720) == 400);
 bool counted(InputJob::Kind kind) {
   return kind == InputJob::Kind::key || kind == InputJob::Kind::text || kind == InputJob::Kind::button ||
-         kind == InputJob::Kind::motion || kind == InputJob::Kind::scroll;
+         kind == InputJob::Kind::motion || kind == InputJob::Kind::scroll || kind == InputJob::Kind::smooth_scroll;
 }
 bool droppable(InputJob::Kind kind) {
-  return kind == InputJob::Kind::text || kind == InputJob::Kind::motion || kind == InputJob::Kind::scroll;
+  return kind == InputJob::Kind::text || kind == InputJob::Kind::motion || kind == InputJob::Kind::scroll ||
+         kind == InputJob::Kind::smooth_scroll;
 }
 }
 void InputQueue::post(InputJob job) {
@@ -77,7 +78,8 @@ InputStatus InputController::apply(const InputEvent& input) {
     if (!backend->typeText(uint32_t(value))) return InputStatus::unsupported;
     backend->flush(); return InputStatus::ok;
   }
-  if (event < 1 || event > 6 || (event != 6 && value)) return InputStatus::invalid;
+  const bool wheel = event == 6 || event == 9;
+  if (event < 1 || event > 9 || (!wheel && value)) return InputStatus::invalid;
   if (event <= 2) {
     if (code > 231) return InputStatus::invalid;
     const auto key = backend->nativeKey(uint16_t(code));
@@ -86,12 +88,14 @@ InputStatus InputController::apply(const InputEvent& input) {
     else if (keys.erase(*key)) backend->releaseKey(*key);
   } else {
     if ((event == 3 && code) || ((event == 4 || event == 5) && (code < 1 || code > 3)) ||
-        (event == 6 && (code > 1 || value < -1200 || value > 1200 || value % 120))) return InputStatus::invalid;
+        (wheel && code > 1) || (event == 6 && (value < -1200 || value > 1200 || value % 120)) ||
+        (event == 9 && (!value || value < -max_smooth_wheel || value > max_smooth_wheel))) return InputStatus::invalid;
     const auto size = backend->dimensions();
     backend->move(pixelCoordinate(input.x, size.first), pixelCoordinate(input.y, size.second));
     if (event == 4) { if (buttons.insert(code).second) backend->pressButton(code); }
     if (event == 5 && buttons.erase(code)) backend->releaseButton(code);
     if (event == 6) backend->scroll(code, int(value / 120));
+    if (event == 9) backend->smoothScroll(code, int(value));
   }
   backend->flush(); return InputStatus::ok;
 }

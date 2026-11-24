@@ -59,6 +59,8 @@ struct Server {
     std::optional<CursorImage> pending_cursor;
     bool last_write_cursor = false;
     bool clipboard_notices = false, clipboard_pending = false;
+    /// The viewer sent the smooth-wheel query (an empty zero-sequence ACK) and awaits its input response.
+    bool smooth_wheel_reply = false;
     /// SL1 messages waiting for the first frame to go out: the monitor list (Type 17) and desktop clipboard text (Type 19).
     std::optional<std::vector<MonitorInfo>> monitors_pending;
     std::optional<std::string> clipboard_data_pending;

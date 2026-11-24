@@ -15,7 +15,7 @@ pub use parser::{FrameParser, ParseError};
 pub use session::{ClientError, Event, Frame, SendError, SessionClient, TransportMode};
 pub use skylatch_proto::{
     control::DeviceInfo,
-    nsl1::{Header, Message, MonitorInfo},
+    nsl1::{Header, InputStatus, Message, MonitorInfo},
 };
 pub use transport::list_devices;
 

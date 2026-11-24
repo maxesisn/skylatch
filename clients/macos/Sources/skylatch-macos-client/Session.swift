@@ -56,6 +56,7 @@ final class Session: @unchecked Sendable {
 
     private let stateLock = NSLock()
     private var client: OpaquePointer?
+    private var smoothWheel = SmoothWheelSupport()
     private var stats = SessionStats()
     private var end: SessionEnd?
     private var thread: Thread?
@@ -129,6 +130,13 @@ final class Session: @unchecked Sendable {
         skylatch_destroy(active)
     }
 
+    /// True once the host accepted smooth-wheel records (type 9) for this connection.
+    var smoothWheelEnabled: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return smoothWheel.enabled
+    }
+
     // MARK: Sending from the main thread
 
     func sendInput(_ record: [UInt8]) {
@@ -138,6 +146,7 @@ final class Session: @unchecked Sendable {
         guard let active, !isStopping(), record.count == 16 else { return }
         let rc = record.withUnsafeBufferPointer { skylatch_send_input(active, $0.baseAddress) }
         if rc == SKYLATCH_OK || rc == SKYLATCH_ERR_NOT_READY || rc == SKYLATCH_ERR_CLOSED { return }
+        if rc == SKYLATCH_ERR_UNSUPPORTED && record[0] == InputType.smoothWheel { return }
         // A full queue only drops pointer motion; anything else means the connection is unusable.
         if rc == SKYLATCH_ERR_QUEUE_FULL && record[0] == InputType.pointerMove { return }
         report("could not queue remote input")
@@ -218,6 +227,12 @@ final class Session: @unchecked Sendable {
             DispatchQueue.main.async {
                 me.delegate?.sessionCursor(width: Int(width), height: Int(height), xhot: Int(xhot), yhot: Int(yhot), rgba: pixels)
             }
+        }
+        callbacks.on_input_response = { ctx, sequence, status in
+            let me = Session.session(ctx)
+            me.stateLock.lock()
+            me.smoothWheel.hostAnswered(sequence: sequence, status: status)
+            me.stateLock.unlock()
         }
         callbacks.on_disconnected = { ctx, error in
             let me = Session.session(ctx)

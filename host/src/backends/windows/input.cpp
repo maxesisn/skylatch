@@ -31,6 +31,8 @@ NativeKey scanCode(int keycode) {
     default: return 0;
   }
 }
+/// WHEEL_DELTA units per 1/16 pixel are 5/32, so one 120-unit notch scrolls 48 pixels.
+constexpr int64_t wheelUnitsPerSixteenth = 5, sixteenthsScale = 32;
 const std::set<NativeKey> modifierKeys = {0x1d, extended | 0x1d, 0x2a, 0x36, 0x38, extended | 0x38,
                                           extended | 0x5b, extended | 0x5c};
 INPUT keyInput(NativeKey key, bool press) {
@@ -59,6 +61,7 @@ class WindowsInput final : public InputBackend {
   mutable Clock::time_point geometryChecked{};
   mutable std::mutex geometryMutex;
   std::set<NativeKey> held;
+  ScrollCarry wheelUnits;
   mutable std::mutex mutex;
   std::condition_variable wake;
   InputQueue queue;
@@ -105,6 +108,11 @@ class WindowsInput final : public InputBackend {
   void scroll(unsigned axis, int notches) override {
     InputJob job{InputJob::Kind::scroll};
     job.number = axis; job.notches = notches;
+    post(job);
+  }
+  void smoothScroll(unsigned axis, int sixteenths) override {
+    InputJob job{InputJob::Kind::smooth_scroll};
+    job.number = axis; job.sixteenths = sixteenths;
     post(job);
   }
   void resetLocks() override { post(InputJob{InputJob::Kind::locks}); }
@@ -197,14 +205,10 @@ class WindowsInput final : public InputBackend {
       case InputJob::Kind::text: type(job.codepoint, inputs); break;
       case InputJob::Kind::button: inputs.push_back(button(job.number, job.press)); break;
       case InputJob::Kind::motion: inputs.push_back(motion(job.x, job.y)); break;
-      case InputJob::Kind::scroll: {
-        INPUT input{};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = job.number == 0 ? MOUSEEVENTF_WHEEL : MOUSEEVENTF_HWHEEL;
-        input.mi.mouseData = DWORD(job.number == 0 ? -job.notches * WHEEL_DELTA : job.notches * WHEEL_DELTA);
-        inputs.push_back(input);
+      case InputJob::Kind::scroll: wheel(job.number, job.notches * WHEEL_DELTA, inputs); break;
+      case InputJob::Kind::smooth_scroll:
+        wheel(job.number, wheelUnits.take(job.number, job.sixteenths * wheelUnitsPerSixteenth, sixteenthsScale), inputs);
         break;
-      }
       case InputJob::Kind::locks:
         if (GetKeyState(VK_CAPITAL) & 1) {
           inputs.push_back(keyInput(virtualKey | VK_CAPITAL, true));
@@ -271,6 +275,15 @@ class WindowsInput final : public InputBackend {
     inputs.push_back(keyInput(key, false));
     for (auto it = shifts.rbegin(); it != shifts.rend(); ++it) inputs.push_back(keyInput(*it, false));
     return true;
+  }
+  /// Windows wheels are positive up and right, so the vertical axis flips the protocol's down-positive sign.
+  static void wheel(unsigned axis, int units, std::vector<INPUT>& inputs) {
+    if (!units) return;
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = axis == 0 ? MOUSEEVENTF_WHEEL : MOUSEEVENTF_HWHEEL;
+    input.mi.mouseData = DWORD(axis == 0 ? -units : units);
+    inputs.push_back(input);
   }
   INPUT button(unsigned number, bool press) {
     INPUT input{};

@@ -33,7 +33,7 @@ messages and unknown versions or types.
 | 2 | ACK | viewer → host | empty, or `viewer_wait_us` u32 | sequence of the frame being acknowledged |
 | 3 | Input | viewer → host | one 16-byte input record | 0 on a stream, nonzero request id on a control channel |
 | 4 | Control ready | host → controller | width u16, height u16 | 0 |
-| 5 | Input response | host → controller | status u8: 0 accepted, 1 invalid, 2 unsupported | echoes request id |
+| 5 | Input response | host → controller, or viewer after a smooth-wheel query | status u8: 0 accepted, 1 invalid, 2 unsupported | echoes request id; 0 answers the query |
 | 6 | Cursor | host → viewer | width, height, hotspot x, hotspot y (u16 each), RGBA pixels | 0 |
 | 7 | Clipboard notice | host → viewer | empty | 0 |
 
@@ -46,6 +46,13 @@ in order.
 saturating at 4294967295; an empty payload means no wait. Only the oldest outstanding frame earns
 flow-control credit. Hosts allow at most 3 seconds of frames at the configured frame rate, and
 8 MiB, in flight.
+
+**Smooth-wheel query.** An ACK with sequence 0 and an empty payload names no frame. A viewer sends
+it once per stream, after the first message from the host, to ask whether the host accepts input
+type 9. A host that does replies on the stream with an input response with sequence 0 and status 0;
+status 2 means it does not. Older hosts ignore the query and close a stream that sends type 9,
+so until the reply arrives the viewer folds precise scrolling into type 6 notches. Viewers that never
+send the query never receive an input response on the stream.
 
 **Cursor.** At most 256 × 256 pixels, straight-alpha RGBA row by row, hotspot inside the image.
 Eight zero bytes restore the local arrow; a fully transparent image hides the cursor. No ACK.
@@ -62,7 +69,7 @@ SL1 peers use [`ClipboardData`](#sl1-extensions) for text synchronization. No AC
 | 0 | 1 | Type |
 | 1 | 1 | Reserved, zero |
 | 2 | 2 | Code: key, button or wheel axis |
-| 4 | 4 | Value: signed (i32) wheel delta or Unicode scalar |
+| 4 | 4 | Value: signed (i32) wheel delta, smooth-wheel delta or Unicode scalar |
 | 8 | 2 | X, 0..65535 across the desktop |
 | 10 | 2 | Y, 0..65535 across the desktop |
 | 12 | 2 | Button mask, low 5 bits |
@@ -76,6 +83,11 @@ SL1 peers use [`ClipboardData`](#sl1-extensions) for text synchronization. No AC
 | 6 | Wheel | Code 0 vertical or 1 horizontal; value a multiple of 120 in -1200..1200; X, Y |
 | 7 | Release all | Everything else zero |
 | 8 | Text | Value is one Unicode scalar, 1..0x10FFFF excluding 0xD800..0xDFFF. Code, X, Y and both masks zero |
+| 9 | Smooth wheel | Code 0 vertical or 1 horizontal; value in 1/16 pixel (`pixels * 16`), nonzero in -262144..262144; X, Y |
+
+Wheel and smooth-wheel values are positive for scrolling down or right. Hosts keep the fraction of a
+smooth-wheel delta that the platform cannot express and add it to the next one on the same axis.
+Send type 9 only to a host that accepted the [smooth-wheel query](#message-types).
 
 Masks do not press or release anything; send explicit down and up events. Held keys and buttons
 are released when the connection loses input.

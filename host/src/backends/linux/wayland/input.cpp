@@ -241,6 +241,13 @@ class WaylandInput final : public InputBackend {
     post(std::move(job));
   }
 
+  void smoothScroll(unsigned axis, int sixteenths) override {
+    InputJob job{InputJob::Kind::smooth_scroll};
+    job.number = axis;
+    job.sixteenths = sixteenths;
+    post(std::move(job));
+  }
+
   void resetLocks() override { post(InputJob{InputJob::Kind::locks}); }
 
   void fence(std::shared_ptr<InputFence> mark) override {
@@ -468,6 +475,13 @@ class WaylandInput final : public InputBackend {
         zwlr_virtual_pointer_v1_axis_discrete(
           pointer_.get(), timestamp(), job.number == 0 ? WL_POINTER_AXIS_VERTICAL_SCROLL : WL_POINTER_AXIS_HORIZONTAL_SCROLL,
           wl_fixed_from_int(job.notches * 15), job.notches);
+        zwlr_virtual_pointer_v1_frame(pointer_.get());
+        break;
+      case InputJob::Kind::smooth_scroll:
+        zwlr_virtual_pointer_v1_axis_source(pointer_.get(), WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+        zwlr_virtual_pointer_v1_axis(
+          pointer_.get(), timestamp(), job.number == 0 ? WL_POINTER_AXIS_VERTICAL_SCROLL : WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+          wl_fixed_from_double(job.sixteenths / 16.0));
         zwlr_virtual_pointer_v1_frame(pointer_.get());
         break;
       case InputJob::Kind::locks:

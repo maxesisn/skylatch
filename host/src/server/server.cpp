@@ -110,7 +110,7 @@ void Server::Stream::end() {
   last_write_cursor = false;
   buffered_stream_bytes = 0; stream_notsent_lowat = 0; flow_timer_due_us = 0;
   if (old) capture.endSession(old);
-  clipboard_notices = clipboard_pending = false;
+  clipboard_notices = clipboard_pending = smooth_wheel_reply = false;
   monitors_pending.reset(); clipboard_data_pending.reset();
   lastSequence = 0; width = height = 0; received.clear(); viewer = nullptr;
 }
@@ -224,10 +224,14 @@ bool Server::streamMessage(Stream& stream) {
   if (!envelope(b, gen, seq)) return false;
   if (b[5] == 2) {
     if (b.size() != 20 && b.size() != 24) return false;
+    if (!seq) {
+      if (b.size() == 20 && gen == stream.generation) { stream.smooth_wheel_reply = true; lws_callback_on_writable(stream.viewer); }
+      return true;
+    }
     const uint64_t wait = FlowControl::ackWaitUs(b.data()+20, b.size()-20);
     bool accepted = false;
     { std::lock_guard<std::mutex> lock(stream.mutex);
-      if (gen == stream.generation && seq) accepted = stream.flow.ack(seq, nowUs(), wait);
+      if (gen == stream.generation) accepted = stream.flow.ack(seq, nowUs(), wait);
     }
     if (accepted) { stream.capture.acknowledge(gen, seq); stream.updateFlow(config.proxy); }
     return true;
@@ -429,7 +433,8 @@ int Server::Stream::write(bool proxy) {
   updateFlow(proxy);
   std::optional<EncodedFrame> frame;
   std::optional<CursorImage> cursor;
-  const bool send_control = lastSequence && (monitors_pending || clipboard_pending || clipboard_data_pending);
+  const bool send_control =
+      lastSequence && (smooth_wheel_reply || monitors_pending || clipboard_pending || clipboard_data_pending);
   { std::lock_guard<std::mutex> lock(mutex);
     if (failed) return -1;
     if (!send_control) {
@@ -448,7 +453,10 @@ int Server::Stream::write(bool proxy) {
       lws_callback_on_writable(wsi);
       return 0;
     }
-    if (monitors_pending) {
+    if (smooth_wheel_reply) {
+      inputReply(wire, LWS_PRE, generation, 0, InputStatus::ok);
+      smooth_wheel_reply = false;
+    } else if (monitors_pending) {
       monitorListMessage(wire, LWS_PRE, generation, *monitors_pending);
       monitors_pending.reset();
     } else if (clipboard_pending) {
