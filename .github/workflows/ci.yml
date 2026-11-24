@@ -76,3 +76,19 @@ jobs:
       - name: Check console-only startup
         shell: cmd
         run: clients\windows\skylatch-client.exe --help
+
+  macos-client:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p skylatch-client-core
+      - name: Build the native client
+        run: clients/macos/build.sh --skip-rust
+      - name: Run the client unit tests
+        run: swift test --package-path clients/macos
+      - name: Check console-only startup
+        run: clients/macos/skylatch-client --help
