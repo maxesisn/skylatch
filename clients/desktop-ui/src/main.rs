@@ -1196,6 +1196,37 @@ impl Proto {
             .into_any_element()
     }
 
+    #[cfg(windows)]
+    fn toggle_maximize(window: &mut Window) {
+        // gpui 0.2.2's Windows `zoom()` always calls SW_MAXIMIZE without checking zoomed state.
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetActiveWindow() -> *mut core::ffi::c_void;
+            fn IsZoomed(hwnd: *mut core::ffi::c_void) -> i32;
+            fn ShowWindowAsync(hwnd: *mut core::ffi::c_void, cmd: i32) -> i32;
+        }
+        const SW_MAXIMIZE: i32 = 3;
+        const SW_RESTORE: i32 = 9;
+        unsafe {
+            let hwnd = GetActiveWindow();
+            if !hwnd.is_null() {
+                let cmd = if IsZoomed(hwnd) != 0 {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                ShowWindowAsync(hwnd, cmd);
+                return;
+            }
+        }
+        window.zoom_window();
+    }
+
+    #[cfg(not(windows))]
+    fn toggle_maximize(window: &mut Window) {
+        window.zoom_window();
+    }
+
     fn win_btn(
         &self,
         id: &'static str,
@@ -1227,7 +1258,7 @@ impl Proto {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, _| match area {
                 WindowControlArea::Min => window.minimize_window(),
-                WindowControlArea::Max => window.zoom_window(),
+                WindowControlArea::Max => Self::toggle_maximize(window),
                 WindowControlArea::Close => window.remove_window(),
                 _ => {}
             })
