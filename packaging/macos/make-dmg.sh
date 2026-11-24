@@ -85,24 +85,46 @@ sed -e "s/@VERSION@/${version%%-*}/g" -e "s/@BUILD_VERSION@/${version%%-*}/g" \
     -e "s/@MIN_VERSION@/$min_version/g" "$here/Info.plist.in" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 
-# An ad-hoc signature also repairs signatures invalidated by relocated dylibs.
+# Without CODESIGN_IDENTITY (or with "-") use an ad-hoc signature, which also
+# repairs signatures invalidated by relocated dylibs. With a Developer ID
+# identity, sign with Hardened Runtime and a secure timestamp.
 identity=${CODESIGN_IDENTITY:--}
+entitlements="$here/entitlements.plist"
 if [[ $identity == - ]]; then
-    sign_flags=(--timestamp=none)
+    for item in "$frameworks/"*.dylib "$macos/"*; do
+        [[ -f $item ]] || continue
+        codesign --force --sign - --timestamp=none "$item"
+    done
+    codesign --force --sign - --timestamp=none "$app"
+    codesign --verify --deep --strict "$app"
 else
-    sign_flags=(--timestamp --options runtime)
+    # Nested code first: dylibs, then helper executables, then the bundle.
+    for item in "$frameworks/"*.dylib; do
+        [[ -f $item ]] || continue
+        codesign --force --timestamp --options runtime --sign "$identity" "$item"
+    done
+    for item in "$macos/"*; do
+        [[ -f $item ]] || continue
+        codesign --force --timestamp --options runtime \
+            --entitlements "$entitlements" --sign "$identity" "$item"
+    done
+    codesign --force --timestamp --options runtime \
+        --entitlements "$entitlements" --sign "$identity" "$app"
+    codesign --verify --deep --strict --verbose=2 "$app"
 fi
-for item in "$frameworks/"*.dylib "$macos/"*; do
-    [[ -f $item ]] || continue
-    codesign --force --sign "$identity" "${sign_flags[@]}" "$item"
-done
-codesign --force --sign "$identity" "${sign_flags[@]}" "$app"
-codesign --verify --deep --strict "$app"
 ln -s /Applications "$work/image/Applications"
 name="Skylatch-$version-macos-$arch.dmg"
-hdiutil create -volname Skylatch -srcfolder "$work/image" -format UDZO "$work/$name"
+dmg_path="$work/$name"
+hdiutil create -volname Skylatch -srcfolder "$work/image" -format UDZO "$dmg_path"
 if [[ $identity != - ]]; then
-    codesign --sign "$identity" --timestamp "$work/$name"
+    codesign --force --timestamp --sign "$identity" "$dmg_path"
+    if [[ -n ${NOTARY_KEY_PATH:-} && -n ${NOTARY_KEY_ID:-} && -n ${NOTARY_ISSUER_ID:-} ]]; then
+        xcrun notarytool submit "$dmg_path" --key "$NOTARY_KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+        xcrun stapler staple "$dmg_path"
+        xcrun stapler validate "$dmg_path"
+        spctl --assess --type open --context context:primary-signature -vv "$dmg_path"
+    fi
 fi
-mv -f "$work/$name" "$output/$name"
+mv -f "$dmg_path" "$output/$name"
 printf 'Built %s\n' "$output/$name"
