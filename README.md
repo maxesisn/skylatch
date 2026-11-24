@@ -65,6 +65,12 @@ curl -H 'Authorization: Bearer change-me' http://127.0.0.1:8080/api/v1/devices
 
 The hub speaks plain HTTP/WS; put a TLS-terminating reverse proxy in front of it to serve WSS on 443.
 
+## Acknowledgments
+
+Skylatch builds directly on the ideas and design of [vercel-labs/screen-relay](https://github.com/vercel-labs/screen-relay)
+(Apache-2.0), including its `NSL1` binary streaming protocol and damage-aware H.264 capture/encoding
+architecture.
+
 ## License
 
 Apache-2.0 for `crates/`, `clients/` and `docs/`; GPL-3.0 for `host/` (links `libx264`).
