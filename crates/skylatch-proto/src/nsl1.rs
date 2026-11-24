@@ -44,6 +44,8 @@ pub const MAX_MONITOR_LIST: usize = 64 * 1024;
 pub const MAX_MONITOR_ID: usize = 256;
 /// Maximum UTF-8 byte length of clipboard text.
 pub const MAX_CLIPBOARD_DATA: usize = 1024 * 1024;
+/// Largest smooth-wheel magnitude in 1/16 pixel (16384 pixels).
+pub const MAX_SMOOTH_WHEEL: i32 = 16384 * 16;
 /// Header flag marking a keyframe (frame messages only).
 pub const FLAG_KEYFRAME: u16 = 1;
 /// WebSocket subprotocol name.
@@ -216,6 +218,23 @@ pub enum WheelAxis {
     Horizontal,
 }
 
+impl WheelAxis {
+    fn code(self) -> u16 {
+        match self {
+            Self::Vertical => 0,
+            Self::Horizontal => 1,
+        }
+    }
+
+    fn from_code(code: u16) -> Result<Self, Nsl1Error> {
+        match code {
+            0 => Ok(Self::Vertical),
+            1 => Ok(Self::Horizontal),
+            _ => Err(Nsl1Error::InvalidInput("invalid wheel axis")),
+        }
+    }
+}
+
 /// Input event kind. Coordinates are 0..=65535 across the desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
@@ -253,6 +272,13 @@ pub enum InputEvent {
     Text {
         scalar: char,
     },
+    /// Type 9. Delta is in 1/16 pixel, nonzero within +/-`MAX_SMOOTH_WHEEL`.
+    SmoothWheel {
+        axis: WheelAxis,
+        delta: i32,
+        x: u16,
+        y: u16,
+    },
 }
 
 /// A 16-byte input record: event plus button and modifier masks.
@@ -262,7 +288,7 @@ pub enum InputEvent {
 /// | 0 | 1 | type |
 /// | 1 | 1 | reserved (zero) |
 /// | 2 | 2 | code (key, button or wheel axis) |
-/// | 4 | 4 | value (signed wheel delta or Unicode scalar) |
+/// | 4 | 4 | value (signed wheel delta, smooth-wheel 1/16 pixels or Unicode scalar) |
 /// | 8, 10 | 2+2 | x, y |
 /// | 12 | 2 | button mask (low 5 bits) |
 /// | 14 | 2 | modifier mask (low 8 bits) |
@@ -311,14 +337,14 @@ impl InputRecord {
                         "wheel delta must be a multiple of 120 within +/-1200",
                     ));
                 }
-                let code = match axis {
-                    WheelAxis::Vertical => 0,
-                    WheelAxis::Horizontal => 1,
-                };
-                (6, code, delta, x, y)
+                (6, axis.code(), delta, x, y)
             }
             InputEvent::ReleaseAll => (7, 0, 0, 0, 0),
             InputEvent::Text { scalar } => (8, 0, scalar as i32, 0, 0),
+            InputEvent::SmoothWheel { axis, delta, x, y } => {
+                check_smooth(delta)?;
+                (9, axis.code(), delta, x, y)
+            }
         };
         if matches!(self.event, InputEvent::ReleaseAll | InputEvent::Text { .. })
             && (self.buttons != 0 || self.modifiers != 0)
@@ -392,11 +418,7 @@ impl InputRecord {
                 }
             }
             6 => {
-                let axis = match code {
-                    0 => WheelAxis::Vertical,
-                    1 => WheelAxis::Horizontal,
-                    _ => return Err(Nsl1Error::InvalidInput("invalid wheel axis")),
-                };
+                let axis = WheelAxis::from_code(code)?;
                 if !(-1200..=1200).contains(&value) || value % 120 != 0 {
                     return Err(Nsl1Error::InvalidInput(
                         "wheel delta must be a multiple of 120 within +/-1200",
@@ -422,6 +444,12 @@ impl InputRecord {
                     .ok_or(Nsl1Error::InvalidInput("invalid Unicode scalar"))?;
                 InputEvent::Text { scalar }
             }
+            9 => InputEvent::SmoothWheel {
+                axis: WheelAxis::from_code(code)?,
+                delta: check_smooth(value)?,
+                x,
+                y,
+            },
             _ => return Err(Nsl1Error::InvalidInput("unknown input type")),
         };
         if matches!(event, InputEvent::ReleaseAll | InputEvent::Text { .. })
@@ -436,6 +464,16 @@ impl InputRecord {
             buttons,
             modifiers,
         })
+    }
+}
+
+fn check_smooth(delta: i32) -> Result<i32, Nsl1Error> {
+    if delta != 0 && (-MAX_SMOOTH_WHEEL..=MAX_SMOOTH_WHEEL).contains(&delta) {
+        Ok(delta)
+    } else {
+        Err(Nsl1Error::InvalidInput(
+            "smooth wheel delta must be nonzero within +/-262144",
+        ))
     }
 }
 
@@ -471,6 +509,7 @@ pub enum Message {
         data: Bytes,
     },
     /// Type 2: viewer acknowledgement. `viewer_wait_us` is `None` for the empty payload.
+    /// Sequence 0 with an empty payload asks whether the host accepts smooth-wheel records.
     Ack {
         generation: u32,
         sequence: u32,
@@ -488,7 +527,7 @@ pub enum Message {
         width: u16,
         height: u16,
     },
-    /// Type 5: response to an input request.
+    /// Type 5: response to an input request, or with sequence 0 on a stream, to the smooth-wheel query.
     InputResponse {
         generation: u32,
         sequence: u32,
@@ -1072,6 +1111,30 @@ mod tests {
             InputEvent::Text { scalar: '漢' },
             InputEvent::Text { scalar: '🦀' },
             InputEvent::Text { scalar: char::MAX },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Vertical,
+                delta: MAX_SMOOTH_WHEEL,
+                x: 5,
+                y: 6,
+            },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Horizontal,
+                delta: -MAX_SMOOTH_WHEEL,
+                x: 7,
+                y: 8,
+            },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Vertical,
+                delta: 1,
+                x: 0,
+                y: 0,
+            },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Horizontal,
+                delta: -1,
+                x: 65535,
+                y: 65535,
+            },
         ];
         for event in events {
             let rec = InputRecord::new(event);
@@ -1097,6 +1160,17 @@ mod tests {
         assert_eq!(
             rec.encode().unwrap(),
             [6, 0, 0, 1, 0xff, 0xff, 0xff, 0x88, 0x12, 0x34, 0x56, 0x78, 0, 5, 0, 0x81]
+        );
+        let smooth = InputRecord::new(InputEvent::SmoothWheel {
+            axis: WheelAxis::Vertical,
+            delta: -40,
+            x: 0x1234,
+            y: 0x5678,
+        })
+        .with_masks(0x01, 0x02);
+        assert_eq!(
+            smooth.encode().unwrap(),
+            [9, 0, 0, 0, 0xff, 0xff, 0xff, 0xd8, 0x12, 0x34, 0x56, 0x78, 0, 1, 0, 2]
         );
         let text = InputRecord::new(InputEvent::Text { scalar: '🦀' });
         assert_eq!(
@@ -1131,6 +1205,24 @@ mod tests {
                 x: 0,
                 y: 0,
             },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Vertical,
+                delta: 0,
+                x: 0,
+                y: 0,
+            },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Vertical,
+                delta: MAX_SMOOTH_WHEEL + 1,
+                x: 0,
+                y: 0,
+            },
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Horizontal,
+                delta: -MAX_SMOOTH_WHEEL - 1,
+                x: 0,
+                y: 0,
+            },
         ];
         for event in bad {
             assert!(InputRecord::new(event).encode().is_err(), "{event:?}");
@@ -1151,6 +1243,67 @@ mod tests {
             .with_masks(0, 1)
             .encode()
             .is_err());
+        assert!(InputRecord::new(InputEvent::SmoothWheel {
+            axis: WheelAxis::Vertical,
+            delta: 16,
+            x: 0,
+            y: 0,
+        })
+        .with_masks(0x20, 0)
+        .encode()
+        .is_err());
+    }
+
+    #[test]
+    fn smooth_wheel_decode_rejects_malformed() {
+        let valid = InputRecord::new(InputEvent::SmoothWheel {
+            axis: WheelAxis::Vertical,
+            delta: 16,
+            x: 0,
+            y: 0,
+        })
+        .encode()
+        .unwrap();
+        let reject = |edit: &dyn Fn(&mut [u8; INPUT_SIZE])| {
+            let mut r = valid;
+            edit(&mut r);
+            assert!(InputRecord::decode(&r).is_err(), "{r:?}");
+        };
+        reject(&|r| r[4..8].copy_from_slice(&0i32.to_be_bytes()));
+        reject(&|r| r[4..8].copy_from_slice(&(MAX_SMOOTH_WHEEL + 1).to_be_bytes()));
+        reject(&|r| r[4..8].copy_from_slice(&(-MAX_SMOOTH_WHEEL - 1).to_be_bytes()));
+        reject(&|r| r[4..8].copy_from_slice(&i32::MIN.to_be_bytes()));
+        reject(&|r| r[1] = 1);
+        reject(&|r| r[2..4].copy_from_slice(&2u16.to_be_bytes()));
+        reject(&|r| r[13] = 0x20);
+        reject(&|r| r[14] = 1);
+        let mut r = valid;
+        r[4..8].copy_from_slice(&(-MAX_SMOOTH_WHEEL).to_be_bytes());
+        assert_eq!(
+            InputRecord::decode(&r).unwrap().event,
+            InputEvent::SmoothWheel {
+                axis: WheelAxis::Vertical,
+                delta: -MAX_SMOOTH_WHEEL,
+                x: 0,
+                y: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn smooth_wheel_query_is_an_empty_zero_sequence_ack() {
+        let wire = roundtrip(Message::Ack {
+            generation: 3,
+            sequence: 0,
+            viewer_wait_us: None,
+        });
+        assert_eq!(wire.len(), HEADER_SIZE);
+        let reply = roundtrip(Message::InputResponse {
+            generation: 3,
+            sequence: 0,
+            status: InputStatus::Accepted,
+        });
+        assert_eq!(&reply[12..], &[0, 0, 0, 0, 0, 0, 0, 1, 0]);
     }
 
     #[test]
