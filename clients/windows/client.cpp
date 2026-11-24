@@ -659,10 +659,23 @@ public:
         WNDCLASSEXW wc{sizeof wc}; wc.lpfnWndProc = wndProc; wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = L"SkylatchNativeView";
         require(RegisterClassExW(&wc) != 0, "RegisterClassExW failed");
+        int winX = CW_USEDEFAULT, winY = CW_USEDEFAULT, winW = 1100, winH = 730;
+        POINT cursor{};
+        MONITORINFO mi{sizeof mi};
+        if (GetCursorPos(&cursor) && GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            const int workW = mi.rcWork.right - mi.rcWork.left;
+            const int workH = mi.rcWork.bottom - mi.rcWork.top;
+            if (workW > 0 && workH > 0) {
+                winW = std::max(640, workW * 80 / 100);
+                winH = std::max(400, workH * 80 / 100);
+                winX = mi.rcWork.left + (workW - winW) / 2;
+                winY = mi.rcWork.top + (workH - winH) / 2;
+            }
+        }
         // Smoke uses a hidden, non-activating HWND with the same decode and Present calls as the viewer.
         require(CreateWindowExW(config.smoke ? WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW : 0, wc.lpszClassName,
-            L"Skylatch | Waiting for video", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-            1100, 730, nullptr, nullptr, wc.hInstance, this) != nullptr, "CreateWindowExW failed");
+            L"Skylatch | Waiting for video", WS_OVERLAPPEDWINDOW, winX, winY,
+            winW, winH, nullptr, nullptr, wc.hInstance, this) != nullptr, "CreateWindowExW failed");
         worker = std::thread(!config.hub.empty() && config.device.empty() ? &Client::enumerate : &Client::stream, this);
         MSG msg{}; BOOL next;
         while ((next = GetMessageW(&msg, nullptr, 0, 0)) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
