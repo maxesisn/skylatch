@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "input.hpp"
+#include "json.hpp"
 #include "skylatch_client_core.h"
-#include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.Data.Json.h>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -26,38 +25,32 @@ inline std::wstring displayText(std::wstring_view value) {
 
 inline std::vector<Device> discover(const std::string& hub, const std::string& token) {
     char err[1024]{};
-    std::unique_ptr<char, decltype(&skylatch_free_string)> json(
+    std::unique_ptr<char, decltype(&skylatch_free_string)> raw(
         skylatch_list_devices_json(hub.c_str(), token.c_str(), err, sizeof err), skylatch_free_string);
-    require(bool(json), err[0] ? err : "device discovery failed");
-    using winrt::Windows::Data::Json::JsonArray;
-    try {
-        winrt::init_apartment();
-        struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
-        const auto array = JsonArray::Parse(winrt::to_hstring(json.get()));
-        std::vector<Device> devices;
-        devices.reserve(array.Size());
-        for (const auto& value : array) {
-            const auto obj = value.GetObject();
-            auto id = winrt::to_string(obj.GetNamedString(L"device_id"));
-            require(!id.empty() && id.find('\0') == std::string::npos, "hub returned an invalid device ID");
-            Device d{std::move(id), displayText(obj.GetNamedString(L"name")), displayText(obj.GetNamedString(L"os")), L"",
-                static_cast<uint32_t>(obj.GetNamedNumber(L"monitors"))};
-            const auto endpoints = obj.GetNamedArray(L"direct_endpoints");
-            for (const auto& endpoint : endpoints) {
-                const auto e = endpoint.GetObject();
-                auto host = displayText(e.GetNamedString(L"host"));
+    require(bool(raw), err[0] ? err : "device discovery failed");
+    const auto parsed = json::parse(raw.get());
+    const auto& array = parsed.asArray();
+    std::vector<Device> devices;
+    devices.reserve(array.size());
+    for (const auto& value : array) {
+        auto id = value.req("device_id").asString();
+        require(!id.empty() && id.find('\0') == std::string::npos, "hub returned an invalid device ID");
+        Device d{std::move(id), displayText(fromUtf8(value.req("name").asString())),
+            displayText(fromUtf8(value.req("os").asString())), L"",
+            static_cast<uint32_t>(value.req("monitors").asNumber())};
+        if (const auto* eps = value.field("direct_endpoints")) {
+            for (const auto& endpoint : eps->asArray()) {
+                auto host = displayText(fromUtf8(endpoint.req("host").asString()));
                 if (host.find(L':') != host.npos && !host.starts_with(L'[')) host = L"[" + host + L"]";
                 if (!d.endpoints.empty()) d.endpoints += L", ";
-                d.endpoints += displayText(e.GetNamedString(L"kind")) + L":" + host + L":" +
-                    std::to_wstring(static_cast<uint16_t>(e.GetNamedNumber(L"port")));
+                d.endpoints += displayText(fromUtf8(endpoint.req("kind").asString())) + L":" + host + L":" +
+                    std::to_wstring(static_cast<uint16_t>(endpoint.req("port").asNumber()));
             }
-            if (d.endpoints.empty()) d.endpoints = L"-";
-            devices.push_back(std::move(d));
         }
-        return devices;
-    } catch (const winrt::hresult_error&) {
-        throw std::runtime_error("could not read the hub device list with Windows.Data.Json");
+        if (d.endpoints.empty()) d.endpoints = L"-";
+        devices.push_back(std::move(d));
     }
+    return devices;
 }
 
 inline void printDevices(const std::vector<Device>& devices) {
