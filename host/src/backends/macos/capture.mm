@@ -1,5 +1,6 @@
 #include "core/capture-source.hpp"
 #include "core/wait.hpp"
+#include "backends/macos/cursor.hpp"
 #include "backends/macos/display.hpp"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -35,6 +36,8 @@ namespace relay {
 namespace macos {
 namespace {
 constexpr size_t max_pending_rects = 256;
+/// How often the system pointer shape is checked while a source is subscribed.
+constexpr uint64_t cursor_poll_interval = 40 * NSEC_PER_MSEC;
 
 std::string errorMessage(NSError* error, const char* action) {
   if (error.code == SCStreamErrorUserDeclined)
@@ -75,6 +78,34 @@ class PixelLock {
 class MacCapture;
 }
 
+/// Reads the system pointer shape and keeps the latest one that differs from the previous.
+struct CursorTracker {
+  /// Reads the pointer now; true when it differs from the last one stored.
+  bool poll(double scale) {
+    std::lock_guard<std::mutex> lock(mutex);
+    CursorImage shape = readSystemCursor(scale);
+    const uint64_t print = cursorFingerprint(shape);
+    if (have && print == fingerprint) return false;
+    latest = std::move(shape);
+    fingerprint = print;
+    have = true;
+    ++serial;
+    return true;
+  }
+  /// The latest pointer when it is newer than seen (or whenever force is set), and updates seen.
+  std::optional<CursorImage> take(uint64_t& seen, bool force) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!have || (!force && serial == seen)) return std::nullopt;
+    seen = serial;
+    return latest;
+  }
+ private:
+  std::mutex mutex;
+  CursorImage latest;
+  uint64_t fingerprint = 0, serial = 0;
+  bool have = false;
+};
+
 /// Holds the latest screen image, capture failure, and subscribed sources.
 struct CaptureState {
   explicit CaptureState(Display selected) : display(selected) {
@@ -89,6 +120,7 @@ struct CaptureState {
   std::condition_variable arrived;
   std::vector<uint8_t> image;
   std::vector<MacCapture*> sources;
+  CursorTracker cursor;
   bool haveFrame = false;
   std::string failure;
   /// Set when ScreenCaptureKit stopped the stream, for example while the display reconfigures.
@@ -99,6 +131,10 @@ struct CaptureState {
   Display currentDisplay();
   void expect(const Display& target);
   void frame(CMSampleBufferRef sample);
+  /// Stream pixels per point on the streamed display, the scale pointer images are rendered at.
+  double cursorScale();
+  /// Checks the system pointer and wakes every source when its shape changed.
+  void pollCursor();
 };
 
 namespace {
@@ -124,6 +160,7 @@ class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
   void stop() {
     @autoreleasepool {
       if (timer) { dispatch_source_cancel(timer); timer = nil; }
+      if (cursorTimer) { dispatch_source_cancel(cursorTimer); cursorTimer = nil; }
       if (started) { started = false; output->retired = true; [stream stopCaptureWithCompletionHandler:nil]; }
     }
   }
@@ -140,6 +177,11 @@ class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
       dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
       dispatch_source_set_event_handler(timer, ^{ if (auto current = weak.lock()) current->tick(); });
       dispatch_resume(timer);
+      cursorTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+      dispatch_source_set_timer(cursorTimer, dispatch_time(DISPATCH_TIME_NOW, cursor_poll_interval),
+                                cursor_poll_interval, cursor_poll_interval / 4);
+      dispatch_source_set_event_handler(cursorTimer, ^{ if (auto current = weak.lock()) current->state->pollCursor(); });
+      dispatch_resume(cursorTimer);
     }
   }
   std::shared_ptr<CaptureState> state;
@@ -171,6 +213,7 @@ class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
       config.height = target.height;
       config.pixelFormat = kCVPixelFormatType_32BGRA;
       config.colorSpaceName = kCGColorSpaceSRGB;
+      // The pointer is streamed separately as its own shape (see cursor.hpp), so it must not be baked into frames.
       config.showsCursor = NO;
       config.queueDepth = 3;
       config.minimumFrameInterval = kCMTimeZero;
@@ -242,7 +285,7 @@ class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
   SCStream* stream = nil;
   RelayCaptureOutput* output = nil;
   dispatch_queue_t queue = nil;
-  dispatch_source_t timer = nil;
+  dispatch_source_t timer = nil, cursorTimer = nil;
   bool started = false;
   unsigned trouble = 0;
 };
@@ -315,6 +358,15 @@ class MacCapture final : public CaptureSource {
                     state->image.data() + (size_t(y) * width + rect.x) * 4, size_t(rect.width) * 4);
     return {front.data(), width * 4, width, height, PixelFormat::BGRA};
   }
+  bool cursorSupported() const override { return true; }
+  /// The pointer shape when it changed since the last call or force is set; the shape is read from the polled
+  /// state, or from the system right away when forced.
+  std::optional<CursorImage> cursor(bool force) override {
+    if (force) state->cursor.poll(state->cursorScale());
+    return state->cursor.take(seenCursor, force);
+  }
+  /// Interrupts the owner's wait so it collects a changed pointer shape.
+  void cursorChanged() { ready.signal(); }
   bool changedRects(std::vector<DamageRect>& rects) override {
     std::lock_guard<std::mutex> lock(mutex);
     if (lastFull) return false;
@@ -332,6 +384,7 @@ class MacCapture final : public CaptureSource {
   std::shared_ptr<SharedCapture> shared;
   std::shared_ptr<CaptureState> state;
   int width = 0, height = 0;
+  uint64_t seenCursor = 0;
   Wake ready;
   std::mutex mutex;
   std::vector<uint8_t> front;
@@ -373,6 +426,22 @@ void CaptureState::fail(const std::string& message) {
 Display CaptureState::currentDisplay() {
   std::lock_guard<std::mutex> lock(mutex);
   return display;
+}
+
+double CaptureState::cursorScale() {
+  const Display shown = currentDisplay();
+  const double points = shown.bounds.size.width;
+  return points > 0 ? double(shown.width) / points : 1.0;
+}
+
+void CaptureState::pollCursor() {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (sources.empty()) return;
+  }
+  if (!cursor.poll(cursorScale())) return;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto* source : sources) source->cursorChanged();
 }
 
 void CaptureState::expect(const Display& target) {

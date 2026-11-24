@@ -43,7 +43,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/*/*.hpp src/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server test-keymap test-macos-keys clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server test-keymap test-macos-keys test-macos-cursor clean FORCE
 all: skylatch-host-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -184,7 +184,14 @@ build/macos-keys-test: tests/macos-keys-test.cpp src/backends/macos/keys.hpp src
 test-macos-keys: build/macos-keys-test
 	./build/macos-keys-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
+build/macos-cursor-test: tests/macos-cursor-test.cpp src/backends/macos/cursor.hpp src/core/capture-source.hpp
+	mkdir -p build
+	$(CXX) -Isrc $(CXXFLAGS) tests/macos-cursor-test.cpp -o $@
+
+test-macos-cursor: build/macos-cursor-test
+	./build/macos-cursor-test
+
+test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys test-macos-cursor)
 
 clean:
 	rm -rf build skylatch-host-engine
