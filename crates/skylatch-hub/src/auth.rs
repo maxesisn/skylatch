@@ -8,6 +8,7 @@ use skylatch_proto::control::DeviceInfo;
 use skylatch_proto::credentials::{
     constant_time_eq, is_token, random_bytes, random_token, token_digest, write_private_file,
 };
+use skylatch_proto::layout::WorkspaceLayout;
 use skylatch_proto::onboarding::{
     EnrollResponse, LoginRequest, LoginResponse, PairingCodeResponse,
 };
@@ -43,6 +44,9 @@ impl From<io::Error> for AuthError {
 struct Credentials {
     users: BTreeMap<String, User>,
     devices: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-account workspace layouts. Absent in state files written by older hubs.
+    #[serde(default)]
+    layouts: HashMap<String, WorkspaceLayout>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -385,6 +389,28 @@ impl Auth {
         // Keep the credential lock until registration so revocation cannot miss this socket.
         let (id, cancel) = registry.register_host(&account, device, tx, true);
         Ok((account, id, cancel))
+    }
+
+    pub(crate) fn layout(&self, account: &str) -> WorkspaceLayout {
+        self.lock()
+            .credentials
+            .layouts
+            .get(account)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_layout(
+        &self,
+        account: &str,
+        layout: WorkspaceLayout,
+    ) -> Result<WorkspaceLayout, AuthError> {
+        let mut data = self.lock();
+        let mut updated = data.credentials.clone();
+        updated.layouts.insert(account.to_string(), layout.clone());
+        write(self.path.as_deref(), &updated)?;
+        data.credentials = updated;
+        Ok(layout)
     }
 
     pub(crate) fn revoke(

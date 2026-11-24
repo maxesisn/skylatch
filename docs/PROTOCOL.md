@@ -132,6 +132,8 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 | `DELETE /api/v1/devices/:id/token` | account Bearer token | Revoke the specified device token |
 | `POST /api/v1/direct-sessions` | account Bearer token | Get a short-lived direct-stream ticket for a connected host |
 | `GET /healthz` | none | Liveness: `{"status":"ok","version":"…"}` |
+| `GET /api/v1/layout` | account Bearer token | The account's saved `WorkspaceLayout` (empty default if none) |
+| `PUT /api/v1/layout` | account Bearer token | Replace the account's `WorkspaceLayout` |
 | `GET /api/v1/devices` | `Authorization: Bearer <token>` | `{"devices":[DeviceInfo…]}` for the token's account |
 | `GET /ws/host` | first message | Host registration socket |
 | `GET /ws/client` | first message | Client session socket |
@@ -179,6 +181,43 @@ ID, name, device token, and optional room and slot in the per-user `agent.json`:
 file is mode `0600`. Subsequent runs use that configuration and can find `skylatch-host-engine`
 next to the agent or on `PATH`. Explicit `--hub` and `--token` still support manual configuration;
 provide `--engine-bin` or `--engine-url` to select a different local engine.
+
+### Workspace layout
+
+`GET /api/v1/layout` and `PUT /api/v1/layout` store one arrangement of rooms, furniture and device
+placements per account, so every client shows the same workstation. Device tokens are rejected
+with `401`. `GET` returns `{"version":1,"rooms":[],"placements":[]}` until a layout is saved.
+`PUT` takes a `WorkspaceLayout` body (at most 256 KiB, larger bodies get `413`), validates it,
+persists it in the `--state-file` (atomically, when configured) and returns the saved layout.
+Validation failures return `400` with `{"error":"…"}`. Layouts are replaced whole; the last write
+wins. All fields except those marked required default when absent.
+
+```json
+{
+  "version": 1,
+  "rooms": [
+    {
+      "id": "office",
+      "name": "Office",
+      "furniture": [
+        {"id": "desk-1", "kind": "l_desk", "grid_x": 0, "grid_y": 0, "facing": "front_left"}
+      ]
+    }
+  ],
+  "placements": [
+    {"device_id": "bench-pc", "custom_name": "Bench", "room_id": "office",
+     "furniture_id": "desk-1", "slot": 0, "du": 0.25, "dv": -0.1}
+  ]
+}
+```
+
+- `kind` is `l_desk`, `straight_desk` or `vm_rack`; `facing` is `front_left` (default) or
+  `front_right`; `grid_x` and `grid_y` are integers.
+- `custom_name`, `du` and `dv` are optional and omitted when unset. `du` and `dv` are finite
+  offsets within `-2.0..=2.0`.
+- Limits: 32 rooms, 32 furniture items per room, 512 placements; room, furniture, room-reference
+  and device IDs are non-empty and at most 128 characters; room names and custom names at most 64
+  characters; room IDs are unique, furniture IDs are unique within their room.
 
 ### Shared types
 

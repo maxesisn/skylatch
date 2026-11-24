@@ -5,6 +5,7 @@
 
 pub mod control;
 pub mod credentials;
+pub mod layout;
 pub mod nsl1;
 pub mod onboarding;
 

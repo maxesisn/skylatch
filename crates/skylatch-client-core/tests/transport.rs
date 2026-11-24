@@ -948,3 +948,59 @@ async fn onboarding_helpers_sign_in_and_create_code() {
         matches!(enroll(&hub.url, &request).await, Err(ClientError::Hub { code, .. }) if code == "401")
     );
 }
+
+#[tokio::test]
+async fn layout_round_trips_through_the_hub() {
+    use skylatch_client_core::{
+        get_layout, put_layout, DevicePlacement, Facing, FurnitureItem, FurnitureKind, RoomLayout,
+        WorkspaceLayout,
+    };
+    let listener = loopback().await;
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let config = HubConfig::new(vec![(ACCOUNT.into(), HUB_TOKEN.into())]);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(AppState::new(config)))
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        get_layout(&url, HUB_TOKEN).await.unwrap(),
+        WorkspaceLayout::default()
+    );
+    let layout = WorkspaceLayout {
+        version: 1,
+        rooms: vec![RoomLayout {
+            id: "r1".into(),
+            name: "Lab".into(),
+            furniture: vec![FurnitureItem {
+                id: "f1".into(),
+                kind: FurnitureKind::VmRack,
+                grid_x: 3,
+                grid_y: -4,
+                facing: Facing::FrontRight,
+            }],
+        }],
+        placements: vec![DevicePlacement {
+            device_id: DEVICE.into(),
+            custom_name: Some("Rack PC".into()),
+            room_id: "r1".into(),
+            furniture_id: "f1".into(),
+            slot: 2,
+            du: Some(0.5),
+            dv: None,
+        }],
+    };
+    assert_eq!(put_layout(&url, HUB_TOKEN, &layout).await.unwrap(), layout);
+    assert_eq!(get_layout(&url, HUB_TOKEN).await.unwrap(), layout);
+    let mut bad = layout.clone();
+    bad.rooms.push(bad.rooms[0].clone());
+    assert!(matches!(
+        put_layout(&url, HUB_TOKEN, &bad).await,
+        Err(ClientError::Hub { code, .. }) if code == "400"
+    ));
+    assert!(matches!(
+        get_layout(&url, "wrong").await,
+        Err(ClientError::Hub { code, .. }) if code == "401"
+    ));
+    server.abort();
+}
