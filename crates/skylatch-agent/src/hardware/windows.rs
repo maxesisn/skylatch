@@ -116,6 +116,14 @@ pub(super) fn form_factor() -> DeviceFormFactor {
     })
 }
 
+pub(super) fn hardware_model() -> Option<String> {
+    super::compose_firmware_model(
+        &bios_value("SystemManufacturer"),
+        &bios_value("SystemProductName"),
+        &bios_value("SystemFamily"),
+    )
+}
+
 impl MonitorInfoExW {
     fn monitor_info(&self) -> Option<MonitorInfo> {
         let rect = &self.monitor;

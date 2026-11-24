@@ -26,6 +26,18 @@ pub(super) fn form_factor() -> DeviceFormFactor {
     })
 }
 
+pub(super) fn hardware_model() -> Option<String> {
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("/sys/class/dmi/id/{name}")).unwrap_or_default()
+    };
+    // Lenovo publishes the friendly name in product_version.
+    super::compose_firmware_model(
+        &read("sys_vendor"),
+        &read("product_name"),
+        &read("product_version"),
+    )
+}
+
 pub(super) fn monitors() -> Vec<MonitorInfo> {
     if !env_is_set("DISPLAY") {
         return Vec::new();

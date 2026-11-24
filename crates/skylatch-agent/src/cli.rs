@@ -59,6 +59,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "auto")]
     pub form_factor: FormFactorArg,
 
+    /// Override the detected hardware model, e.g. "Mac mini (Apple M4)".
+    #[arg(long, value_name = "NAME", env = "SKYLATCH_HARDWARE_MODEL")]
+    pub model: Option<String>,
+
     /// Physical room or workstation group.
     #[arg(long, value_name = "NAME")]
     pub room: Option<String>,

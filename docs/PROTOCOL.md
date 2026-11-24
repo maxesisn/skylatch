@@ -225,11 +225,12 @@ wins. All fields except those marked required default when absent.
 DeviceInfo      { "device_id": "…", "name": "…", "os": "windows|macos|linux",
                   "host_version": "…", "monitors": 2, "direct_endpoints": [DirectEndpoint],
                   "form_factor": "mini", "monitor_list": [MonitorInfo, MonitorInfo],
-                  "room": "Office", "slot": 3 }
+                  "room": "Office", "slot": 3,
+                  "hardware_model": "Mac mini (Apple M4)" }
 DirectEndpoint  { "kind": "lan|overlay", "host": "192.0.2.10", "port": 7001 }
 ```
 
-The four hardware and placement fields are optional on input; the hub returns them in both the
+The five hardware and placement fields are optional on input; the hub returns them in both the
 HTTP directory and WebSocket `devices` responses:
 
 | Field | Meaning | Default if absent |
@@ -238,6 +239,7 @@ HTTP directory and WebSocket `devices` responses:
 | `monitor_list` | Startup snapshot of the desktop layout, using the [MonitorInfo](#sl1-extensions) fields | `[]` |
 | `room` | Optional physical room or workstation group (`--room`) | `null` |
 | `slot` | Optional unsigned 32-bit desk or rack slot index (`--slot`) | `null` |
+| `hardware_model` | Optional human-readable model such as `Mac mini (Apple M4)` or `ThinkPad X1 Carbon Gen 12`; the agent detects it unless overridden by `--model`; omitted from JSON when unknown | `null` |
 
 In this snapshot, `active` indicates an enabled display, not the currently selected capture source.
 Coordinates and sizes use the platform's desktop coordinate space (which may be scaled on macOS).

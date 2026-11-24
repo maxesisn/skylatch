@@ -95,6 +95,7 @@ fn device(endpoints: Vec<DirectEndpoint>) -> DeviceInfo {
         monitor_list: vec![],
         room: None,
         slot: None,
+        hardware_model: None,
     }
 }
 

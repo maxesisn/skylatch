@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Skylatch">
   <title>Skylatch</title>
-  <!-- Paper tile -->
-  <rect x="3" y="3" width="58" height="58" rx="14" fill="#FCFBF8" stroke="#1A1A18" stroke-width="3"/>
-  <!-- Square housing (outer 14..50, inner 18..46) -->
-  <path fill="#1A1A18" fill-rule="evenodd" d="M14 14h36v36H14z M18 18v28h28V18z"/>
-  <!-- Cobalt bolt sliding into the right wall -->
-  <rect x="24" y="29" width="24" height="6" fill="#2563EB"/>
+  <!-- Carbon tile -->
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#1B1D22" stroke="#2E323B" stroke-width="2"/>
+  <!-- Warm-white housing, open on the right -->
+  <path fill="none" stroke="#F4F2EC" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" d="M44 22V18A4 4 0 0 0 40 14H18A4 4 0 0 0 14 18V46A4 4 0 0 0 18 50H40A4 4 0 0 0 44 46V42"/>
+  <!-- Cobalt bolt sliding through the opening -->
+  <rect x="25" y="27" width="25" height="10" rx="2.5" fill="#3B82F6"/>
   <!-- Vertical latch handle -->
-  <rect x="20" y="24" width="4" height="16" fill="#1A1A18"/>
+  <rect x="22" y="21" width="7.5" height="22" rx="2.5" fill="#F4F2EC"/>
 </svg>
