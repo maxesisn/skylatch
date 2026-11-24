@@ -830,7 +830,7 @@ impl Proto {
     fn apply_devices(&mut self, devs: Vec<DeviceInfo>) {
         if devs == self.devices
             && self.hub != HubState::Connecting
-            && !self.scenes.devices.is_empty() == !devs.is_empty()
+            && self.scenes.devices.is_empty() == devs.is_empty()
         {
             return;
         }
@@ -1221,9 +1221,16 @@ impl Proto {
             .flex()
             .items_center()
             .justify_center()
-            .window_control_area(area)
+            .cursor_pointer()
             .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
             .text_color(rgba(pal.ink, 1.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, _| match area {
+                WindowControlArea::Min => window.minimize_window(),
+                WindowControlArea::Max => window.zoom_window(),
+                WindowControlArea::Close => window.remove_window(),
+                _ => {}
+            })
             .child(
                 div()
                     .font_family("Segoe MDL2 Assets")
