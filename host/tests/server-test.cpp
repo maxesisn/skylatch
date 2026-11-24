@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <condition_variable>
 #include <mutex>
@@ -21,6 +22,14 @@
 #include <sys/stat.h>
 #endif
 
+/** Sets or, with an empty value, clears an environment variable. */
+static void setEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  if (*value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
 static bool engineConfig(const std::vector<std::string>& options, relay::Config& config, std::string* error = nullptr) {
   relay::Config parsed;
   std::vector<std::string> values = {"skylatch-host-engine", "--viewer-dir", "build/test-viewer"};
@@ -464,6 +473,16 @@ int main() {
          engine.capture == CaptureMode::gdi && engine.max_dimension == 6000);
   assert(!engineConfig({"--capture", "vnc"}, engine, &error) && error == "Capture must be auto, dxgi or gdi");
   assert(!engineConfig({"--capture"}, engine, &error) && error == "Missing value for --capture");
+  assert(engineConfig({}, engine) && engine.encoder == relay::EncoderPreference::automatic);
+  assert(engineConfig({"--encoder", "hw"}, engine) && engine.encoder == relay::EncoderPreference::hardware);
+  assert(engineConfig({"--encoder", "sw"}, engine) && engine.encoder == relay::EncoderPreference::software);
+  assert(!engineConfig({"--encoder", "x264"}, engine, &error) && error == "Encoder must be auto, hw or sw");
+  setEnvironment("SKYLATCH_ENCODER", "sw");
+  assert(engineConfig({}, engine) && engine.encoder == relay::EncoderPreference::software);
+  assert(engineConfig({"--encoder", "auto"}, engine) && engine.encoder == relay::EncoderPreference::automatic);
+  setEnvironment("SKYLATCH_ENCODER", "gpu");
+  assert(!engineConfig({}, engine, &error) && error == "SKYLATCH_ENCODER must be auto, hw or sw");
+  setEnvironment("SKYLATCH_ENCODER", "");
   assert(engineConfig({"--bitrate-min", "250000", "--bitrate-start", "250000", "--bitrate-max", "100000000"}, engine));
   assert(engine.bitrate_min == 250000 && engine.bitrate_start == 250000 && engine.bitrate_max == 100000000);
   assert(engineConfig({"--bitrate-start", "15000000", "--bitrate-max", "20000000"}, engine));

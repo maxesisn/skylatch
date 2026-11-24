@@ -14,11 +14,11 @@ BACKEND_DIR_x11 = linux/x11
 BACKEND_PKGS_wayland = wayland-client xkbcommon
 BACKEND_DIR_wayland = linux/wayland
 BACKEND_DIR_windows = windows
-BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32 -lws2_32
+BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32 -lws2_32 -lmfplat -lmfuuid -lole32
 BACKEND_FLAGS_windows = -DNOMINMAX -D_WIN32_WINNT=0x0A00
 BACKEND_DIR_macos = macos
 BACKEND_FLAGS_macos = -mmacosx-version-min=12.3 -Werror=unguarded-availability-new
-BACKEND_LIBS_macos = -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ApplicationServices -framework AppKit -framework Foundation
+BACKEND_LIBS_macos = -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ApplicationServices -framework AppKit -framework Foundation
 ifneq ($(filter-out $(AVAILABLE_BACKENDS),$(BACKENDS)),)
 $(error Unknown BACKENDS '$(filter-out $(AVAILABLE_BACKENDS),$(BACKENDS))'; available: $(AVAILABLE_BACKENDS))
 endif
@@ -29,12 +29,25 @@ BACKEND_PKGS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_PKGS_$(backend))))
 BACKEND_DIRS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_DIR_$(backend))))
 BACKEND_CPPFLAGS = $(foreach backend,$(sort $(BACKENDS)),-DRELAY_BACKEND_$(backend) $(BACKEND_FLAGS_$(backend)))
 CODEC_PKGS = x264
+# Linux hardware encoding (NVENC, VAAPI) goes through libavcodec when it is installed; macOS and Windows use the
+# system VideoToolbox and Media Foundation encoders and never link FFmpeg.
+ifneq ($(filter x11 wayland,$(BACKENDS)),)
+ifeq ($(shell uname -s),Linux)
+ifeq ($(shell pkg-config --exists libavcodec libavutil && echo yes),yes)
+VIDEO_ENCODER_CPPFLAGS = -DSKYLATCH_FFMPEG_ENCODER $(shell pkg-config --cflags libavcodec libavutil)
+VIDEO_ENCODER_LIBS = $(shell pkg-config --libs libavcodec libavutil)
+endif
+endif
+endif
 PKGS = $(sort $(BACKEND_PKGS) $(CODEC_PKGS) $(PLATFORM_PKGS) libwebsockets zlib)
-CPPFLAGS += -Isrc $(BACKEND_CPPFLAGS) $(shell pkg-config --cflags $(PKGS))
+CPPFLAGS += -Isrc $(BACKEND_CPPFLAGS) $(VIDEO_ENCODER_CPPFLAGS) $(shell pkg-config --cflags $(PKGS))
 CXXFLAGS ?= -O2
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -pthread
 BACKEND_LIBS = $(foreach backend,$(BACKENDS),$(BACKEND_LIBS_$(backend)))
-LDLIBS += $(shell pkg-config --libs $(PKGS)) $(BACKEND_LIBS) -pthread
+LDLIBS += $(shell pkg-config --libs $(PKGS)) $(VIDEO_ENCODER_LIBS) $(BACKEND_LIBS) -pthread
+# Unit tests that link the core sources need the encoder libraries the engine links.
+CORE_CPPFLAGS = -Isrc $(BACKEND_CPPFLAGS) $(VIDEO_ENCODER_CPPFLAGS)
+CORE_LIBS = $(VIDEO_ENCODER_LIBS) $(BACKEND_LIBS)
 
 CORE_SRCS = $(wildcard src/core/*.cpp)
 BACKEND_SRCS = $(foreach dir,$(BACKEND_DIRS),$(wildcard src/backends/$(dir)/*.cpp src/backends/$(dir)/*.mm))
@@ -43,7 +56,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/*/*.hpp src/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server test-keymap test-macos-keys test-macos-cursor clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server test-keymap test-macos-keys test-macos-cursor clean FORCE
 all: skylatch-host-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -142,16 +155,23 @@ build/input-test: tests/input-test.cpp src/core/input.cpp src/core/input.hpp
 test-input: build/input-test
 	./build/input-test
 
-build/backend-source-test: tests/backend-source-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp)
+build/backend-source-test: tests/backend-source-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp) build/backends
 	mkdir -p build
-	$(CXX) -Isrc $(CXXFLAGS) tests/backend-source-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale)
+	$(CXX) $(CORE_CPPFLAGS) $(CXXFLAGS) tests/backend-source-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale) $(CORE_LIBS)
 
 test-backend: build/backend-source-test
 	./build/backend-source-test
 
-build/capture-resize-test: tests/capture-resize-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp)
+build/capture-resize-test: tests/capture-resize-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp) build/backends
 	mkdir -p build
-	$(CXX) -Isrc $(CXXFLAGS) tests/capture-resize-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS))
+	$(CXX) $(CORE_CPPFLAGS) $(CXXFLAGS) tests/capture-resize-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS)) $(CORE_LIBS)
+
+build/encoder-test: tests/encoder-test.cpp $(CORE_SRCS) $(wildcard src/core/*.hpp) build/backends
+	mkdir -p build
+	$(CXX) $(CORE_CPPFLAGS) $(CXXFLAGS) tests/encoder-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil) $(CORE_LIBS)
+
+test-encoder: build/encoder-test
+	./build/encoder-test
 
 test-capture-resize: build/capture-resize-test
 	./build/capture-resize-test
@@ -191,7 +211,7 @@ build/macos-cursor-test: tests/macos-cursor-test.cpp src/backends/macos/cursor.h
 test-macos-cursor: build/macos-cursor-test
 	./build/macos-cursor-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys test-macos-cursor)
+test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys test-macos-cursor)
 
 clean:
 	rm -rf build skylatch-host-engine

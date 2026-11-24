@@ -2,6 +2,7 @@
 #include "backend.hpp"
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -284,6 +285,11 @@ bool unsignedNumber(const std::string& text, uint64_t& value) {
 bool parseConfig(int argc, char** argv, Config& config) {
   config.viewer = (executablePath().parent_path() / "viewer").string();
   if (config.backend.empty()) config.backend = defaultBackend().name;
+  if (const char* value = std::getenv("SKYLATCH_ENCODER"); value && *value) {
+    const auto preference = parseEncoderPreference(value);
+    if (!preference) throw std::runtime_error("SKYLATCH_ENCODER must be auto, hw or sw");
+    config.encoder = *preference;
+  }
   const auto bitrate = [](const std::string& text) {
     uint64_t value;
     if (!unsignedNumber(text, value) || value < 250000 || value > 100000000)
@@ -295,7 +301,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (option == "--help") {
       std::cout << "Usage: skylatch-host-engine [--bind ADDRESS] [--port PORT] [--viewer-dir DIR | --no-viewer]\n"
                    "  [--backend NAME] [--output NAME] [--check]\n"
-                   "  [--fps N] [--max-dimension N] [--capture auto|dxgi|gdi]\n"
+                   "  [--fps N] [--max-dimension N] [--capture auto|dxgi|gdi] [--encoder auto|hw|sw]\n"
                    "  [--bitrate-min BPS] [--bitrate-start BPS] [--bitrate-max BPS]\n"
                    "  [--token-file FILE [--public-origin https://HOST[:PORT]]\n"
                    "    [--allow-origin ORIGIN[,...]]]\n"
@@ -305,6 +311,9 @@ bool parseConfig(int argc, char** argv, Config& config) {
                    "and a value above 4096 raises the H.264 budget to Level 6.2 so a native 5K display fits.\n"
                    "--capture picks the Windows capture API: auto (DXGI, falling back to GDI when the session has\n"
                    "no DXGI output, such as a VM with only a basic display adapter), dxgi, or gdi.\n"
+                   "--encoder picks the H.264 encoder: auto (the platform hardware encoder, VideoToolbox, Media\n"
+                   "Foundation or NVENC/VAAPI, falling back to libx264 when it is missing or fails), hw (hardware\n"
+                   "only; fails without it) or sw (libx264). SKYLATCH_ENCODER sets the same choice.\n"
                    "Bitrates are 250000 to 100000000 bits per second with\n"
                    "min <= start <= max. Non-loopback --bind needs --token-file;\n"
                    "--public-origin also needs TLS or --behind-tls-proxy.\n"
@@ -347,6 +356,10 @@ bool parseConfig(int argc, char** argv, Config& config) {
       const auto mode = parseCaptureMode(value);
       if (!mode) throw std::runtime_error("Capture must be auto, dxgi or gdi");
       config.capture = *mode;
+    } else if (option == "--encoder") {
+      const auto preference = parseEncoderPreference(value);
+      if (!preference) throw std::runtime_error("Encoder must be auto, hw or sw");
+      config.encoder = *preference;
     } else if (option == "--bitrate-min") config.bitrate_min = bitrate(value);
     else if (option == "--bitrate-start") config.bitrate_start = bitrate(value);
     else if (option == "--bitrate-max") config.bitrate_max = bitrate(value);

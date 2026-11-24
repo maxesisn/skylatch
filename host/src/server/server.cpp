@@ -86,7 +86,7 @@ Server::Stream::Stream(Server& server) : capture([this, &server](EncodedFrame&& 
   pending.push_back(std::move(frame));
   lws_cancel_service(server.context);
   return true;
-}, CaptureSettings{server.config.fps, server.config.bitrate_min, server.config.bitrate_start, server.config.bitrate_max, server.config.max_dimension},
+}, CaptureSettings{server.config.fps, server.config.bitrate_min, server.config.bitrate_start, server.config.bitrate_max, server.config.max_dimension, server.config.encoder},
 backendFor(server.config.backend).capture, [this, &server](uint32_t gen, CursorImage&& cursor) {
   std::lock_guard<std::mutex> lock(mutex);
   if (!generation || gen != generation) return;
@@ -344,8 +344,11 @@ std::string Server::metrics() {
   return streams[0]->metrics();
 }
 std::string Server::Stream::metrics() {
+  const auto encoder = capture.stats();
   std::lock_guard<std::mutex> lock(mutex);
-  return ",\"inflight_frames\":" + std::to_string(flow.frames.size()) +
+  return ",\"encoder\":\"" + encoder.encoder_name + "\"" +
+      ",\"hardware_encoder\":" + (encoder.hardware_encoder ? "true" : "false") +
+      ",\"inflight_frames\":" + std::to_string(flow.frames.size()) +
       ",\"inflight_bytes\":" + std::to_string(flow.bytes) +
       ",\"window_frames\":" + std::to_string(flow.window) +
       ",\"target_bitrate_bps\":" + std::to_string(flow.target_bitrate) +

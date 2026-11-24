@@ -2,6 +2,7 @@
 
 #include "capture-source.hpp"
 #include "surface-budget.hpp"
+#include "video-encoder.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,6 +27,9 @@ struct CaptureStats {
   uint64_t capture_ns = 0;
   uint64_t convert_ns = 0;
   uint64_t encode_ns = 0;
+  /// VideoEncoder::name() of the encoder in use, empty before the first one opens.
+  std::string encoder_name;
+  bool hardware_encoder = false;
 };
 
 struct CaptureSettings {
@@ -33,6 +37,7 @@ struct CaptureSettings {
   uint64_t min_bitrate, start_bitrate, max_bitrate;
   /// Longest stream axis in pixels; a source that is larger is scaled down to fit.
   int max_dimension = SurfaceBudget::default_max_dimension;
+  EncoderPreference encoder = EncoderPreference::automatic;
 };
 
 class CaptureEncoder {

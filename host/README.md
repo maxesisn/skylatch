@@ -14,11 +14,11 @@ trimmed build without the upstream web viewer, CLI or SDK.
 
 ## Design
 
-| OS | Capture |
-| --- | --- |
-| macOS | ScreenCaptureKit |
-| Linux | X11, Wayland |
-| Windows | DXGI desktop duplication; GDI fallback for VMs with no DXGI output (`--capture`) |
+| OS | Capture | Hardware H.264 encoder |
+| --- | --- | --- |
+| macOS | ScreenCaptureKit | VideoToolbox (system framework) |
+| Linux | X11, Wayland | NVENC or VAAPI through `libavcodec`, when it is installed at build time |
+| Windows | DXGI desktop duplication; GDI fallback for VMs with no DXGI output (`--capture`) | Media Foundation hardware MFT (NVENC, Quick Sync, AMF) |
 
 - Speaks `NSL1` ([../docs/PROTOCOL.md](../docs/PROTOCOL.md)) on `/stream`, `/control` and `/input`.
 - Normally launched and supervised by `skylatch-agent` (see `crates/skylatch-agent`), which
@@ -26,6 +26,11 @@ trimmed build without the upstream web viewer, CLI or SDK.
 - Supports surfaces above 4096 px (`--max-dimension`, up to 8192; above 4096 the H.264 budget is
   Level 6.2, so a native 5K display streams unscaled) and follows display resolution changes
   without a restart: the encoder is rebuilt and the next frame is an IDR at the new size.
+- `--encoder auto` (the default; also `SKYLATCH_ENCODER`) encodes with the platform hardware encoder and falls back
+  to `libx264` when the hardware one is missing, fails to open, or fails to encode a frame; the switch is logged
+  once and sticks for the rest of the run. `--encoder hw` fails instead of falling back and `--encoder sw` always uses
+  `libx264`, which skips unchanged macroblocks. `/metrics` reports `encoder` and `hardware_encoder`. macOS and Windows
+  builds link only system encoder libraries, never FFmpeg.
 - On Windows, `--capture auto` (the default) uses DXGI desktop duplication and falls back to GDI
   `BitBlt` capture when DXGI has no output, as in a VM whose only display adapter is a basic one.
   The GDI path finds damage by comparing 64x64 pixel tiles with the previous frame. `--capture dxgi`
