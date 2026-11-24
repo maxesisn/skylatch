@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
+// Lock-Bolt application icon (multi-resolution PNG-in-ICO), resource id 101.
+// Compiled by build.rs with the current directory set to this folder.
+101 ICON "..\\..\\assets\\icon\\skylatch.ico"

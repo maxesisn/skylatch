@@ -151,6 +151,28 @@ fn worker(cmd_rx: Receiver<Cmd>, res_tx: Sender<(u64, PollResult)>) {
     }
 }
 
+/// Runs one hub request on a short-lived worker thread with its own tokio runtime, so the UI
+/// thread never waits on the network. The answer arrives on the returned channel; if the
+/// runtime cannot start, the channel is closed without an answer.
+pub fn run_async<T, F>(fut: F) -> Receiver<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("skylatch-hub-request".into())
+        .spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                let _ = tx.send(rt.block_on(fut));
+            }
+        });
+    rx
+}
+
 /// One-line, user-facing explanation of a discovery failure.
 pub fn describe_error(e: &ClientError) -> String {
     match e {
@@ -257,6 +279,13 @@ pub fn spawn_client(exe: &Path, args: &[String]) -> std::io::Result<()> {
     if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
         // the Windows client loads its core DLL from its own directory
         cmd.current_dir(dir);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // this launcher has no console of its own: never let the client flash one
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn()?;
     // reap the child when it exits so it never lingers as a zombie

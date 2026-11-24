@@ -3,9 +3,15 @@
 //! Skylatch desktop launcher — a 45° isometric monochrome desk (GPUI) that lists the devices
 //! of a Skylatch hub and starts the native stream client with one click.
 
+// A GUI program on Windows: no console window is created when it is started by a double
+// click. `--help`, `--version` and command-line errors attach to the parent console instead.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod config;
 mod iso;
 mod live;
+mod onboard;
+mod onboard_view;
 mod scene;
 mod theme;
 
@@ -15,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    Application, Bounds, ClickEvent, Context, ElementId, FocusHandle, FontWeight, Hsla,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels,
-    Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowControlArea,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId, FocusHandle, FontWeight,
+    Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
+    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowControlArea,
     WindowOptions, canvas, div, fill, point, px, size,
 };
 use skylatch_proto::control::DeviceInfo;
@@ -25,6 +31,7 @@ use skylatch_proto::control::DeviceInfo;
 use config::{Config, Effective};
 use iso::*;
 use live::{HubTarget, LiveHandle};
+use onboard::{Code, HubSubmit, Onboarding, Pairing, Tab};
 use scene::*;
 use theme::{Pal, Rgb};
 
@@ -41,13 +48,15 @@ OPTIONS
     -V, --version      Print version and exit
         --hub <URL>    Hub base URL (ws://, wss://, http:// or https://)
         --token <TOK>  Hub account token
-        --demo         Show the built-in demo fleet even when a hub is configured
+        --demo         Show the built-in demo fleet (never shown otherwise)
         --dark         Start in Dark Mode (default: Light)
         --shelf        Start in Shelf view (default: Isometric desk)
 
 With a hub URL and token the window lists the online devices (refreshed every 10 s). The
 same settings can be typed into the in-window Hub drawer (click the Hub pill, or press H).
-Without them the built-in demo fleet is shown.
+Without them the first-run screen offers to sign in to a hub (password or account token) or
+to connect to one host directly, and shows an empty L-shaped desk until a device appears.
+While signed in, `+ Add device` shows a one-time pairing code for `skylatch-agent join`.
 
 KEYS
     Left / Right / Tab   cycle screens (Shift+Tab reverses)
@@ -505,9 +514,14 @@ fn paint_mark(window: &mut Window, b: Bounds<Pixels>, pal: &Pal) {
 /// Where the device list comes from and how the last attempt went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HubState {
+    /// `--demo`: the built-in fleet.
     Demo,
+    /// No hub configured: the first-run onboarding is shown.
+    Unconfigured,
     Connecting,
-    Online { count: usize },
+    Online {
+        count: usize,
+    },
     Failed(String),
 }
 
@@ -533,6 +547,8 @@ const DRAWER_W: f32 = 448.0;
 const DRAWER_H: f32 = 330.0;
 const MAX_URL_LEN: usize = 256;
 const MAX_TOKEN_LEN: usize = 512;
+/// How long the copy button shows "已复制".
+const COPIED_FLASH: Duration = Duration::from_millis(1800);
 
 fn drawer_rect() -> Rect2 {
     Rect2 {
@@ -579,6 +595,8 @@ struct Proto {
     pump_enabled: bool,
     pump_running: bool,
     drawer: Drawer,
+    onb: Onboarding,
+    pair: Pairing,
 }
 
 impl Proto {
@@ -589,11 +607,13 @@ impl Proto {
         config_path: Option<PathBuf>,
     ) -> Self {
         let live_mode = eff.live();
-        // live mode starts empty until the hub answers; demo mode shows the built-in fleet
-        let scenes = if live_mode {
-            build_scene(&[])
-        } else {
+        let eff_demo = eff.demo;
+        // the built-in fleet only ever appears with `--demo`; every other start begins with an
+        // empty desk until the hub answers (or the onboarding connects one)
+        let scenes = if eff_demo {
             Scenes::new()
+        } else {
+            build_scene(&[])
         };
         let mut p = Proto {
             scenes: Arc::new(scenes),
@@ -631,12 +651,16 @@ impl Proto {
             config_path,
             hub: if live_mode {
                 HubState::Connecting
-            } else {
+            } else if eff_demo {
                 HubState::Demo
+            } else {
+                HubState::Unconfigured
             },
             live: None,
             pump_enabled: false,
             pump_running: false,
+            onb: Onboarding::new(),
+            pair: Pairing::new(),
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -650,6 +674,7 @@ impl Proto {
     /// tests drive `pump_live` by hand).
     fn start(&mut self, cx: &mut Context<Self>) {
         self.pump_enabled = true;
+        self.ensure_pump(cx);
         if self.eff.live() {
             self.live_connect(cx);
         }
@@ -706,6 +731,12 @@ impl Proto {
         if let Some(b) = &self.banner {
             if b.at.elapsed().as_secs_f32() > 4.2 {
                 self.banner = None;
+            }
+            busy = true;
+        }
+        if let Some(t) = self.pair.copied_at {
+            if t.elapsed() > COPIED_FLASH {
+                self.pair.copied_at = None;
             }
             busy = true;
         }
@@ -852,6 +883,13 @@ impl Proto {
             .get_or_insert_with(LiveHandle::spawn)
             .configure(Some(target));
         self.hub = HubState::Connecting;
+        self.ensure_pump(cx);
+    }
+
+    /// Starts the 250 ms loop that applies finished background work (device lists, sign-in,
+    /// pairing codes) to the view. Headless tests call [`Proto::pump_live`] and
+    /// [`Proto::pump_tasks`] by hand instead.
+    fn ensure_pump(&mut self, cx: &mut Context<Self>) {
         if self.pump_enabled && !self.pump_running {
             self.pump_running = true;
             cx.spawn(async move |this, cx| {
@@ -859,7 +897,13 @@ impl Proto {
                     cx.background_executor()
                         .timer(Duration::from_millis(250))
                         .await;
-                    if this.update(cx, |this, cx| this.pump_live(cx)).is_err() {
+                    if this
+                        .update(cx, |this, cx| {
+                            this.pump_live(cx);
+                            this.pump_tasks(cx);
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -889,7 +933,20 @@ impl Proto {
                 Err(msg) => self.hub = HubState::Failed(msg),
             }
         }
+        self.maybe_first_code();
         cx.notify();
+    }
+
+    /// An empty hub gets its first pairing code without a click.
+    fn maybe_first_code(&mut self) {
+        if matches!(self.hub, HubState::Online { count: 0 })
+            && self.pair.code.is_none()
+            && !self.pair.busy
+            && self.pair.error.is_none()
+            && !self.pair.open
+        {
+            self.request_code();
+        }
     }
 
     fn refresh(&mut self) {
@@ -901,11 +958,13 @@ impl Proto {
                 self.hub = HubState::Connecting;
             }
             self.say("正在刷新设备列表…", false);
-        } else {
+        } else if self.eff.demo {
             self.say(
                 "演示模式 · 数据为内置示例，点击 Hub 状态可连接真实 Hub",
                 false,
             );
+        } else {
+            self.say("尚未连接 Hub · 请先登录或直接连接主机", false);
         }
         self.kick();
     }
@@ -913,6 +972,7 @@ impl Proto {
     // ───────────── Hub settings drawer ─────────────
 
     fn open_drawer(&mut self) {
+        self.pair.open = false;
         self.drawer.open = true;
         self.drawer.field = Field::Url;
         self.drawer.error = None;
@@ -933,6 +993,10 @@ impl Proto {
     }
 
     fn toggle_drawer(&mut self) {
+        if self.eff.unconfigured() {
+            // the onboarding card is the settings screen until a hub is configured
+            return;
+        }
         if self.drawer.open {
             self.drawer.open = false;
             self.kick();
@@ -1007,24 +1071,32 @@ impl Proto {
             self.drawer.field = Field::Token;
             return;
         }
-        self.stored.hub_url = url.clone();
-        self.stored.token = token.clone();
         self.stored.prefer_direct = self.drawer.prefer_direct;
-        self.save_config();
-        self.eff.hub_url = url;
-        self.eff.token = token;
         self.eff.prefer_direct = self.drawer.prefer_direct;
-        self.eff.demo = false;
         self.drawer.open = false;
         self.drawer.error = None;
-        // the demo fleet must not linger: its devices do not exist on the hub
-        self.devices.clear();
-        self.install_scenes(build_scene(&[]));
-        self.live_connect(cx);
+        self.adopt_hub(url, token, cx);
         self.say("正在连接 Hub…", false);
     }
 
-    fn switch_to_demo(&mut self) {
+    /// Makes `url` + `token` the configured hub: persisted (the token only, never a password),
+    /// the scene reset and polling started.
+    fn adopt_hub(&mut self, url: String, token: String, cx: &mut Context<Self>) {
+        self.stored.hub_url = url.clone();
+        self.stored.token = token.clone();
+        self.save_config();
+        self.eff.hub_url = url;
+        self.eff.token = token;
+        self.eff.demo = false;
+        self.pair.reset();
+        // whatever was on the desk before (demo fleet, previous hub) does not exist here
+        self.devices.clear();
+        self.install_scenes(build_scene(&[]));
+        self.live_connect(cx);
+    }
+
+    /// Forgets the hub (and `--demo`): back to the first-run onboarding.
+    fn sign_out(&mut self) {
         self.stored.hub_url.clear();
         self.stored.token.clear();
         self.save_config();
@@ -1034,13 +1106,255 @@ impl Proto {
         if let Some(h) = self.live.as_mut() {
             h.configure(None);
         }
-        self.hub = HubState::Demo;
+        self.hub = HubState::Unconfigured;
         self.devices.clear();
         self.drawer.open = false;
         self.drawer.url.clear();
         self.drawer.token.clear();
-        self.install_scenes(Scenes::new());
-        self.say("已切换到演示模式 · 已清除保存的 Hub 地址与 Token", false);
+        self.pair.reset();
+        self.onb = Onboarding::new();
+        self.install_scenes(build_scene(&[]));
+        self.say("已退出 · 已清除保存的 Hub 地址与 Token", false);
+    }
+
+    // ───────────── first-run onboarding ─────────────
+
+    /// The empty-desk card is up: no hub is configured and `--demo` was not given.
+    fn onboarding_active(&self) -> bool {
+        self.eff.unconfigured()
+    }
+
+    fn onb_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        let m = &ks.modifiers;
+        match ks.key.as_str() {
+            "tab" => self.onb.move_focus(if m.shift { -1 } else { 1 }),
+            "enter" => self.onb_submit(cx),
+            "backspace" => self.onb.backspace(),
+            "escape" => {}
+            "v" if m.secondary() => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    self.onb.type_text(text.trim());
+                }
+            }
+            key => {
+                if m.control || m.alt || m.platform {
+                    return;
+                }
+                let typed = ks
+                    .key_char
+                    .clone()
+                    .or_else(|| (key.chars().count() == 1).then(|| key.to_string()));
+                if let Some(t) = typed {
+                    self.onb.type_text(&t);
+                }
+            }
+        }
+        self.kick();
+    }
+
+    fn onb_submit(&mut self, cx: &mut Context<Self>) {
+        if self.onb.busy {
+            return;
+        }
+        match self.onb.tab {
+            Tab::Direct => self.direct_connect(),
+            Tab::Hub => match self.onb.hub_submit() {
+                Err(e) => self.onb.error = Some(e),
+                Ok(HubSubmit::Token { url, token }) => {
+                    self.onb = Onboarding::new();
+                    self.adopt_hub(url, token, cx);
+                    self.say("正在连接 Hub…", false);
+                }
+                Ok(HubSubmit::Login {
+                    url,
+                    username,
+                    password,
+                }) => {
+                    // the password leaves the form now; only the returned session token is kept
+                    self.onb.wipe_password();
+                    self.onb.busy = true;
+                    self.onb.error = None;
+                    let hub = url.clone();
+                    let rx = live::run_async(async move {
+                        skylatch_client_core::login(&hub, &username, &password)
+                            .await
+                            .map(|r| r.token)
+                            .map_err(|e| onboard::describe_login_error(&e))
+                    });
+                    self.onb.login = Some((url, rx));
+                }
+            },
+        }
+        self.kick();
+    }
+
+    /// Direct connect: starts the native client against one host, no hub involved.
+    fn direct_connect(&mut self) {
+        let (url, token) = match self.onb.direct_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.onb.error = Some(e);
+                return;
+            }
+        };
+        let args = onboard::direct_args(&url, token.as_deref());
+        let result = live::locate_client_here(self.eff.client_bin.as_deref()).and_then(|exe| {
+            live::spawn_client(&exe, &args).map_err(|e| format!("无法启动 {}：{e}", exe.display()))
+        });
+        match result {
+            Ok(()) => {
+                self.onb.error = None;
+                self.say(format!("已启动 skylatch-client · 直连 {url}"), false);
+            }
+            Err(e) => self.onb.error = Some(e),
+        }
+    }
+
+    // ───────────── pairing codes ─────────────
+
+    /// Mints a fresh one-time code on a background thread.
+    fn request_code(&mut self) {
+        if !self.eff.live() {
+            return;
+        }
+        let t = self.live_target();
+        self.pair.generation += 1;
+        self.pair.busy = true;
+        self.pair.error = None;
+        self.pair.code = None;
+        self.pair.copied_at = None;
+        let rx = live::run_async(async move {
+            skylatch_client_core::create_pairing_code(&t.url, &t.token)
+                .await
+                .map(|r| (r.code, r.expires_in_secs))
+                .map_err(|e| onboard::describe_pairing_error(&e))
+        });
+        self.pair.pending = Some((self.pair.generation, rx));
+    }
+
+    fn open_pair_modal(&mut self) {
+        if !self.eff.live() {
+            return;
+        }
+        self.drawer.open = false;
+        self.hover = None;
+        if !self.pair.open {
+            self.pair.open = true;
+            self.request_code();
+        }
+        self.kick();
+    }
+
+    fn close_pair_modal(&mut self) {
+        self.pair.open = false;
+        self.kick();
+    }
+
+    /// Copies the `skylatch-agent join` command for the current code.
+    fn copy_join_command(&mut self, cx: &mut Context<Self>) {
+        let Some(code) = self.pair.code.as_ref().filter(|c| !c.expired()) else {
+            return;
+        };
+        let cmd = onboard::join_command(&config::normalize_hub_url(&self.eff.hub_url), &code.code);
+        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+        self.pair.copied_at = Some(Instant::now());
+        self.kick();
+    }
+
+    fn pair_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        match ks.key.as_str() {
+            "escape" => self.close_pair_modal(),
+            "enter" => self.copy_join_command(cx),
+            "r" => self.request_code(),
+            _ => {}
+        }
+        self.kick();
+    }
+
+    /// Applies finished sign-in and pairing requests and keeps the code badge fresh.
+    fn pump_tasks(&mut self, cx: &mut Context<Self>) {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+
+        let login = self.onb.login.as_ref().map(|(_, rx)| rx.try_recv());
+        match login {
+            Some(Ok(outcome)) => {
+                let (url, _) = self.onb.login.take().expect("login in flight");
+                match outcome {
+                    Ok(token) => {
+                        self.onb = Onboarding::new();
+                        self.adopt_hub(url, token, cx);
+                        self.say("已登录 · 正在加载设备…", false);
+                    }
+                    Err(msg) => {
+                        self.onb.busy = false;
+                        self.onb.error = Some(msg);
+                    }
+                }
+                changed = true;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.onb.login = None;
+                self.onb.busy = false;
+                self.onb.error = Some("登录请求未能完成，请重试".into());
+                changed = true;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        let pending = self
+            .pair
+            .pending
+            .as_ref()
+            .map(|(generation, rx)| (*generation, rx.try_recv()));
+        match pending {
+            Some((generation, Ok(outcome))) => {
+                self.pair.pending = None;
+                if generation == self.pair.generation {
+                    self.pair.busy = false;
+                    match outcome {
+                        Ok((code, secs)) => {
+                            self.pair.code = Some(Code::new(code, secs));
+                            self.pair.error = None;
+                        }
+                        Err(msg) => self.pair.error = Some(msg),
+                    }
+                    self.pair.shown = (u64::MAX, false);
+                    changed = true;
+                }
+            }
+            Some((generation, Err(TryRecvError::Disconnected))) => {
+                self.pair.pending = None;
+                if generation == self.pair.generation {
+                    self.pair.busy = false;
+                    self.pair.error = Some("请求未能完成，请重试".into());
+                    changed = true;
+                }
+            }
+            Some((_, Err(TryRecvError::Empty))) | None => {}
+        }
+
+        // the countdown only repaints when the visible minute (or the expiry) changes
+        if (self.pair.open || self.pair_card_visible())
+            && let Some(code) = &self.pair.code
+        {
+            let now = (code.minutes_left(), code.expired());
+            if now != self.pair.shown {
+                self.pair.shown = now;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Hub reachable and empty: the "add the first device" card is up.
+    fn pair_card_visible(&self) -> bool {
+        self.eff.live()
+            && matches!(self.hub, HubState::Online { count: 0 })
+            && self.scenes.devices.is_empty()
+            && !self.pair.open
     }
 
     // ───────────── one-click take-over ─────────────
@@ -1095,6 +1409,9 @@ impl Proto {
     }
 
     fn hit(&self, pos: Point<Pixels>) -> Option<usize> {
+        if self.pair.open {
+            return None;
+        }
         let (sw, sh) = self.stage;
         let (x, y) = (f(pos.x), f(pos.y) - HEADER_H);
         if x < 0.0 || y < 0.0 || x > sw || y > sh {
@@ -1121,8 +1438,18 @@ impl Proto {
 
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        if self.pair.open {
+            self.pair_key(ks, cx);
+            cx.notify();
+            return;
+        }
         if self.drawer.open {
             self.drawer_key(ks, cx);
+            cx.notify();
+            return;
+        }
+        if self.onboarding_active() {
+            self.onb_key(ks, cx);
             cx.notify();
             return;
         }
@@ -1276,6 +1603,7 @@ impl Proto {
         let host = config::hub_host(&self.eff.hub_url);
         match &self.hub {
             HubState::Demo => (rgba(pal.muted, 0.8), true, "Hub · 本地演示".to_string()),
+            HubState::Unconfigured => (rgba(pal.muted, 0.8), true, "Hub · 未连接".to_string()),
             HubState::Connecting => (rgba(pal.blue, 1.0), true, format!("Hub · {host} · 连接中…")),
             HubState::Online { count } => (
                 rgba(pal.green, 1.0),
@@ -1371,6 +1699,7 @@ impl Proto {
         let status = match (&self.drawer.error, &self.hub) {
             (Some(e), _) => (e.clone(), rgba(pal.warn, 1.0)),
             (None, HubState::Demo) => ("当前为演示模式，填写后即可连接真实 Hub".to_string(), muted),
+            (None, HubState::Unconfigured) => (String::new(), muted),
             (None, HubState::Connecting) => ("正在连接…".to_string(), rgba(pal.blue, 1.0)),
             (None, HubState::Online { count }) => {
                 (format!("已连接 · {count} 台设备在线"), rgba(pal.green, 1.0))
@@ -1526,7 +1855,7 @@ impl Proto {
                     )
                     .child(
                         div()
-                            .id("drawer-demo")
+                            .id("drawer-signout")
                             .h(px(34.0))
                             .px(px(14.0))
                             .flex()
@@ -1536,9 +1865,9 @@ impl Proto {
                             .border_color(hair)
                             .cursor_pointer()
                             .hover(move |s| s.bg(rgba(pal.wash, 1.0)))
-                            .child(txt("切换到演示", 13.0, ink))
+                            .child(txt("退出登录", 13.0, ink))
                             .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.switch_to_demo();
+                                this.sign_out();
                                 cx.notify();
                             })),
                     ),
@@ -1608,6 +1937,7 @@ impl Render for Proto {
             .border_color(hair)
             .child(
                 div()
+                    .debug_selector(|| "header-brand".to_string())
                     .h_full()
                     .flex()
                     .items_center()
@@ -1682,13 +2012,14 @@ impl Render for Proto {
                         )
                     }),
             )
+            .children(live_mode.then(|| self.add_device_button(&pal, cx)))
             .child(
                 div()
                     .w(px(22.0))
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
-            .child(
+            .children((!scenes.devices.is_empty()).then(|| {
                 div()
                     .flex()
                     .items_center()
@@ -1707,10 +2038,11 @@ impl Render for Proto {
                             cx,
                             move |t| t.set_desk(i),
                         )
-                    })),
-            )
+                    }))
+            }))
             .child(
                 div()
+                    .debug_selector(|| "header-drag".to_string())
                     .flex_1()
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
@@ -1816,6 +2148,11 @@ impl Render for Proto {
                     if ys.len() > 1 { "S" } else { "" }
                 ),
             )
+        } else if scenes.devices.is_empty() {
+            (
+                "空桌 · Empty desk".to_string(),
+                "EMPTY L-DESK · 0 SCREENS".to_string(),
+            )
         } else {
             (clip(&desk.name, 18), desk.sub.clone())
         };
@@ -1897,7 +2234,7 @@ impl Render for Proto {
                 )
                 .child(txt(label, 11.0, muted))
         };
-        overlays.push(
+        overlays.extend((!self.onboarding_active()).then(|| {
             div()
                 .absolute()
                 .left(px(26.0))
@@ -1912,37 +2249,40 @@ impl Render for Proto {
                 .child(key("R", "刷新"))
                 .child(key("H", "Hub"))
                 .child(key("Enter", "接管"))
-                .into_any_element(),
-        );
+                .into_any_element()
+        }));
 
-        // nothing to draw yet: say why
+        // nothing to draw yet: say why. An unconfigured app shows the onboarding card and an
+        // empty hub the first-device card instead.
         if scenes.devices.is_empty() {
-            let (head, sub, col) = match &self.hub {
+            let note = match &self.hub {
                 HubState::Connecting => {
-                    ("正在连接 Hub…".to_string(), "等待设备列表".to_string(), ink)
+                    Some(("正在连接 Hub…".to_string(), "等待设备列表".to_string(), ink))
                 }
-                HubState::Failed(m) => ("无法获取设备列表".to_string(), clip(m, 80), warn),
-                HubState::Online { .. } => (
-                    "Hub 上暂无在线设备".to_string(),
-                    "主机上线后会自动出现（每 10 秒刷新，按 R 立即刷新）".to_string(),
-                    ink,
-                ),
-                HubState::Demo => ("暂无设备".to_string(), String::new(), ink),
+                HubState::Failed(m) => Some(("无法获取设备列表".to_string(), clip(m, 80), warn)),
+                HubState::Online { .. } | HubState::Demo | HubState::Unconfigured => None,
             };
-            overlays.push(
-                div()
-                    .absolute()
-                    .top(px(sh * 0.58))
-                    .left_0()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(txt(head, 14.0, col).font_weight(FontWeight::MEDIUM))
-                    .child(txt(sub, 11.5, muted))
-                    .into_any_element(),
-            );
+            if let Some((head, sub, col)) = note {
+                overlays.push(
+                    div()
+                        .absolute()
+                        .top(px(sh * 0.58))
+                        .left_0()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(txt(head, 14.0, col).font_weight(FontWeight::MEDIUM))
+                        .child(txt(sub, 11.5, muted))
+                        .into_any_element(),
+                );
+            }
+        }
+        if self.onboarding_active() {
+            overlays.push(self.onboarding_card(&pal, cx));
+        } else if self.pair_card_visible() {
+            overlays.push(self.first_device_card(&pal, cx));
         }
 
         // always-visible labels: muted ink + status dot; hovered / selected devices switch to
@@ -2107,8 +2447,17 @@ impl Render for Proto {
             sel: self.sel,
         };
 
+        // Window dragging: nothing above the header's `Drag` areas may react to a mouse-down.
+        // gpui's Windows backend treats a mouse-down that was handled (a listener stopped it) or
+        // default-prevented as consumed and then never lets the system start the native
+        // title-bar drag (move, Aero Snap, double-click to maximise). That includes the
+        // focus-on-click of an element with `track_focus`, which calls `prevent_default`. So
+        // neither `root` nor `header` has mouse listeners or tracks focus: the stage owns the
+        // focus handle and every pointer interaction with the desk. Key events still reach
+        // `root`'s handler because they bubble up from the focused stage.
         let stage = div()
             .id("stage")
+            .track_focus(&self.focus)
             .relative()
             .flex_1()
             .w_full()
@@ -2120,6 +2469,35 @@ impl Render for Proto {
                     cx.notify();
                 }
             }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                let h = this.hit(ev.position);
+                if h != this.hover {
+                    this.hover = h;
+                    this.kick();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    if this.drawer.open {
+                        // clicks inside the drawer belong to it; a click on the stage dismisses it
+                        if !this.in_drawer(ev.position) {
+                            this.drawer.open = false;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    if let Some(dv) = this.hit(ev.position) {
+                        this.select(dv);
+                        if ev.click_count >= 2 {
+                            this.connect();
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 canvas(|_, _, _| (), move |b, _, w, _| paint_stage(w, b, &paint))
                     .absolute()
@@ -2170,7 +2548,13 @@ impl Render for Proto {
                     .child(txt(d.capture.clone(), 12.0, muted))
             }
             (None, None) => div().child(txt(
-                "按 H 打开 Hub 设置，或使用 --demo 查看演示",
+                match &self.hub {
+                    HubState::Unconfigured => "连接 Hub 或直连一台主机后，设备会出现在这张桌子上",
+                    HubState::Online { count: 0 } => {
+                        "Hub 上暂无在线设备 · 点击顶栏「+ 添加设备」获取配对码"
+                    }
+                    _ => "按 H 打开 Hub 设置",
+                },
                 12.0,
                 muted,
             )),
@@ -2348,66 +2732,85 @@ impl Render for Proto {
             .flex_col()
             .bg(canvas_c)
             .text_color(ink)
-            .track_focus(&self.focus)
             .when(self.hover.is_some(), |d| d.cursor_pointer())
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| this.on_key(ev, cx)))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                let h = this.hit(ev.position);
-                if h != this.hover {
-                    this.hover = h;
-                    this.kick();
-                    cx.notify();
-                }
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus);
-                    if this.drawer.open {
-                        // clicks inside the drawer belong to it; a click on the stage dismisses it
-                        if !this.in_drawer(ev.position) && f(ev.position.y) > HEADER_H {
-                            this.drawer.open = false;
-                            cx.notify();
-                        }
-                        return;
-                    }
-                    if let Some(dv) = this.hit(ev.position) {
-                        this.select(dv);
-                        if ev.click_count >= 2 {
-                            this.connect();
-                        }
-                        cx.notify();
-                    }
-                }),
-            )
             .child(header)
             .child(stage)
             .child(footer)
             .children(self.drawer.open.then(|| self.drawer_view(&pal, cx)))
+            .children(self.pair.open.then(|| self.pair_modal(&pal, cx)))
     }
 }
 
 // ───────────────────────────── entry ─────────────────────────────
 
+/// Console output for a program built with the Windows GUI subsystem.
+///
+/// Such a program starts without a console. For `--help`, `--version` and command-line
+/// errors it attaches to the console of the parent (if there is one) and points the standard
+/// handles at it. Handles that were redirected to a file or a pipe stay untouched, so
+/// `skylatch-ui --help > help.txt` and `| more` keep working: attaching a console replaces
+/// the process's standard handles, hence the redirected ones are saved first and put back.
 #[cfg(windows)]
-unsafe extern "system" {
-    fn FreeConsole() -> i32;
+fn attach_parent_console() {
+    use std::os::windows::io::IntoRawHandle;
+
+    type Handle = *mut core::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetStdHandle(which: u32) -> Handle;
+        fn SetStdHandle(which: u32, handle: Handle) -> i32;
+        fn GetFileType(handle: Handle) -> u32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+
+    // SAFETY: plain Win32 calls with valid arguments. Standard handles are only replaced by
+    // the saved originals or, when the process had none, by a console handle that is
+    // intentionally leaked for the lifetime of the process.
+    unsafe {
+        let usable = |h: Handle| {
+            !h.is_null() && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN
+        };
+        let saved = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| (which, GetStdHandle(which)));
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        for (which, original) in saved {
+            if usable(original) {
+                SetStdHandle(which, original);
+            } else if !usable(GetStdHandle(which))
+                && let Ok(console) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
+            {
+                SetStdHandle(which, console.into_raw_handle());
+            }
+        }
+    }
 }
+#[cfg(not(windows))]
+fn attach_parent_console() {}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match config::parse_args(&args) {
         Ok(cli) => cli,
         Err(e) => {
+            attach_parent_console();
             eprintln!("skylatch-ui: {e}");
             std::process::exit(2);
         }
     };
     if cli.help {
+        attach_parent_console();
         print!("{HELP}");
         return;
     }
     if cli.version {
+        attach_parent_console();
         println!("skylatch-ui {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -2415,18 +2818,13 @@ fn main() {
     let stored = match config_path.as_deref().map(config::load) {
         Some(Ok(cfg)) => cfg,
         Some(Err(e)) => {
+            // best effort: with no console attached this goes nowhere, which is fine for a GUI
             eprintln!("skylatch-ui: ignoring unreadable config: {e}");
             Config::default()
         }
         None => Config::default(),
     };
     let eff = config::resolve(&stored, &cli, &config::process_env);
-
-    // GUI path only: drop the console that a double-click would otherwise leave behind.
-    #[cfg(windows)]
-    unsafe {
-        FreeConsole();
-    }
 
     Application::new().run(move |cx| {
         let bounds = Bounds::centered(None, size(px(1360.0), px(860.0)), cx);
@@ -2955,7 +3353,7 @@ mod ui_tests {
     }
 
     #[gpui::test]
-    fn hub_drawer_edits_saves_and_switches_to_demo(cx: &mut TestAppContext) {
+    fn hub_drawer_edits_saves_and_signs_out(cx: &mut TestAppContext) {
         let dir = std::env::temp_dir().join(format!("skylatch-ui-drawer-{}", std::process::id()));
         let path = dir.join("config.json");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3063,9 +3461,9 @@ mod ui_tests {
         let saved = config::load(&path).unwrap();
         assert!(saved.dark_mode && saved.hub_url == "ws://127.0.0.1:9");
 
-        // back to the demo: stored hub + token are cleared, demo fleet is back
+        // signing out: stored hub + token are cleared and the first-run screen is back
         cx.simulate_keystrokes("h");
-        view.update(cx, |v, _| v.switch_to_demo());
+        view.update(cx, |v, _| v.sign_out());
         draw(cx);
         let saved = config::load(&path).unwrap();
         assert!(saved.hub_url.is_empty() && saved.token.is_empty() && saved.dark_mode);
@@ -3073,9 +3471,11 @@ mod ui_tests {
             view.read_with(cx, |v, _| (
                 v.hub.clone(),
                 v.eff.live(),
+                v.onboarding_active(),
                 v.scenes.devices.len()
             )),
-            (HubState::Demo, false, 9)
+            (HubState::Unconfigured, false, true, 0),
+            "no demo fleet after signing out"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3140,5 +3540,523 @@ mod ui_tests {
                 .is_some_and(|b| b.error && b.text.contains("不存在"))
         }));
         draw(cx);
+    }
+
+    // ───────────── first-run onboarding, pairing and the title bar ─────────────
+
+    /// A minimal hub on a loopback port that answers the two HTTP onboarding routes. Pairing
+    /// codes count up, so a regenerated code differs from the previous one.
+    struct FakeHub {
+        port: u16,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeHub {
+        fn ws_url(&self) -> String {
+            format!("ws://127.0.0.1:{}", self.port)
+        }
+
+        fn http_url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn fake_hub() -> FakeHub {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requests.clone();
+        std::thread::spawn(move || {
+            let codes = ["482-917", "135-790", "264-081", "903-412"];
+            let mut issued = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                let mut need: Option<usize> = None;
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if need.is_none()
+                        && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        need = Some(pos + 4 + len);
+                    }
+                    if need.is_some_and(|n| buf.len() >= n) {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let first = text.lines().next().unwrap_or("").to_string();
+                let auth = text
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or("authorization: none")
+                    .to_string();
+                log.lock().unwrap().push(format!("{first} | {auth}"));
+                let (status, body) = if first.starts_with("POST /api/v1/login") {
+                    if text.contains("\"password\":\"wrong\"") {
+                        ("401 Unauthorized", String::new())
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"account":"alice","token":"session-token-1"}"#.to_string(),
+                        )
+                    }
+                } else if first.starts_with("POST /api/v1/pairing-codes") {
+                    if auth.ends_with("Bearer session-token-1")
+                        || auth.ends_with("Bearer account-token")
+                    {
+                        let code = codes[issued % codes.len()];
+                        issued += 1;
+                        (
+                            "200 OK",
+                            format!(r#"{{"code":"{code}","expires_in_secs":600}}"#),
+                        )
+                    } else {
+                        ("401 Unauthorized", String::new())
+                    }
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        FakeHub { port, requests }
+    }
+
+    fn click_sel(cx: &mut VisualTestContext, selector: &'static str) {
+        draw(cx);
+        let b = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("no element `{selector}` on screen"));
+        cx.simulate_click(b.center(), Modifiers::none());
+    }
+
+    fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
+        cx.update(|_, app| app.read_from_clipboard().and_then(|c| c.text()))
+    }
+
+    fn has_sel(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+        draw(cx);
+        cx.debug_bounds(selector).is_some()
+    }
+
+    fn pump_until(
+        view: &gpui::Entity<Proto>,
+        cx: &mut VisualTestContext,
+        what: &str,
+        done: impl Fn(&Proto) -> bool,
+    ) {
+        for _ in 0..400 {
+            view.update(cx, |v, cx| v.pump_tasks(cx));
+            if view.read_with(cx, |v, _| done(v)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn onboarding_view(
+        cx: &mut TestAppContext,
+        path: Option<PathBuf>,
+    ) -> (gpui::Entity<Proto>, &mut VisualTestContext) {
+        cx.add_window_view(move |window, cx| {
+            let cfg = Config::default();
+            let p = Proto::new(cx, cfg.clone(), Effective::from_config(&cfg), path);
+            window.focus(&p.focus);
+            p
+        })
+    }
+
+    #[gpui::test]
+    fn first_launch_without_a_hub_shows_the_empty_desk_onboarding(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        let (hub, n, active, live, screens) = view.read_with(cx, |v, _| {
+            (
+                v.hub.clone(),
+                v.scenes.devices.len(),
+                v.onboarding_active(),
+                v.eff.live(),
+                v.scene().screens.len(),
+            )
+        });
+        assert_eq!(
+            (hub, n, active, live, screens),
+            (HubState::Unconfigured, 0, true, false, 0),
+            "no demo fleet on a normal first launch"
+        );
+        assert!(
+            view.read_with(cx, |v, _| !v.scene().backdrop.is_empty()),
+            "the empty L-desk is drawn"
+        );
+        assert!(has_sel(cx, "onboarding-card"));
+        assert!(
+            !has_sel(cx, "add-device"),
+            "no hub: no add-device button yet"
+        );
+
+        // typing fills the form; shortcut letters are just letters here
+        cx.simulate_input("hub.example.test");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("alice");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("pw");
+        let (url, user, pass, dark, shelf) = view.read_with(cx, |v, _| {
+            (
+                v.onb.hub_url.clone(),
+                v.onb.username.clone(),
+                v.onb.password.clone(),
+                v.dark,
+                v.shelf,
+            )
+        });
+        assert_eq!(
+            (url.as_str(), user.as_str(), pass.as_str(), dark, shelf),
+            ("hub.example.test", "alice", "pw", false, false)
+        );
+        draw(cx);
+
+        // an incomplete form says what is missing instead of doing anything
+        view.update(cx, |v, _| v.onb.password.clear());
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.onb.error.as_deref().is_some_and(|e| e.contains("密码")) && !v.onb.busy
+        }));
+
+        // the Account Token option replaces the password field
+        view.update(cx, |v, _| v.onb.set_token_mode(true));
+        draw(cx);
+        cx.simulate_input("abc");
+        assert_eq!(view.read_with(cx, |v, _| v.onb.token.clone()), "abc");
+
+        // Direct Connect needs a ws:// or wss:// URL ...
+        view.update(cx, |v, _| v.onb.set_tab(Tab::Direct));
+        draw(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.onb.error.as_deref().is_some_and(|e| e.contains("ws://"))
+        }));
+        cx.simulate_input("ws://127.0.0.1:9");
+        // ... and finds the native client; without one the card says so
+        view.update(cx, |v, _| {
+            v.eff.client_bin = Some("/nonexistent/skylatch-client".into())
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.onb.error.as_deref().is_some_and(|e| e.contains("不存在"))
+        }));
+        // with a client at hand it is started at once, no hub and no saved settings involved
+        let fake_client = std::env::current_exe().unwrap();
+        view.update(cx, |v, _| {
+            v.eff.client_bin = Some(fake_client.to_string_lossy().into_owned())
+        });
+        cx.simulate_keystrokes("enter");
+        let (banner, err, active, stored) = view.read_with(cx, |v, _| {
+            (
+                v.banner.as_ref().map(|b| (b.text.clone(), b.error)),
+                v.onb.error.clone(),
+                v.onboarding_active(),
+                v.stored.clone(),
+            )
+        });
+        assert!(
+            banner.is_some_and(|(t, e)| !e && t.contains("直连 ws://127.0.0.1:9")),
+            "{err:?}"
+        );
+        assert!(err.is_none() && active && stored == Config::default());
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn password_login_keeps_only_the_session_token(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-login-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (view, cx) = onboarding_view(cx, Some(path.clone()));
+        let url = hub.http_url();
+        view.update(cx, |v, _| {
+            v.onb.hub_url = url;
+            v.onb.username = "alice".into();
+            v.onb.password = "wrong".into();
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(
+            view.read_with(cx, |v, _| v.onb.busy && v.onb.password.is_empty()),
+            "the password leaves the form as soon as it is submitted"
+        );
+        draw(cx);
+        pump_until(&view, cx, "the rejected login", |v| !v.onb.busy);
+        assert!(view.read_with(cx, |v, _| {
+            v.onb.error.as_deref().is_some_and(|e| e.contains("密码")) && v.onboarding_active()
+        }));
+
+        view.update(cx, |v, _| v.onb.password = "s3cret-pw-4711".into());
+        cx.simulate_keystrokes("enter");
+        pump_until(&view, cx, "the login", |v| v.eff.live());
+        let (token, hub_url, active) = view.read_with(cx, |v, _| {
+            (
+                v.eff.token.clone(),
+                v.eff.hub_url.clone(),
+                v.onboarding_active(),
+            )
+        });
+        assert_eq!(
+            (token.as_str(), hub_url.as_str(), active),
+            ("session-token-1", hub.ws_url().as_str(), false)
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("session-token-1") && saved.contains(&hub.ws_url()));
+        assert!(
+            !saved.contains("s3cret-pw-4711") && !saved.contains("wrong"),
+            "passwords are never stored: {saved}"
+        );
+        assert!(view.read_with(cx, |v, _| v.onb.password.is_empty()
+            && v.onb.username.is_empty()));
+        assert!(
+            hub.log()
+                .iter()
+                .filter(|l| l.contains("/api/v1/login"))
+                .count()
+                == 2,
+            "{:?}",
+            hub.log()
+        );
+        // signed in: the add-device button is in the header, whatever the device count
+        assert!(has_sel(cx, "add-device"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn an_existing_account_token_can_be_pasted_instead_of_logging_in(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("skylatch-ui-token-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (view, cx) = onboarding_view(cx, Some(path.clone()));
+        view.update(cx, |v, _| {
+            v.onb.hub_url = "https://hub.example.test/".into();
+            v.onb.set_token_mode(true);
+            v.onb.token = "  pasted-account-token ".into();
+        });
+        cx.simulate_keystrokes("enter");
+        draw(cx);
+        let (live, url, token, hub) = view.read_with(cx, |v, _| {
+            (
+                v.eff.live(),
+                v.eff.hub_url.clone(),
+                v.eff.token.clone(),
+                v.hub.clone(),
+            )
+        });
+        assert!(live);
+        assert_eq!(
+            (url.as_str(), token.as_str(), hub),
+            (
+                "wss://hub.example.test",
+                "pasted-account-token",
+                HubState::Connecting
+            )
+        );
+        let saved = config::load(&path).unwrap();
+        assert_eq!(saved.token, "pasted-account-token");
+        assert_eq!(saved.hub_url, "wss://hub.example.test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn live_view<'a>(
+        cx: &'a mut TestAppContext,
+        hub: &FakeHub,
+    ) -> (gpui::Entity<Proto>, &'a mut VisualTestContext) {
+        let eff = Effective {
+            hub_url: hub.ws_url(),
+            token: "account-token".into(),
+            ..Effective::from_config(&Config::default())
+        };
+        cx.add_window_view(move |window, cx| {
+            let p = Proto::new(cx, Config::default(), eff, None);
+            window.focus(&p.focus);
+            p
+        })
+    }
+
+    #[gpui::test]
+    fn an_empty_hub_offers_a_first_device_card_with_a_live_code(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 0 };
+            v.maybe_first_code();
+        });
+        assert!(view.read_with(cx, |v, _| v.pair.busy));
+        pump_until(&view, cx, "the first code", |v| v.pair.code.is_some());
+        assert!(has_sel(cx, "first-device-card"));
+        assert!(
+            has_sel(cx, "add-device"),
+            "0 devices: the button is there too"
+        );
+        let (code, cmd) = view.read_with(cx, |v, _| {
+            let c = v.pair.code.as_ref().unwrap().code.clone();
+            let cmd = onboard::join_command(&config::normalize_hub_url(&v.eff.hub_url), &c);
+            (c, cmd)
+        });
+        assert_eq!(code, "482-917");
+        assert_eq!(
+            cmd,
+            format!("skylatch-agent join {} --code 482-917", hub.ws_url())
+        );
+        // it never asks twice on its own
+        view.update(cx, |v, _| v.maybe_first_code());
+        assert!(view.read_with(cx, |v, _| !v.pair.busy));
+        assert_eq!(hub.log().len(), 1, "{:?}", hub.log());
+        // devices arrive: the card gives way to the desk
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 7 };
+            v.apply_devices(fleet());
+        });
+        assert!(view.read_with(cx, |v, _| !v.pair_card_visible()));
+        assert!(
+            has_sel(cx, "add-device"),
+            "10 devices or 1: the button stays"
+        );
+    }
+
+    #[gpui::test]
+    fn add_device_modal_shows_a_one_time_code_and_copies_the_command(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 7 };
+            v.apply_devices(fleet());
+        });
+        draw(cx);
+        assert!(!has_sel(cx, "pair-modal"));
+
+        click_sel(cx, "add-device");
+        assert!(view.read_with(cx, |v, _| v.pair.open && v.pair.busy));
+        pump_until(&view, cx, "the pairing code", |v| v.pair.code.is_some());
+        assert!(has_sel(cx, "pair-modal"));
+        let (code, minutes) = view.read_with(cx, |v, _| {
+            let c = v.pair.code.as_ref().unwrap();
+            (c.code.clone(), c.minutes_left())
+        });
+        assert_eq!((code.as_str(), minutes), ("482-917", 10));
+        assert!(
+            hub.log()
+                .iter()
+                .any(|l| l.contains("POST /api/v1/pairing-codes")
+                    && l.ends_with("Bearer account-token")),
+            "{:?}",
+            hub.log()
+        );
+
+        // the copy button puts the whole join command on the clipboard
+        click_sel(cx, "pair-copy");
+        let clip = clipboard_text(cx);
+        assert_eq!(
+            clip.as_deref(),
+            Some(format!("skylatch-agent join {} --code 482-917", hub.ws_url()).as_str())
+        );
+        assert!(view.read_with(cx, |v, _| v.pair.copied_at.is_some()));
+
+        // "换一码" mints another code and the old one is gone
+        click_sel(cx, "pair-again");
+        assert!(view.read_with(cx, |v, _| v.pair.code.is_none() && v.pair.busy));
+        pump_until(&view, cx, "the next code", |v| v.pair.code.is_some());
+        assert_eq!(
+            view.read_with(cx, |v, _| v.pair.code.as_ref().unwrap().code.clone()),
+            "135-790"
+        );
+
+        // R regenerates, Enter copies, Esc closes; the desk behind ignores the mouse meanwhile
+        cx.simulate_keystrokes("r");
+        pump_until(&view, cx, "the third code", |v| {
+            v.pair.code.as_ref().is_some_and(|c| c.code == "264-081")
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(clipboard_text(cx).is_some_and(|t| t.ends_with("--code 264-081")));
+        cx.simulate_keystrokes("escape");
+        assert!(view.read_with(cx, |v, _| !v.pair.open));
+
+        // clicking the dimmed backdrop closes it as well
+        click_sel(cx, "add-device");
+        pump_until(&view, cx, "a fresh code", |v| v.pair.code.is_some());
+        draw(cx);
+        let scrim = cx.debug_bounds("pair-scrim").unwrap();
+        cx.simulate_click(
+            point(scrim.origin.x + px(8.0), scrim.origin.y + px(8.0)),
+            Modifiers::none(),
+        );
+        assert!(view.read_with(cx, |v, _| !v.pair.open));
+    }
+
+    #[gpui::test]
+    fn an_expired_code_cannot_be_copied_and_a_rejected_token_is_explained(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online { count: 1 };
+            v.pair.code = Some(Code::new("111-222".into(), 0));
+        });
+        cx.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("unchanged".into())));
+        view.update(cx, |v, cx| v.copy_join_command(cx));
+        assert_eq!(clipboard_text(cx).as_deref(), Some("unchanged"));
+
+        view.update(cx, |v, _| v.eff.token = "revoked-token".into());
+        view.update(cx, |v, _| v.open_pair_modal());
+        pump_until(&view, cx, "the rejection", |v| v.pair.error.is_some());
+        let (err, code) = view.read_with(cx, |v, _| (v.pair.error.clone(), v.pair.code.is_none()));
+        assert!(err.is_some_and(|e| e.contains("登录已失效")) && code);
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn header_drag_areas_have_no_mouse_down_listener_above_them(cx: &mut TestAppContext) {
+        // gpui's Windows backend only starts the native title-bar drag when the mouse-down was
+        // neither handled nor default-prevented. A click on a drag area must therefore reach no
+        // listener and no focus-tracking element above it: keyboard focus (which a tracked
+        // element would take, and default-prevent, on every click) has to stay where it was.
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        let other = cx.update(|window, app| {
+            let handle = app.focus_handle();
+            window.focus(&handle);
+            handle
+        });
+        let focused = |view: &gpui::Entity<Proto>, cx: &mut VisualTestContext| {
+            cx.update(|window, app| view.read(app).focus.is_focused(window))
+        };
+        assert!(!focused(&view, cx));
+        for area in ["header-brand", "header-drag"] {
+            click_sel(cx, area);
+            assert!(
+                !focused(&view, cx),
+                "a click on `{area}` reached a listener"
+            );
+        }
+        // the stage still takes focus, as before
+        cx.simulate_click(point(px(6.0), px(HEADER_H + 6.0)), Modifiers::none());
+        assert!(focused(&view, cx));
+        drop(other);
     }
 }
