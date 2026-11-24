@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone package: the empty [workspace] table below keeps Cargo from treating this crate
+# as a member of the repository root workspace, so the server / library workspace never
+# builds (or downloads) any GUI dependency.
+
+[package]
+name = "skylatch-ui"
+description = "Skylatch desktop launcher: isometric desk UI that lists hub devices and starts the native client"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/maxesisn/skylatch"
+publish = false
+
+[[bin]]
+name = "skylatch-ui"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+skylatch-client-core = { path = "../../crates/skylatch-client-core" }
+skylatch-proto = { path = "../../crates/skylatch-proto" }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+
+[workspace]
