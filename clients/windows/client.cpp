@@ -265,19 +265,16 @@ class Client {
         }
     }
 
-    static void onMonitorList(void* ctx, const char* json, size_t len) noexcept {
+    static void onMonitorList(void* ctx, const char* raw, size_t len) noexcept {
         auto& self = *static_cast<Client*>(ctx);
-        if (self.stopping || self.config.smoke || !json) return;
+        if (self.stopping || self.config.smoke || !raw) return;
         try {
-            using winrt::Windows::Data::Json::JsonArray;
+            const auto parsed = json::parse(std::string_view(raw, len));
             std::vector<Monitor> list;
-            winrt::init_apartment();
-            struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
-            const auto array = JsonArray::Parse(winrt::hstring(fromUtf8(std::string_view(json, len))));
-            for (const auto& value : array) {
-                const auto obj = value.GetObject();
-                list.push_back({winrt::to_string(obj.GetNamedString(L"id")), displayText(obj.GetNamedString(L"name")),
-                    obj.HasKey(L"active") && obj.GetNamedBoolean(L"active")});
+            for (const auto& value : parsed.asArray()) {
+                const auto* active = value.field("active");
+                list.push_back({value.req("id").asString(), displayText(fromUtf8(value.req("name").asString())),
+                    active && active->asBool()});
             }
             {
                 std::lock_guard lock(self.monitorLock);
@@ -286,7 +283,6 @@ class Client {
             PostMessageW(self.wnd, msgMonitors, 0, 0);
         } catch (const std::exception&) {
             // The monitor button is a convenience; a malformed list must not end the session.
-        } catch (const winrt::hresult_error&) {
         }
     }
 
