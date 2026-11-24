@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Queue depth towards a client. When it is full the frame gate starts dropping.
 pub const CLIENT_QUEUE: usize = 32;
@@ -50,6 +50,9 @@ struct Device {
     tx: mpsc::Sender<HostCommand>,
     last_seen: Instant,
     session: Option<Session>,
+    _cancel: Option<oneshot::Sender<()>>,
+    enrolled: bool,
+    direct_key: Option<String>,
 }
 
 type Key = (String, String);
@@ -77,6 +80,31 @@ impl Registry {
 
     /// Registers a host connection, replacing any previous one for the same device.
     pub fn register(&self, account: &str, info: DeviceInfo, tx: mpsc::Sender<HostCommand>) -> u64 {
+        self.insert_host(account, info, tx, None, false)
+    }
+
+    pub(crate) fn register_host(
+        &self,
+        account: &str,
+        info: DeviceInfo,
+        tx: mpsc::Sender<HostCommand>,
+        enrolled: bool,
+    ) -> (u64, oneshot::Receiver<()>) {
+        let (cancel, stopped) = oneshot::channel();
+        (
+            self.insert_host(account, info, tx, Some(cancel), enrolled),
+            stopped,
+        )
+    }
+
+    fn insert_host(
+        &self,
+        account: &str,
+        info: DeviceInfo,
+        tx: mpsc::Sender<HostCommand>,
+        cancel: Option<oneshot::Sender<()>>,
+        enrolled: bool,
+    ) -> u64 {
         let conn_id = self.next_id();
         let key = (account.to_string(), info.device_id.clone());
         let old = self.lock().insert(
@@ -87,12 +115,51 @@ impl Registry {
                 tx,
                 last_seen: Instant::now(),
                 session: None,
+                _cancel: cancel,
+                enrolled,
+                direct_key: None,
             },
         );
         if let Some(session) = old.and_then(|d| d.session) {
             notify_closed(&session, "host_replaced");
         }
         conn_id
+    }
+
+    pub(crate) fn revoke_host(&self, account: &str, device_id: &str) {
+        let key = (account.to_owned(), device_id.to_owned());
+        let mut map = self.lock();
+        if map.get(&key).is_some_and(|d| d.enrolled) {
+            if let Some(session) = map.remove(&key).and_then(|d| d.session) {
+                notify_closed(&session, "token_revoked");
+            }
+        }
+    }
+
+    pub(crate) fn set_direct_key(&self, account: &str, device_id: &str, conn_id: u64, key: String) {
+        if let Some(device) = self
+            .lock()
+            .get_mut(&(account.to_owned(), device_id.to_owned()))
+            .filter(|d| d.conn_id == conn_id)
+        {
+            device.direct_key = Some(key);
+        }
+    }
+
+    pub(crate) fn direct_access(
+        &self,
+        account: &str,
+        device_id: &str,
+    ) -> Option<(String, Vec<DirectEndpoint>)> {
+        let map = self.lock();
+        let device = map.get(&(account.to_owned(), device_id.to_owned()))?;
+        if device.session.is_some() || device.info.direct_endpoints.is_empty() {
+            return None;
+        }
+        Some((
+            device.direct_key.clone()?,
+            device.info.direct_endpoints.clone(),
+        ))
     }
 
     /// Removes the device if `conn_id` is still its current connection.

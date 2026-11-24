@@ -1,11 +1,12 @@
 use clap::Parser;
 use skylatch_hub::{router, AppState, HubConfig};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 /// Skylatch relay hub. Terminate TLS in front of it (reverse proxy) to serve WSS on 443.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(version, about)]
 struct Args {
     /// Address to listen on.
@@ -17,9 +18,18 @@ struct Args {
         long = "account",
         env = "SKYLATCH_ACCOUNTS",
         value_delimiter = ',',
-        required = true
+        hide_env_values = true
     )]
     accounts: Vec<String>,
+
+    /// Password login account as `username=password`. Repeat the flag for several users.
+    /// Alternatively set the comma-delimited `SKYLATCH_USERS` environment variable.
+    #[arg(long = "user")]
+    users: Vec<String>,
+
+    /// Store password hashes, client sessions, and revocable device credentials as private JSON.
+    #[arg(long, env = "SKYLATCH_STATE_FILE")]
+    state_file: Option<PathBuf>,
 
     /// Heartbeat interval announced to hosts, in seconds.
     #[arg(long, env = "SKYLATCH_HEARTBEAT_SECS", default_value_t = 15)]
@@ -49,11 +59,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|a| parse_account(a))
         .collect::<Result<Vec<_>, _>>()?;
+    let users = if args.users.is_empty() {
+        match std::env::var("SKYLATCH_USERS") {
+            Ok(raw) if !raw.is_empty() => raw.split(',').map(str::to_owned).collect(),
+            Ok(_) | Err(std::env::VarError::NotPresent) => vec![],
+            Err(err) => return Err(err.into()),
+        }
+    } else {
+        args.users
+    };
+    let users = users
+        .iter()
+        .map(|s| {
+            s.split_once('=')
+                .filter(|(name, password)| !name.is_empty() && !password.is_empty())
+                .map(|(name, password)| (name.into(), password.into()))
+                .ok_or("invalid --user: expected username=password")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if accounts.is_empty()
+        && users.is_empty()
+        && !args.state_file.as_ref().is_some_and(|path| path.is_file())
+    {
+        return Err("configure --account, --user, or an existing --state-file".into());
+    }
     let mut config = HubConfig::new(accounts);
     config.heartbeat_interval = Duration::from_secs(args.heartbeat_secs.max(1));
+    let state = AppState::with_auth(config, args.state_file, users)?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "skylatch-hub listening");
-    axum::serve(listener, router(AppState::new(config)))
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

@@ -4,6 +4,8 @@
 //! device and receive its `NSL1` stream relayed through the hub. Slow clients lose frames, never
 //! the connection: see [`gate::FrameGate`].
 
+mod api;
+mod auth;
 pub mod config;
 pub mod gate;
 pub mod registry;

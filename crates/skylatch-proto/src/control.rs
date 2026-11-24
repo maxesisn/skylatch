@@ -77,6 +77,10 @@ pub enum HostToHub {
     DirectEndpoints {
         endpoints: Vec<DirectEndpoint>,
     },
+    /// Enables hub-issued tickets for this connection's authenticated direct listener.
+    DirectAccess {
+        key: String,
+    },
     /// The host is ready to stream for the session.
     SessionReady {
         session_id: String,
