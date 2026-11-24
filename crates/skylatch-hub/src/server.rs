@@ -1,15 +1,19 @@
 //! HTTP and WebSocket handlers.
 
+use crate::api;
+use crate::auth::{Auth, AuthError};
 use crate::config::HubConfig;
 use crate::registry::{ClientOut, HostCommand, OpenError, Registry, CLIENT_QUEUE, HOST_QUEUE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use skylatch_proto::control::{ClientToHub, DeviceInfo, HostToHub, HubToClient, HubToHost};
+use skylatch_proto::credentials::is_token;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,20 +27,37 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct AppState {
     pub config: Arc<HubConfig>,
     pub registry: Arc<Registry>,
+    pub(crate) auth: Arc<Auth>,
 }
 
 impl AppState {
     pub fn new(config: HubConfig) -> Self {
-        Self {
+        Self::with_auth(config, None, vec![]).expect("empty in-memory credentials need no I/O")
+    }
+
+    /// Loads persisted credentials and creates or updates configured password users.
+    pub fn with_auth(
+        config: HubConfig,
+        state_file: Option<PathBuf>,
+        users: Vec<(String, String)>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),
-        }
+            auth: Arc::new(Auth::new(state_file, users)?),
+        })
     }
 }
 
 /// Builds the hub router.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(api::console))
+        .route("/api/v1/login", post(api::login))
+        .route("/api/v1/pairing-codes", post(api::create_code))
+        .route("/api/v1/enroll", post(api::enroll))
+        .route("/api/v1/devices/{device_id}/token", delete(api::revoke))
+        .route("/api/v1/direct-sessions", post(api::direct_session))
         .route("/healthz", get(healthz))
         .route("/api/v1/devices", get(list_devices))
         .route("/ws/host", get(ws_host))
@@ -62,7 +83,7 @@ struct DeviceList {
     devices: Vec<DeviceInfo>,
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
         .to_str()
@@ -71,7 +92,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(account) = bearer(&headers).and_then(|t| state.config.account_for_token(t)) else {
+    let Some(account) = bearer(&headers).and_then(|t| state.auth.account(&state.config, t)) else {
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -80,7 +101,7 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
             .into_response();
     };
     Json(DeviceList {
-        devices: state.registry.list(account),
+        devices: state.registry.list(&account),
     })
     .into_response()
 }
@@ -127,85 +148,102 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
     let Some(first) = first_text(&mut socket).await else {
         return;
     };
-    let (account, device) = match serde_json::from_str::<HostToHub>(&first) {
-        Ok(HostToHub::Register { token, device }) => match state.config.account_for_token(&token) {
-            Some(account) if !device.device_id.is_empty() => (account.to_string(), device),
-            Some(_) => {
+    let Ok(HostToHub::Register { token, device }) = serde_json::from_str(&first) else {
+        let _ = socket.send(reject("invalid", "expected register")).await;
+        return;
+    };
+    let device_id = device.device_id.clone();
+    let (tx, mut rx) = mpsc::channel::<HostCommand>(HOST_QUEUE);
+    let (account, conn_id, cancelled) =
+        match state
+            .auth
+            .register_host(&state.config, &state.registry, &token, device, tx)
+        {
+            Ok(value) => value,
+            Err(AuthError::Invalid) => {
                 let _ = socket
                     .send(reject("invalid", "device_id must not be empty"))
                     .await;
                 return;
             }
-            None => {
+            Err(_) => {
                 let _ = socket.send(reject("unauthorized", "bad token")).await;
                 return;
             }
-        },
-        _ => {
-            let _ = socket.send(reject("invalid", "expected register")).await;
+        };
+    tracing::info!(%account, %device_id, "host registered");
+    let pump = async {
+        let interval = state.config.heartbeat_interval;
+        let registered = text(&HubToHost::Registered {
+            heartbeat_interval_secs: interval.as_secs().max(1),
+        });
+        if socket.send(registered).await.is_err() {
             return;
         }
-    };
-    let device_id = device.device_id.clone();
-    let (tx, mut rx) = mpsc::channel::<HostCommand>(HOST_QUEUE);
-    let conn_id = state.registry.register(&account, device, tx);
-    tracing::info!(%account, %device_id, "host registered");
-    let interval = state.config.heartbeat_interval;
-    let registered = text(&HubToHost::Registered {
-        heartbeat_interval_secs: interval.as_secs().max(1),
-    });
-    if socket.send(registered).await.is_err() {
-        state.registry.unregister(&account, &device_id, conn_id);
-        return;
-    }
-    let idle_limit = interval * 3;
-    loop {
-        tokio::select! {
-            incoming = timeout(idle_limit, socket.recv()) => {
-                let msg = match incoming {
-                    Err(_) => { tracing::info!(%device_id, "host heartbeat timeout"); break; }
-                    Ok(None | Some(Err(_))) => break,
-                    Ok(Some(Ok(m))) => m,
-                };
-                state.registry.touch(&account, &device_id, conn_id);
-                match msg {
-                    Message::Text(t) => match serde_json::from_str::<HostToHub>(t.as_str()) {
-                        Ok(HostToHub::Heartbeat { seq }) => {
-                            if socket.send(text(&HubToHost::HeartbeatAck { seq })).await.is_err() { break; }
+        let idle_limit = interval * 3;
+        loop {
+            tokio::select! {
+                incoming = timeout(idle_limit, socket.recv()) => {
+                    let msg = match incoming {
+                        Err(_) => { tracing::info!(%device_id, "host heartbeat timeout"); break; }
+                        Ok(None | Some(Err(_))) => break,
+                        Ok(Some(Ok(m))) => m,
+                    };
+                    state.registry.touch(&account, &device_id, conn_id);
+                    match msg {
+                        Message::Text(t) => match serde_json::from_str::<HostToHub>(t.as_str()) {
+                            Ok(HostToHub::Heartbeat { seq }) => {
+                                if socket.send(text(&HubToHost::HeartbeatAck { seq })).await.is_err() { break; }
+                            }
+                            Ok(HostToHub::DirectEndpoints { endpoints }) => {
+                                state.registry.set_endpoints(&account, &device_id, conn_id, endpoints);
+                            }
+                            Ok(HostToHub::DirectAccess { key }) => {
+                                if is_token(&key) {
+                                    state.registry.set_direct_key(&account, &device_id, conn_id, key);
+                                }
+                            }
+                            Ok(HostToHub::SessionReady { session_id }) => {
+                                tracing::debug!(%device_id, %session_id, "session ready");
+                            }
+                            Ok(HostToHub::SessionClosed { session_id }) => {
+                                state.registry.close_session_from_host(&account, &device_id, &session_id);
+                            }
+                            Ok(HostToHub::Register { .. }) | Err(_) => {
+                                let _ = socket.send(reject("invalid", "unexpected message")).await;
+                            }
+                        },
+                        Message::Binary(data) => {
+                            if !state.registry.relay_from_host(&account, &device_id, conn_id, data).await {
+                                break;
+                            }
                         }
-                        Ok(HostToHub::DirectEndpoints { endpoints }) => {
-                            state.registry.set_endpoints(&account, &device_id, conn_id, endpoints);
-                        }
-                        Ok(HostToHub::SessionReady { session_id }) => {
-                            tracing::debug!(%device_id, %session_id, "session ready");
-                        }
-                        Ok(HostToHub::SessionClosed { session_id }) => {
-                            state.registry.close_session_from_host(&account, &device_id, &session_id);
-                        }
-                        Ok(HostToHub::Register { .. }) | Err(_) => {
-                            let _ = socket.send(reject("invalid", "unexpected message")).await;
-                        }
-                    },
-                    Message::Binary(data) => {
-                        if !state.registry.relay_from_host(&account, &device_id, conn_id, data).await {
-                            break;
-                        }
+                        Message::Close(_) => break,
+                        Message::Ping(_) | Message::Pong(_) => {}
                     }
-                    Message::Close(_) => break,
-                    Message::Ping(_) | Message::Pong(_) => {}
+                }
+                command = rx.recv() => {
+                    let Some(command) = command else { break };
+                    let sent = match command {
+                        HostCommand::Json(m) => socket.send(text(&m)).await,
+                        HostCommand::Binary(b) => socket.send(Message::Binary(b)).await,
+                    };
+                    if sent.is_err() { break; }
                 }
             }
-            command = rx.recv() => {
-                let Some(command) = command else { break };
-                let sent = match command {
-                    HostCommand::Json(m) => socket.send(text(&m)).await,
-                    HostCommand::Binary(b) => socket.send(Message::Binary(b)).await,
-                };
-                if sent.is_err() { break; }
-            }
         }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => {},
+        _ = pump => {},
     }
     state.registry.unregister(&account, &device_id, conn_id);
+    let _ = timeout(
+        Duration::from_millis(250),
+        socket.send(Message::Close(None)),
+    )
+    .await;
     tracing::info!(%account, %device_id, "host disconnected");
 }
 
@@ -221,8 +259,8 @@ async fn handle_client(state: AppState, mut socket: WebSocket) {
         return;
     };
     let account = match serde_json::from_str::<ClientToHub>(&first) {
-        Ok(ClientToHub::Auth { token }) => match state.config.account_for_token(&token) {
-            Some(account) => account.to_string(),
+        Ok(ClientToHub::Auth { token }) => match state.auth.account(&state.config, &token) {
+            Some(account) => account,
             None => {
                 let _ = socket.send(client_error("unauthorized", "bad token")).await;
                 return;

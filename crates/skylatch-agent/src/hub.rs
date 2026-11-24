@@ -1,12 +1,15 @@
 //! The outbound hub connection and the session bridge.
 
-use crate::cli::Cli;
+use crate::cli::{Cli, DaemonCredentials};
+use crate::direct::{self, Direct};
 use crate::engine::{EngineEvent, EngineSource, LocalLink};
 use crate::hardware::detect_hardware_profile;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::control::{DeviceInfo, HostToHub, HubToHost};
-use std::time::Duration;
-use tokio::sync::mpsc;
+use skylatch_proto::credentials::random_token;
+use std::{io, net::Ipv4Addr, sync::Arc, time::Duration};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -33,14 +36,48 @@ enum ConnError {
 struct Active {
     session_id: String,
     link: LocalLink,
+    viewer: OwnedSemaphorePermit,
 }
 
 /// Runs until the process is stopped, reconnecting to the hub with capped exponential backoff.
-pub async fn run(cli: Cli) {
+pub async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let credentials = cli.resolve()?;
+    let direct_enabled = cli.enable_direct || cli.direct_port != 0;
+    if direct_enabled
+        && cli.engine_url.as_ref().is_some_and(|url| match url.host() {
+            Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host != "localhost",
+            None => true,
+        })
+    {
+        return Err("the direct listener requires a loopback engine URL".into());
+    }
+    let listener = if direct_enabled {
+        Some(TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.direct_port)).await?)
+    } else {
+        None
+    };
+
     // Probes can involve native display services or a short-lived child process.
     let hardware = tokio::task::spawn_blocking(detect_hardware_profile)
         .await
         .unwrap_or_default();
+    let mut endpoints = cli.direct_endpoints.clone();
+    if let Some(listener) = &listener {
+        let port = listener.local_addr()?.port();
+        match direct::endpoints(port) {
+            Ok(detected) => {
+                for endpoint in detected {
+                    if !endpoints.contains(&endpoint) {
+                        endpoints.push(endpoint);
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(%err, "could not detect direct interfaces"),
+        }
+        tracing::info!(port, "direct listener enabled");
+    }
     let device = DeviceInfo {
         device_id: cli.resolved_device_id(),
         name: cli.resolved_name(),
@@ -51,17 +88,58 @@ pub async fn run(cli: Cli) {
         monitor_list: hardware.monitor_list,
         room: cli.room.clone(),
         slot: cli.slot,
-        direct_endpoints: cli.direct_endpoints.clone(),
+        direct_endpoints: endpoints,
     };
-    let mut engine = match (&cli.engine_bin, &cli.engine_url) {
+    let engine = Arc::new(Mutex::new(match (&cli.engine_bin, &cli.engine_url) {
         (Some(bin), _) => EngineSource::spawn(bin.clone(), cli.engine_port, cli.engine_args()),
         (None, Some(url)) => EngineSource::attach(url.clone()),
-        (None, None) => unreachable!("clap requires one engine source"),
-    };
+        (None, None) => {
+            let bin = format!("skylatch-host-engine{}", std::env::consts::EXE_SUFFIX);
+            let sibling = std::env::current_exe()?.with_file_name(&bin);
+            let bin = if sibling.is_file() {
+                sibling
+            } else {
+                bin.into()
+            };
+            EngineSource::spawn(bin, None, vec![])
+        }
+    }));
+    let viewer = Arc::new(Semaphore::new(1));
+    if let Some(listener) = listener {
+        let (key, watch) = watch::channel(None);
+        let direct = Direct {
+            engine: engine.clone(),
+            viewer: viewer.clone(),
+            key: watch,
+            device_token: credentials
+                .device_token
+                .then(|| Arc::from(credentials.token.as_str())),
+        };
+        tokio::select! {
+            _ = reconnect(&credentials, &device, &engine, &viewer, Some(&key)) => {},
+            result = direct::serve(listener, direct) => result?,
+        }
+    } else {
+        reconnect(&credentials, &device, &engine, &viewer, None).await;
+    }
+    Ok(())
+}
+
+async fn reconnect(
+    credentials: &DaemonCredentials,
+    device: &DeviceInfo,
+    engine: &Mutex<EngineSource>,
+    viewer: &Arc<Semaphore>,
+    key: Option<&watch::Sender<Option<String>>>,
+) {
     let mut backoff = BACKOFF_MIN;
     loop {
         let mut registered = false;
-        match connection(&cli, &device, &mut engine, &mut registered).await {
+        let result = connection(credentials, device, engine, viewer, key, &mut registered).await;
+        if let Some(key) = key {
+            key.send_replace(None);
+        }
+        match result {
             Ok(()) => tracing::info!("hub connection ended"),
             Err(err) => tracing::warn!("{err}"),
         }
@@ -79,19 +157,22 @@ fn json(msg: &HostToHub) -> Message {
 }
 
 async fn connection(
-    cli: &Cli,
+    credentials: &DaemonCredentials,
     device: &DeviceInfo,
-    engine: &mut EngineSource,
+    engine: &Mutex<EngineSource>,
+    viewer: &Arc<Semaphore>,
+    key: Option<&watch::Sender<Option<String>>>,
     registered: &mut bool,
 ) -> Result<(), ConnError> {
-    tracing::info!(hub = %cli.hub, "connecting to hub");
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(cli.hub.as_str(), None, true)
-        .await
-        .map_err(|e| ConnError::Connect(e.to_string()))?;
+    tracing::info!(hub = %credentials.hub, "connecting to hub");
+    let (ws, _) =
+        tokio_tungstenite::connect_async_with_config(credentials.hub.as_str(), None, true)
+            .await
+            .map_err(|e| ConnError::Connect(e.to_string()))?;
     let (mut sink, mut stream) = ws.split();
 
     sink.send(json(&HostToHub::Register {
-        token: cli.token.clone(),
+        token: credentials.token.clone(),
         device: device.clone(),
     }))
     .await
@@ -119,6 +200,13 @@ async fn connection(
     })
     .await
     .map_err(|_| ConnError::Register("timed out".into()))??;
+    if let Some(online) = key {
+        let key = random_token().map_err(|err: io::Error| ConnError::Register(err.to_string()))?;
+        online.send_replace(Some(key.clone()));
+        sink.send(json(&HostToHub::DirectAccess { key }))
+            .await
+            .map_err(|e| ConnError::Register(e.to_string()))?;
+    }
     *registered = true;
     tracing::info!(device_id = %device.device_id, heartbeat_secs, "registered with hub");
 
@@ -159,11 +247,17 @@ async fn connection(
                                     if let Some(old) = active.take() {
                                         old.link.close().await;
                                     }
+                                    let Ok(viewer) = viewer.clone().try_acquire_owned() else {
+                                        sink.send(json(&HostToHub::SessionClosed { session_id }))
+                                            .await
+                                            .map_err(|e| ConnError::Ws(e.to_string()))?;
+                                        continue;
+                                    };
                                     generation += 1;
-                                    match engine.open_link(generation, events_tx.clone()).await {
+                                    match engine.lock().await.open_link(generation, events_tx.clone()).await {
                                         Ok(link) => {
                                             tracing::info!(%session_id, "session open");
-                                            active = Some(Active { session_id: session_id.clone(), link });
+                                            active = Some(Active { session_id: session_id.clone(), link, viewer });
                                             sink.send(json(&HostToHub::SessionReady { session_id }))
                                                 .await
                                                 .map_err(|e| ConnError::Ws(e.to_string()))?;
@@ -183,10 +277,10 @@ async fn connection(
                                         let old = active.take().expect("checked above");
                                         old.link.close().await;
                                         generation += 1;
-                                        match engine.open_link(generation, events_tx.clone()).await {
+                                        match engine.lock().await.open_link(generation, events_tx.clone()).await {
                                             Ok(link) => {
                                                 tracing::debug!(%session_id, "keyframe requested");
-                                                active = Some(Active { session_id, link });
+                                                active = Some(Active { session_id, link, viewer: old.viewer });
                                             }
                                             Err(err) => {
                                                 tracing::error!(%session_id, "keyframe restart failed: {err}");
@@ -250,6 +344,9 @@ async fn connection(
     }
     .await;
 
+    if let Some(key) = key {
+        key.send_replace(None);
+    }
     if let Some(a) = active.take() {
         a.link.close().await;
     }

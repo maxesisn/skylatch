@@ -443,3 +443,276 @@ async fn keyframe_request_close_and_reconnect() {
         HostToHub::Register { token, device }
     );
 }
+
+struct ConfigDirectory(std::path::PathBuf);
+
+impl ConfigDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "skylatch-test-{}",
+            skylatch_proto::credentials::random_token().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_skylatch-agent"));
+        command
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
+            .env("HOME", &self.0)
+            .env("APPDATA", &self.0)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("SKYLATCH_HUB")
+            .env_remove("SKYLATCH_TOKEN")
+            .env_remove("SKYLATCH_PASSWORD")
+            .env_remove("SKYLATCH_ENGINE_BIN")
+            .env_remove("SKYLATCH_DEVICE_NAME")
+            .env_remove("SKYLATCH_DEVICE_ID")
+            .kill_on_drop(true);
+        command
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        let dir = if cfg!(windows) {
+            "Skylatch"
+        } else if cfg!(target_os = "macos") {
+            "Library/Application Support/Skylatch"
+        } else {
+            ".config/skylatch"
+        };
+        self.0.join(dir).join("agent.json")
+    }
+}
+
+impl Drop for ConfigDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn join_saves_config_and_direct_listener_authenticates_and_streams() {
+    use skylatch_client_core::{create_pairing_code, Event, SessionClient, TransportMode};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+
+    let cfg = HubConfig::new(vec![("demo".into(), "example-static-token".into())]);
+    let state = AppState::with_auth(
+        cfg,
+        None,
+        vec![("demo".into(), "example passphrase".into())],
+    )
+    .unwrap();
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let hub = listener.local_addr().unwrap();
+    let _hub_task = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let origin = format!("http://{hub}");
+    let joined = ConfigDirectory::new();
+    let child = joined
+        .command()
+        .args(["join", &origin, "--device-id", "first", "--name", "First"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = child;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"demo\nexample passphrase\n")
+        .await
+        .unwrap();
+    let result = timeout(WAIT, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let path = joined.path();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("example passphrase"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let config = ConfigDirectory::new();
+    let pair = create_pairing_code(&origin, "example-static-token")
+        .await
+        .unwrap();
+    let output = timeout(
+        WAIT,
+        config
+            .command()
+            .args([
+                "join",
+                &origin,
+                "--code",
+                &pair.code,
+                "--device-id",
+                "paired",
+                "--name",
+                "Paired",
+                "--room",
+                "Example room",
+                "--slot",
+                "2",
+            ])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+    let token = config_json["device_token"].as_str().unwrap();
+    assert_ne!(token, "example-static-token");
+    assert_eq!(config_json["slot"], 2);
+
+    let mut engine = mock_engine().await;
+    let mut agent = config
+        .command()
+        .args([
+            "--engine-url",
+            &format!("ws://{}", engine.addr),
+            "--enable-direct",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let device = timeout(WAIT, async {
+        loop {
+            let devices = skylatch_client_core::list_devices(&origin, "example-static-token")
+                .await
+                .unwrap();
+            if let Some(device) = devices.into_iter().find(|d| d.device_id == "paired") {
+                break device;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(device.name, "Paired");
+    assert_eq!(device.room.as_deref(), Some("Example room"));
+    assert_eq!(device.slot, Some(2));
+    let port = if let Some(endpoint) = device.direct_endpoints.first() {
+        for endpoint in &device.direct_endpoints {
+            assert!(endpoint
+                .host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| !ip.is_loopback()));
+            assert_eq!(endpoint.port, device.direct_endpoints[0].port);
+        }
+        endpoint.port
+    } else {
+        // The listener remains usable from loopback on machines with no other IPv4 interfaces.
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(agent.stdout.take().unwrap()).lines();
+        timeout(WAIT, async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let line = line.replace("\x1b[0m", "").replace("\x1b[3m", "");
+                if line.contains("direct listener enabled") {
+                    if let Some((_, port)) = line.rsplit_once("port=") {
+                        return port.trim().parse().unwrap();
+                    }
+                }
+            }
+            panic!("missing direct port");
+        })
+        .await
+        .unwrap()
+    };
+    let direct = format!("ws://{}:{port}/stream", std::net::Ipv4Addr::LOCALHOST);
+    let mut unauth = direct.as_str().into_client_request().unwrap();
+    unauth
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("nsl1"));
+    assert!(
+        matches!(connect_async(unauth).await, Err(Error::Http(response)) if matches!(response.status().as_u16(), 401 | 503))
+    );
+    let mut authenticated = direct.as_str().into_client_request().unwrap();
+    authenticated.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(&format!("nsl1, bearer.{token}")).unwrap(),
+    );
+    let (mut socket, response) = timeout(WAIT, async {
+        loop {
+            match connect_async(authenticated.clone()).await {
+                Err(Error::Http(response)) if response.status() == 503 => {
+                    tokio::time::sleep(Duration::from_millis(30)).await
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.headers()["sec-websocket-protocol"], "nsl1");
+    assert_eq!(recv_binary(&mut socket).await, keyframe(1));
+    socket.send(Message::Binary(input())).await.unwrap();
+    assert_eq!(
+        timeout(WAIT, engine.received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        input()
+    );
+    socket.close(None).await.unwrap();
+    timeout(WAIT, engine.closed.recv()).await.unwrap().unwrap();
+
+    if !device.direct_endpoints.is_empty() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = SessionClient::connect_hub(
+            &origin,
+            "example-static-token",
+            "paired",
+            true,
+            move |event| {
+                let _ = tx.send(event);
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.transport_mode(), TransportMode::Direct);
+        assert!(matches!(
+            timeout(WAIT, rx.recv()).await.unwrap(),
+            Some(Event::Frame(_))
+        ));
+
+        let mut revoke = TcpStream::connect(hub).await.unwrap();
+        revoke.write_all(b"DELETE /api/v1/devices/paired/token HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer example-static-token\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        timeout(WAIT, revoke.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 204"));
+        assert!(matches!(
+            timeout(WAIT, rx.recv()).await.unwrap(),
+            Some(Event::Disconnected(_))
+        ));
+        assert!(
+            matches!(connect_async(authenticated).await, Err(Error::Http(response)) if response.status() == 503)
+        );
+    }
+}

@@ -1,7 +1,9 @@
 //! Command line and derived configuration.
 
-use clap::{ArgGroup, Parser, ValueEnum};
+use crate::join::{config_path, load, Join};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use skylatch_proto::control::{DeviceFormFactor, DirectEndpoint, EndpointKind};
+use skylatch_proto::credentials::is_token;
 use std::path::PathBuf;
 use url::Url;
 
@@ -32,18 +34,18 @@ impl FormFactorArg {
 ///
 /// Keeps one outbound WebSocket to `skylatch-hub` and, when a client opens a session, bridges
 /// its `NSL1` stream to the local `skylatch-host-engine`.
-#[derive(Debug, Clone, Parser)]
-#[command(version, about)]
-#[command(group(ArgGroup::new("engine").required(true).args(["engine_bin", "engine_url"])))]
+#[derive(Parser)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
+#[command(group(ArgGroup::new("engine").args(["engine_bin", "engine_url"])))]
 pub struct Cli {
     /// Hub URL: `wss://hub.example.com/ws/host`, or a base URL such as `ws://127.0.0.1:8080`
     /// (`/ws/host` is appended when the path is empty).
     #[arg(long, env = "SKYLATCH_HUB", value_parser = parse_hub_url)]
-    pub hub: Url,
+    pub hub: Option<Url>,
 
-    /// Account token.
+    /// Account or device token.
     #[arg(long, env = "SKYLATCH_TOKEN", hide_env_values = true)]
-    pub token: String,
+    pub token: Option<String>,
 
     /// Stable device id (default: derived from the hostname).
     #[arg(long, env = "SKYLATCH_DEVICE_ID")]
@@ -81,6 +83,18 @@ pub struct Cli {
     #[arg(long = "direct-endpoint", value_name = "KIND=HOST:PORT", value_parser = parse_endpoint)]
     pub direct_endpoints: Vec<DirectEndpoint>,
 
+    /// Listen for authenticated NSL1 connections. Port 0 disables unless --enable-direct is set.
+    #[arg(long, default_value_t = 0)]
+    pub direct_port: u16,
+
+    /// Enable direct connections, using an ephemeral port when --direct-port is not set.
+    #[arg(long)]
+    pub enable_direct: bool,
+
+    /// Treat --token as a per-device token for direct authentication, never as an account token.
+    #[arg(long, requires = "token")]
+    pub device_token: bool,
+
     /// Capture frame rate passed to the engine (10-120).
     #[arg(long, requires = "engine_bin", value_parser = clap::value_parser!(u32).range(10..=120))]
     pub fps: Option<u32>,
@@ -100,9 +114,81 @@ pub struct Cli {
     /// Capture backend passed to the engine (for example `x11`, `wayland`, `macos`, `windows`).
     #[arg(long, requires = "engine_bin")]
     pub backend: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Enroll this workstation and save its private device credentials.
+    Join(Join),
+}
+
+pub(crate) struct DaemonCredentials {
+    pub hub: Url,
+    pub token: String,
+    pub device_token: bool,
 }
 
 impl Cli {
+    pub(crate) fn resolve(&mut self) -> Result<DaemonCredentials, Box<dyn std::error::Error>> {
+        let saved = if self.hub.is_some() && self.token.is_some() {
+            None
+        } else {
+            match config_path() {
+                Ok(path) => load(&path)?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            }
+        };
+        let mut from_disk = false;
+        if let Some(saved) = saved {
+            let saved_hub = parse_hub_url(&saved.hub_url)?;
+            if let Some(hub) = &self.hub {
+                if hub != &saved_hub && self.token.is_none() {
+                    return Err("an explicit --token is required for a different hub".into());
+                }
+            }
+            self.hub.get_or_insert(saved_hub);
+            if self.token.is_none() {
+                if !is_token(&saved.device_token) {
+                    return Err("invalid saved device credentials; run skylatch-agent join".into());
+                }
+                if self
+                    .device_id
+                    .as_ref()
+                    .is_some_and(|id| id != &saved.device_id)
+                {
+                    return Err(
+                        "a saved device token cannot be used for a different --device-id".into(),
+                    );
+                }
+                from_disk = true;
+                self.token = Some(saved.device_token);
+                self.device_id = Some(saved.device_id);
+            }
+            self.name = self.name.take().or(Some(saved.name));
+            self.room = self.room.take().or(saved.room);
+            self.slot = self.slot.or(saved.slot);
+        }
+        let hub = self
+            .hub
+            .take()
+            .ok_or("provide --hub or run skylatch-agent join")?;
+        let token = self
+            .token
+            .take()
+            .ok_or("provide --token or run skylatch-agent join")?;
+        if self.device_token && !is_token(&token) {
+            return Err("a device token must have 64 hex digits".into());
+        }
+        Ok(DaemonCredentials {
+            hub,
+            token,
+            device_token: from_disk || self.device_token,
+        })
+    }
+
     /// Device id, falling back to a sanitised hostname.
     pub fn resolved_device_id(&self) -> String {
         match &self.device_id {
@@ -133,7 +219,7 @@ impl Cli {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let h = gethostname::gethostname()
         .to_string_lossy()
         .trim()

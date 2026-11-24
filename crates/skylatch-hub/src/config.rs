@@ -1,5 +1,6 @@
 //! Hub configuration.
 
+use skylatch_proto::credentials::constant_time_eq;
 use std::time::Duration;
 
 /// Runtime configuration.
@@ -29,13 +30,6 @@ impl HubConfig {
         }
         found
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

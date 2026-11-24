@@ -114,7 +114,14 @@ impl EngineSource {
         let url = self.ensure_ready().await?;
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            match LocalLink::connect(&url, generation, events.clone()).await {
+            let connect = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                LocalLink::connect(&url, generation, events.clone()),
+            );
+            match connect
+                .await
+                .map_err(|_| EngineError::NotReady("WebSocket handshake timed out".into()))?
+            {
                 Ok(link) => return Ok(link),
                 Err(err) => {
                     if let Self::Spawn {
@@ -137,6 +144,7 @@ impl EngineSource {
 }
 
 fn stream_url(host: &str, port: Option<u16>) -> Result<Url, EngineError> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -233,15 +241,23 @@ impl LocalLink {
     }
 
     /// Sends a WebSocket close and tears the link down.
-    pub async fn close(self) {
-        let _ = self.tx.send(Message::Close(None)).await;
-        drop(self.tx);
+    pub async fn close(mut self) {
         self.reader.abort();
-        if tokio::time::timeout(Duration::from_secs(2), self.writer)
-            .await
-            .is_err()
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = self.tx.send(Message::Close(None)).await;
+            let _ = (&mut self.writer).await;
+        })
+        .await
+        .is_err()
         {
             tracing::debug!("engine link close timed out");
         }
+    }
+}
+
+impl Drop for LocalLink {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
     }
 }

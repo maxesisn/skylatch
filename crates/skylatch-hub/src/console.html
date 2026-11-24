@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Skylatch Hub</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --paper: #f6f2e8; --surface: #fdfaf2; --ink: #262923; --muted: #5e6156;
+  --rule: #cbc6b8; --accent: #385849; --accent-hover: #2a4337; --on-accent: #faf8ee;
+  --error: #943a2c; --measure: 68rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --paper: #20221e; --surface: #292b25; --ink: #f0ebdd; --muted: #c1beaf;
+    --rule: #525448; --accent: #a9c5a8; --accent-hover: #c8dcc1; --on-accent: #17271c; --error: #f1ae9e; }
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 1rem/1.55 system-ui, sans-serif; }
+header, main, footer { max-width: var(--measure); margin: auto; padding: 0 1.4rem; }
+header { display: flex; align-items: center; gap: .8rem; padding-top: 1.4rem; padding-bottom: 1.4rem; }
+.mark { width: 1.9rem; height: 1.9rem; flex: none; border: 1px solid; position: relative; color: var(--accent); }
+.mark::before { content: ''; position: absolute; inset: .35rem; border-top: 1px solid; border-left: 1px solid; }
+.mark::after { content: ''; position: absolute; inset: .7rem .35rem .35rem .7rem; border-bottom: 1px solid; border-right: 1px solid; }
+.brand { font: 600 1.2rem Georgia, serif; }
+.kicker, .label, th { font-size: .72rem; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); }
+.masthead { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: clamp(2rem, 8vw, 4rem) 0; }
+h1, h2, p { margin: 0; }
+h1, h2 { font-family: Georgia, serif; font-weight: 500; line-height: 1.08; }
+h1 { font-size: clamp(2.4rem, 8vw, 5rem); margin: .3rem 0 .7rem; letter-spacing: -.045em; }
+h2 { font-size: 1.8rem; margin-bottom: .7rem; }
+.muted { color: var(--muted); }
+.card { border: 1px solid var(--rule); padding: clamp(1rem, 4vw, 1.5rem); background: var(--surface); margin-top: 1.4rem; }
+.signin { max-width: 34rem; }
+form { display: grid; gap: .9rem; margin-top: 1rem; }
+label { display: grid; gap: .3rem; }
+input, button { border: 1px solid var(--rule); color: var(--ink); background: var(--surface); border-radius: .2rem; padding: .52rem .75rem; font: inherit; }
+input { min-width: 0; }
+button { cursor: pointer; font-weight: 650; width: fit-content; }
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: .55; cursor: wait; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.primary { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
+.primary:hover { background: var(--accent-hover); }
+.bar, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; }
+.bar { justify-content: space-between; margin: 1.4rem 0 .8rem; }
+.bar h2 { margin: 0; }
+.danger, .error { color: var(--error); }
+.error { margin-top: .8rem; min-height: 1.55em; }
+.error:empty { margin: 0; min-height: 0; }
+.scroll { overflow: auto; border: 1px solid var(--rule); background: var(--surface); }
+table { width: 100%; border-collapse: collapse; text-align: left; }
+th, td { padding: .65rem .9rem; vertical-align: top; }
+td { border-top: 1px solid var(--rule); }
+.device-id { display: block; font-size: .78rem; overflow-wrap: anywhere; }
+.code { display: block; color: var(--accent); font: 600 clamp(2rem, 7vw, 3rem) ui-monospace, monospace; letter-spacing: .1em; margin: .4rem 0; }
+.command { display: block; width: 100%; font: .85rem/1.5 ui-monospace, monospace; margin: .7rem 0; }
+details { border-top: 1px solid var(--rule); margin-top: 1.3rem; padding-top: .9rem; }
+summary { cursor: pointer; color: var(--accent); font-weight: 650; }
+footer { color: var(--muted); font-size: .82rem; padding-top: 1.5rem; padding-bottom: 1.5rem; }
+</style>
+</head>
+<body>
+<header><span class="mark" aria-hidden="true"></span><span class="brand">Skylatch</span><span class="kicker">Hub console</span></header>
+<main>
+  <div class="masthead"><p class="kicker">Device directory</p><h1>Your workstations</h1><p class="muted">See what’s online, connect a new machine, or revoke a device’s access.</p></div>
+  <section class="card signin" id="signin" aria-labelledby="signin-title">
+    <h2 id="signin-title">Sign in</h2>
+    <form id="credentials">
+      <label>Username <input name="username" autocomplete="username" required maxlength="128"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+      <button class="primary">Sign in</button>
+    </form>
+    <details><summary>Use an account token instead</summary>
+      <form id="token-form">
+        <label>Account token <input type="password" name="token" autocomplete="off" required></label>
+        <button>Sign in with token</button>
+      </form>
+    </details>
+  </section>
+  <section id="devices" aria-labelledby="devices-title" hidden>
+    <div class="bar"><h2 id="devices-title">Online devices</h2><div class="actions">
+      <button class="primary" id="add">+ Add Device</button><button id="refresh">Refresh</button><button id="logout">Sign out</button>
+    </div></div>
+    <section class="card" id="pairing" aria-labelledby="pairing-title" hidden>
+      <h2 id="pairing-title">Pair a new device</h2>
+      <p class="muted">Run the command on the new workstation. This code works once and expires in 10 minutes.</p>
+      <output class="code" id="code"></output>
+      <input class="command" id="command" aria-label="Device join command" readonly>
+      <button id="copy">Copy command</button> <span class="muted" id="copy-state" role="status"></span>
+    </section>
+    <p class="muted" id="empty" hidden>No workstations are online. Pair a device to get started.</p>
+    <div class="scroll" id="listing" hidden><table><thead><tr>
+      <th scope="col">Device</th><th scope="col">OS</th><th scope="col">Form</th><th scope="col">Monitors</th><th scope="col">Room</th><th scope="col">Access</th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+  </section>
+  <p id="message" class="error" role="alert"></p>
+</main>
+<footer>Skylatch Hub · Workstation access</footer>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+let token = '';
+let session = 0;
+let pairingTimer;
+const prefix = 'api/v1/';
+async function request(path, method = 'GET', body, bearer = token) {
+  const headers = {};
+  if (bearer) headers.Authorization = `Bearer ${bearer}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const res = await fetch(prefix + path, {method, headers, body: JSON.stringify(body), cache: 'no-store', redirect: 'error'});
+  if (res.status === 204) return;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+  return data;
+}
+function clearPairing() {
+  clearTimeout(pairingTimer);
+  $('pairing').hidden = true;
+  $('command').value = '';
+  $('code').textContent = '';
+  $('copy-state').textContent = '';
+}
+function draw(devices) {
+  $('rows').replaceChildren();
+  $('empty').hidden = devices.length !== 0;
+  $('listing').hidden = devices.length === 0;
+  for (const device of devices) {
+    const row = $('rows').insertRow();
+    const name = document.createElement('strong');
+    name.textContent = device.name;
+    const id = document.createElement('span');
+    id.className = 'muted device-id';
+    id.textContent = device.device_id;
+    row.insertCell().append(name, id);
+    for (const value of [device.os, device.form_factor, device.monitors, device.room || '—']) {
+      row.insertCell().textContent = value;
+    }
+    const revoke = document.createElement('button');
+    revoke.className = 'danger';
+    revoke.textContent = 'Revoke';
+    revoke.setAttribute('aria-label', `Revoke ${device.name}`);
+    revoke.addEventListener('click', () => {
+      if (!confirm(`Revoke the device token for ${device.name}? The device will need to enroll again.`)) return;
+      act(revoke, async () => {
+        await request(`devices/${encodeURIComponent(device.device_id)}/token`, 'DELETE');
+        if (token) await refresh();
+      });
+    });
+    row.insertCell().append(revoke);
+  }
+}
+async function act(button, action) {
+  const accountSession = session;
+  button.disabled = true;
+  $('message').textContent = '';
+  try { await action(); }
+  catch (err) { if (accountSession === session) $('message').textContent = err.message; }
+  finally { button.disabled = false; }
+}
+async function signin(value) {
+  const {devices} = await request('devices', 'GET', undefined, value);
+  token = value;
+  session++;
+  draw(devices);
+  $('signin').hidden = true;
+  $('devices').hidden = false;
+  $('add').focus();
+}
+$('credentials').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const fields = event.currentTarget.elements;
+  act(event.submitter, async () => {
+    const login = request('login', 'POST', {username: fields.username.value, password: fields.password.value}, '');
+    fields.password.value = '';
+    await signin((await login).token);
+  });
+});
+$('token-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const field = event.currentTarget.elements.token;
+  act(event.submitter, async () => { const value = field.value.trim(); field.value = ''; await signin(value); });
+});
+$('add').addEventListener('click', () => act($('add'), async () => {
+  const accountSession = session;
+  const result = await request('pairing-codes', 'POST');
+  if (accountSession !== session) return;
+  clearPairing();
+  $('code').textContent = result.code;
+  $('command').value = `skylatch-agent join "${location.origin}" --code ${result.code}`;
+  $('pairing').hidden = false;
+  $('copy').focus();
+  pairingTimer = setTimeout(clearPairing, result.expires_in_secs * 1000);
+}));
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('command').value); $('copy-state').textContent = 'Copied.'; }
+  catch (_) { $('command').focus(); $('command').select(); $('copy-state').textContent = 'Command selected. Copy it with your keyboard.'; }
+});
+async function refresh() {
+  const accountSession = session;
+  const {devices} = await request('devices');
+  if (accountSession === session) draw(devices);
+}
+$('refresh').addEventListener('click', () => act($('refresh'), refresh));
+$('logout').addEventListener('click', () => {
+  token = '';
+  session++;
+  $('rows').replaceChildren();
+  $('devices').hidden = true;
+  $('signin').hidden = false;
+  $('message').textContent = '';
+  clearPairing();
+  $('credentials').elements.username.focus();
+});
+</script>
+</body>
+</html>

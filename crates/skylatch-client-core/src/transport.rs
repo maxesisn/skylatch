@@ -91,7 +91,7 @@ async fn connect_socket(request: Request) -> Result<(Socket, Response), ClientEr
     Ok(connect_async_tls_with_config(request, Some(ws_config()), true, Some(connector)).await?)
 }
 
-fn parse_base(url: &str, accept_http: bool) -> Result<(&'static str, Uri), ClientError> {
+pub(crate) fn parse_base(url: &str, accept_http: bool) -> Result<(&'static str, Uri), ClientError> {
     let uri: Uri = url.parse().map_err(|_| ClientError::InvalidUrl)?;
     let scheme = match uri.scheme_str() {
         Some("ws") => "ws",
@@ -264,7 +264,7 @@ fn direct_request(url: &str, token: Option<&str>) -> Result<Request, ClientError
     Ok(request)
 }
 
-fn endpoint_request(endpoint: &DirectEndpoint) -> Option<Request> {
+fn endpoint_request(endpoint: &DirectEndpoint, ticket: Option<&str>) -> Option<Request> {
     let host = endpoint.host.trim_start_matches('[').trim_end_matches(']');
     let host = if let Ok(ip) = host.parse::<Ipv6Addr>() {
         format!("[{ip}]")
@@ -278,8 +278,8 @@ fn endpoint_request(endpoint: &DirectEndpoint) -> Option<Request> {
     } else {
         return None;
     };
-    // Hints carry only addresses. Never forward the hub account token to a direct host.
-    direct_request(&format!("ws://{host}:{}", endpoint.port), None).ok()
+    // Only the short-lived, device-scoped ticket may leave the hub control path.
+    direct_request(&format!("ws://{host}:{}", endpoint.port), ticket).ok()
 }
 
 pub(crate) async fn open_direct(url: &str, token: Option<&str>) -> Result<Socket, ClientError> {
@@ -304,9 +304,14 @@ fn verify_direct_protocol(headers: &HeaderMap) -> Result<(), ClientError> {
     }
 }
 
-pub(crate) async fn probe_direct(endpoints: &[DirectEndpoint]) -> Option<Socket> {
+pub(crate) async fn probe_direct(
+    endpoints: &[DirectEndpoint],
+    ticket: Option<&str>,
+) -> Option<Socket> {
     timeout(FAST_PATH_TIMEOUT, async {
-        let mut requests = endpoints.iter().filter_map(endpoint_request);
+        let mut requests = endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint_request(endpoint, ticket));
         let mut probes = JoinSet::new();
         for request in requests.by_ref().take(PROBE_CONCURRENCY) {
             probes.spawn(tcp_probe(request));
