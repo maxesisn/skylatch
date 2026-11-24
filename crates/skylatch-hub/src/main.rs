@@ -1,5 +1,5 @@
 use clap::Parser;
-use skylatch_hub::{router, AppState, HubConfig};
+use skylatch_hub::{router, AppState, HubConfig, HubMode};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,6 +34,10 @@ struct Args {
     /// Heartbeat interval announced to hosts, in seconds.
     #[arg(long, env = "SKYLATCH_HEARTBEAT_SECS", default_value_t = 15)]
     heartbeat_secs: u64,
+
+    /// `relay` carries session traffic through the hub; `signaling-only` only issues direct-connect credentials and hints.
+    #[arg(long, env = "SKYLATCH_HUB_MODE", default_value = "relay")]
+    mode: HubMode,
 }
 
 fn parse_account(s: &str) -> Result<(String, String), String> {
@@ -85,9 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut config = HubConfig::new(accounts);
     config.heartbeat_interval = Duration::from_secs(args.heartbeat_secs.max(1));
+    config.mode = args.mode;
     let state = AppState::with_auth(config, args.state_file, users)?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!(addr = %listener.local_addr()?, "skylatch-hub listening");
+    tracing::info!(addr = %listener.local_addr()?, mode = args.mode.as_str(), "skylatch-hub listening");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

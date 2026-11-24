@@ -118,6 +118,8 @@ impl Hub {
             room: None,
             slot: None,
             hardware_model: None,
+            online: true,
+            last_seen_unix: None,
         };
         socket
             .send(Message::Text(

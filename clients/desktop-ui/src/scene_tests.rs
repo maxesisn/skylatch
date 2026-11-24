@@ -55,6 +55,8 @@ fn info(
         room: room.map(String::from),
         slot,
         hardware_model: None,
+        online: true,
+        last_seen_unix: None,
     }
 }
 

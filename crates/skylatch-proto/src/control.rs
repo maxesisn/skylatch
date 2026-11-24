@@ -62,6 +62,16 @@ pub struct DeviceInfo {
     /// Human-readable hardware model, e.g. `Mac mini (Apple M4)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_model: Option<String>,
+    /// False when the hub is reporting the last known snapshot of a disconnected host.
+    #[serde(default = "default_true")]
+    pub online: bool,
+    /// Unix seconds of the host's last registration, update or disconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_unix: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Messages a host sends to the hub.
@@ -203,6 +213,8 @@ mod tests {
             room: Some("Office".into()),
             slot: Some(3),
             hardware_model: Some("Mac mini (Apple M4)".into()),
+            online: true,
+            last_seen_unix: None,
             direct_endpoints: vec![DirectEndpoint {
                 kind: EndpointKind::Lan,
                 host: "192.0.2.20".into(),
@@ -211,7 +223,7 @@ mod tests {
         }
     }
 
-    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":1,"direct_endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}],"form_factor":"mini","monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}],"room":"Office","slot":3,"hardware_model":"Mac mini (Apple M4)"}"#;
+    const DEVICE_JSON: &str = r#"{"device_id":"d1","name":"Studio","os":"macos","host_version":"0.1.0","monitors":1,"direct_endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}],"form_factor":"mini","monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}],"room":"Office","slot":3,"hardware_model":"Mac mini (Apple M4)","online":true}"#;
 
     #[test]
     fn device_info_roundtrip() {
@@ -231,6 +243,22 @@ mod tests {
         assert_eq!(d.room, None);
         assert_eq!(d.slot, None);
         assert_eq!(d.hardware_model, None);
+        assert!(d.online);
+        assert_eq!(d.last_seen_unix, None);
+    }
+
+    #[test]
+    fn offline_snapshot_roundtrips_and_old_clients_can_ignore_new_fields() {
+        let mut d = device();
+        d.online = false;
+        d.last_seen_unix = Some(1_700_000_000);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["online"], false);
+        assert_eq!(v["last_seen_unix"], 1_700_000_000u64);
+        assert_eq!(serde_json::from_value::<DeviceInfo>(v).unwrap(), d);
+        let online = serde_json::to_value(device()).unwrap();
+        assert_eq!(online["online"], true);
+        assert!(online.get("last_seen_unix").is_none());
     }
 
     #[test]

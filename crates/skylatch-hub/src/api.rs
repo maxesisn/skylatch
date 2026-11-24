@@ -39,6 +39,11 @@ impl IntoResponse for AuthError {
                 "device already enrolled; revoke its token first",
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "device or credential not found"),
+            Self::Offline => (StatusCode::CONFLICT, "device_offline"),
+            Self::Online => (
+                StatusCode::CONFLICT,
+                "device is online; revoke its token to disconnect it",
+            ),
             Self::Limited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many attempts; try again shortly",
@@ -128,6 +133,21 @@ pub(crate) async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) async fn delete_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<StatusCode, AuthError> {
+    let account = account(&state, &headers)?;
+    blocking(move || {
+        state
+            .auth
+            .delete_offline(&state.registry, &account, &device_id)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(crate) async fn direct_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -137,7 +157,15 @@ pub(crate) async fn direct_session(
     let (key, endpoints) = state
         .registry
         .direct_access(&account, &request.device_id)
-        .ok_or(AuthError::NotFound)?;
+        .ok_or_else(|| {
+            if state.registry.info(&account, &request.device_id).is_none()
+                && state.auth.is_known(&account, &request.device_id)
+            {
+                AuthError::Offline
+            } else {
+                AuthError::NotFound
+            }
+        })?;
     Ok(secret(DirectTicketResponse {
         ticket: direct_ticket(&key)?,
         endpoints,

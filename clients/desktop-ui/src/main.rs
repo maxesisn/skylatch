@@ -1437,7 +1437,8 @@ impl Proto {
 
     /// Applies a device list and, when given, the arrangement fetched with it. A fetched
     /// arrangement is ignored while one of ours is still on its way to the hub or being dragged.
-    fn apply_state(&mut self, devs: Vec<DeviceInfo>, layout: Option<WorkspaceLayout>) {
+    fn apply_state(&mut self, mut devs: Vec<DeviceInfo>, layout: Option<WorkspaceLayout>) {
+        devs.retain(|d| d.online);
         let local_changed = self.refresh_local_id();
         let layout_changed = layout.is_some_and(|l| {
             let busy = self.save.inflight.is_some() || self.save.dirty || self.drag.is_some();
@@ -5091,6 +5092,8 @@ mod ui_tests {
             room: Some(room.into()),
             slot: Some(slot),
             hardware_model: None,
+            online: true,
+            last_seen_unix: None,
         }
     }
 
