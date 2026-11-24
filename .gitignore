@@ -35,6 +35,10 @@ xcuserdata/
 *.obj
 *.pdb
 *.exe
+/clients/windows/skylatch-client.exe
+/clients/windows/*.dll
+/clients/windows/*.obj
+/clients/windows/*.pdb
 
 # Secrets and local config
 .env
