@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     if (!relay::parseConfig(argc, argv, config)) return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 2; }
   const auto& backend = relay::backendFor(config.backend);
-  if (!backend.initialize(config.output, config.fps)) { std::cerr << "Native backend initialization failed\n"; return 1; }
+  if (!backend.initialize(config.output, config.fps, {config.max_dimension, config.capture})) { std::cerr << "Native backend initialization failed\n"; return 1; }
   if (config.check) return 0;
   std::signal(SIGINT, signalStop); std::signal(SIGTERM, signalStop);
   relay::Server s(config);

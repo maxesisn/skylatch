@@ -1,4 +1,5 @@
 #include "backends/macos/display.hpp"
+#include "core/backend-options.hpp"
 #include "core/capture-source.hpp"
 #include "core/surface-budget.hpp"
 #include <charconv>
@@ -14,6 +15,7 @@ namespace macos {
 namespace {
 std::string chosen;
 unsigned target_fps = 60;
+int max_dimension = SurfaceBudget::default_max_dimension;
 }
 Display findDisplay() {
   uint32_t count = 0;
@@ -41,11 +43,12 @@ Display findDisplay() {
         height = int(CGDisplayModeGetPixelHeight(mode));
         CGDisplayModeRelease(mode);
       }
-      const SurfacePlan plan = planSurface(width, height, SurfaceBudget::forFps(target_fps), SurfaceScaleMode::exact);
+      const SurfacePlan plan = planSurface(width, height, SurfaceBudget::forFps(target_fps, max_dimension), SurfaceScaleMode::exact);
       if (!plan.ok()) {
         throw std::runtime_error("Unsupported display size " + std::to_string(width) + "x" +
-                                 std::to_string(height) + " for H.264 level 5.2 at " +
-                                 std::to_string(target_fps) + " fps");
+                                 std::to_string(height) + " for H.264 at " +
+                                 std::to_string(target_fps) + " fps and max dimension " +
+                                 std::to_string(max_dimension));
       }
       return {id, bounds, width, height, plan.stream_width, plan.stream_height};
     }
@@ -55,9 +58,10 @@ Display findDisplay() {
                            "; online displays: " + names);
 }
 /// Checks screen capture and event posting permissions, requests each missing one once, and validates --output.
-bool initializeNativeBackend(const std::string& output, unsigned fps) {
+bool initializeNativeBackend(const std::string& output, unsigned fps, const BackendOptions& options) {
   chosen = output;
   target_fps = fps ? fps : 60u;
+  max_dimension = options.max_dimension;
   const bool screen = CGPreflightScreenCaptureAccess();
   const bool input = CGPreflightPostEventAccess();
   if (!screen) {

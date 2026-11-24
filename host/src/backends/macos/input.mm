@@ -38,8 +38,11 @@ constexpr CGEventFlags modifierFlag(NativeKey key) {
 }
 /// Applies queued input as CGEvents on one thread that owns a private event source.
 class MacInput final : public InputBackend {
-  CGRect bounds{};
-  uint16_t width = 0, height = 0;
+  /// The display geometry, re-read from the system a few times a second so a resized display keeps pointer mapping right.
+  struct Geometry { CGRect bounds{}; uint16_t width = 0, height = 0; };
+  mutable Geometry geometry_;
+  mutable std::chrono::steady_clock::time_point geometryChecked{};
+  mutable std::mutex geometryMutex;
   CGEventSourceRef source = nullptr;
   CGPoint position{}, clickPoint{};
   std::set<NativeKey> held;
@@ -57,10 +60,9 @@ class MacInput final : public InputBackend {
  public:
   MacInput() {
     const auto display = macos::findDisplay();
-    bounds = display.bounds;
-    width = uint16_t(display.width);
-    height = uint16_t(display.height);
-    position = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+    geometry_ = {display.bounds, uint16_t(display.width), uint16_t(display.height)};
+    geometryChecked = std::chrono::steady_clock::now();
+    position = CGPointMake(CGRectGetMidX(display.bounds), CGRectGetMidY(display.bounds));
     capsLock = (CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & kCGEventFlagMaskAlphaShift) != 0;
     clickInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>([NSEvent doubleClickInterval]));
@@ -71,7 +73,10 @@ class MacInput final : public InputBackend {
     wake.notify_all();
     if (worker.joinable()) worker.join();
   }
-  std::pair<uint16_t, uint16_t> dimensions() const override { return {width, height}; }
+  std::pair<uint16_t, uint16_t> dimensions() const override {
+    const Geometry now = geometry();
+    return {now.width, now.height};
+  }
   const char* name() const override { return "macos"; }
   std::optional<NativeKey> nativeKey(uint16_t usage) const override {
     const int key = macos::macKey(hidKeycode(usage));
@@ -258,9 +263,22 @@ class MacInput final : public InputBackend {
     }
     while (!heldButtons.empty()) applyButton(heldButtons.begin()->first, false, flags());
   }
+  Geometry geometry() const {
+    std::lock_guard<std::mutex> lock(geometryMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - geometryChecked >= std::chrono::milliseconds(250)) {
+      geometryChecked = now;
+      try {
+        const auto display = macos::findDisplay();
+        geometry_ = {display.bounds, uint16_t(display.width), uint16_t(display.height)};
+      } catch (const std::exception&) {}  // keep the last known geometry while the display is briefly unavailable
+    }
+    return geometry_;
+  }
   CGPoint globalPoint(int x, int y) const {
-    return CGPointMake(bounds.origin.x + (x + 0.5) * bounds.size.width / std::max(1, int(width)),
-                       bounds.origin.y + (y + 0.5) * bounds.size.height / std::max(1, int(height)));
+    const Geometry now = geometry();
+    return CGPointMake(now.bounds.origin.x + (x + 0.5) * now.bounds.size.width / std::max(1, int(now.width)),
+                       now.bounds.origin.y + (y + 0.5) * now.bounds.size.height / std::max(1, int(now.height)));
   }
   CGEventType motionType() const {
     if (heldButtons.count(1)) return kCGEventLeftMouseDragged;

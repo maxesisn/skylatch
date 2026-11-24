@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/backend-options.hpp"
 #include <libwebsockets.h>
 #include <chrono>
 #include <cstdint>
@@ -12,6 +13,10 @@ struct Config {
   std::string bind = "127.0.0.1", viewer, token, origin, authority, cert, key, backend, output;
   unsigned port = 8080;
   unsigned fps = 60;
+  /// Longest stream axis in pixels; larger displays are scaled down.
+  int max_dimension = SurfaceBudget::default_max_dimension;
+  /// Windows capture API selection; other backends ignore it.
+  CaptureMode capture = CaptureMode::automatic;
   uint64_t bitrate_min = 1000000, bitrate_start = 8000000, bitrate_max = 40000000;
   bool proxy = false, insecure_local = false, check = false, no_viewer = false;
   std::vector<std::string> allowed_origins;

@@ -3,6 +3,7 @@
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
+#include "core/backend-options.hpp"
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -56,5 +57,5 @@ struct Connection {
   void cleanup();
 };
 
-bool initializeNativeBackend(const std::string& output, unsigned fps);
+bool initializeNativeBackend(const std::string& output, unsigned fps, const BackendOptions& options);
 }

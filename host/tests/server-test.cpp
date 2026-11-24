@@ -308,6 +308,20 @@ int main() {
   assert(engineConfig({"--fps", "120"}, engine) && engine.fps == 120);
   assert(!engineConfig({"--fps", "9"}, engine) && !engineConfig({"--fps", "121"}, engine));
   assert(!engineConfig({"--fps", "-1"}, engine) && !engineConfig({"--fps", "30x"}, engine));
+  assert(engineConfig({}, engine) && engine.max_dimension == 4096 && engine.capture == CaptureMode::automatic);
+  assert(engineConfig({"--max-dimension", "8192"}, engine) && engine.max_dimension == 8192);
+  assert(engineConfig({"--max-dimension", "5120"}, engine) && engine.max_dimension == 5120);
+  assert(engineConfig({"--max-dimension", "640"}, engine) && engine.max_dimension == 640);
+  assert(!engineConfig({"--max-dimension", "639"}, engine) && !engineConfig({"--max-dimension", "8193"}, engine));
+  assert(!engineConfig({"--max-dimension", "-1"}, engine) && !engineConfig({"--max-dimension", "4k"}, engine, &error));
+  assert(error == "Max dimension must be an integer from 640 to 8192");
+  assert(!engineConfig({"--max-dimension"}, engine, &error) && error == "Missing value for --max-dimension");
+  assert(engineConfig({"--capture", "auto"}, engine) && engine.capture == CaptureMode::automatic);
+  assert(engineConfig({"--capture", "dxgi"}, engine) && engine.capture == CaptureMode::dxgi);
+  assert(engineConfig({"--capture", "gdi", "--max-dimension", "6000"}, engine) &&
+         engine.capture == CaptureMode::gdi && engine.max_dimension == 6000);
+  assert(!engineConfig({"--capture", "vnc"}, engine, &error) && error == "Capture must be auto, dxgi or gdi");
+  assert(!engineConfig({"--capture"}, engine, &error) && error == "Missing value for --capture");
   assert(engineConfig({"--bitrate-min", "250000", "--bitrate-start", "250000", "--bitrate-max", "100000000"}, engine));
   assert(engine.bitrate_min == 250000 && engine.bitrate_start == 250000 && engine.bitrate_max == 100000000);
   assert(engineConfig({"--bitrate-start", "15000000", "--bitrate-max", "20000000"}, engine));

@@ -13,11 +13,16 @@
 
 namespace relay {
 
-/** CaptureSource decorator that scales oversized or odd-dimensioned frames into a SurfacePlan budget. */
+/**
+ * CaptureSource decorator that scales oversized or odd-dimensioned frames into a SurfacePlan budget. When the inner
+ * source changes size it plans again against the same budget, so dimensions() may change between captures.
+ */
 class ScaledCaptureSource final : public CaptureSource {
  public:
-  ScaledCaptureSource(std::unique_ptr<CaptureSource> inner, const SurfacePlan& plan)
-      : inner_(std::move(inner)),
+  ScaledCaptureSource(std::unique_ptr<CaptureSource> inner, const SurfacePlan& plan,
+                      const SurfaceBudget& budget = SurfaceBudget::forFps(60))
+      : budget_(budget),
+        inner_(std::move(inner)),
         src_width_(plan.source_width),
         src_height_(plan.source_height),
         dst_width_(plan.stream_width),
@@ -29,7 +34,10 @@ class ScaledCaptureSource final : public CaptureSource {
 
   WaitHandle fd() const override { return inner_->fd(); }
   std::pair<int, int> dimensions() const override { return {dst_width_, dst_height_}; }
-  bool drainDamage() override { return inner_->drainDamage(); }
+  bool drainDamage() override {
+    follow();
+    return inner_->drainDamage();
+  }
   PixelFormat pixelFormat() const override { return format_; }
   bool cursorSupported() const override { return inner_->cursorSupported(); }
 
@@ -53,6 +61,8 @@ class ScaledCaptureSource final : public CaptureSource {
   }
 
   FrameView capture() override {
+    follow();
+    if (!unsupported_.empty()) throw std::runtime_error(unsupported_);
     const FrameView view = inner_->capture();
     validateSourceView(view, true);
     if (state_ == SourceState::shadowed) state_ = SourceState::direct;
@@ -62,6 +72,8 @@ class ScaledCaptureSource final : public CaptureSource {
   }
 
   FrameView captureChanged(bool full) override {
+    follow();
+    if (!unsupported_.empty()) throw std::runtime_error(unsupported_);
     const bool need_full = full || state_ == SourceState::awaiting_full;
     const FrameView view = inner_->captureChanged(need_full);
     validateSourceView(view, need_full);
@@ -111,6 +123,27 @@ class ScaledCaptureSource final : public CaptureSource {
   /** Source pixels the scaler reads: none yet (next capture must be full), full views direct from the source, or a full-resolution shadow kept current from partial views. */
   enum class SourceState : uint8_t { awaiting_full, direct, shadowed };
 
+  /** Plans again when the inner source has changed size, discarding every buffer tied to the old size. */
+  void follow() {
+    const auto size = inner_->dimensions();
+    if (size.first == src_width_ && size.second == src_height_) return;
+    const SurfacePlan plan = planSurface(size.first, size.second, budget_, SurfaceScaleMode::exact);
+    if (!plan.ok()) {
+      unsupported_ = "Unsupported root size " + std::to_string(size.first) + "x" + std::to_string(size.second);
+      return;
+    }
+    unsupported_.clear();
+    src_width_ = plan.source_width;
+    src_height_ = plan.source_height;
+    dst_width_ = plan.stream_width;
+    dst_height_ = plan.stream_height;
+    table_.build(src_width_, src_height_, dst_width_, dst_height_);
+    dst_buffer_.assign(size_t(dst_width_) * size_t(dst_height_) * 4u, 0);
+    src_shadow_.clear();
+    state_ = SourceState::awaiting_full;
+    report_.reset();
+  }
+
   FrameView streamView() const { return {dst_buffer_.data(), dst_width_ * 4, dst_width_, dst_height_, format_, 0, 0}; }
 
   void scaleInto(const uint8_t* src, int src_stride, const DamageRect& rect) {
@@ -152,6 +185,8 @@ class ScaledCaptureSource final : public CaptureSource {
     }
   }
 
+  SurfaceBudget budget_;
+  std::string unsupported_;
   std::unique_ptr<CaptureSource> inner_;
   int src_width_ = 0;
   int src_height_ = 0;
@@ -165,21 +200,23 @@ class ScaledCaptureSource final : public CaptureSource {
   std::optional<std::vector<DamageRect>> report_;
 };
 
-/** Wraps source with ScaledCaptureSource only when its dimensions exceed the H.264 Level 5.2 budget for fps. */
+/** Wraps source with ScaledCaptureSource only when its dimensions exceed the H.264 budget for fps and max_dimension. */
 inline std::unique_ptr<CaptureSource> fitCaptureSourceToBudget(std::unique_ptr<CaptureSource> source,
-                                                               unsigned fps, SurfacePlan* out_plan = nullptr) {
+                                                               unsigned fps, SurfacePlan* out_plan = nullptr,
+                                                               int max_dimension = SurfaceBudget::default_max_dimension) {
   if (!source) throw std::runtime_error("capture source unavailable");
   const auto dims = source->dimensions();
-  const SurfaceBudget budget = SurfaceBudget::forFps(fps);
+  const SurfaceBudget budget = SurfaceBudget::forFps(fps, max_dimension);
   const SurfacePlan plan = planSurface(dims.first, dims.second, budget, SurfaceScaleMode::exact);
   if (out_plan) *out_plan = plan;
   if (!plan.ok()) {
     throw std::runtime_error("Unsupported root size " + std::to_string(dims.first) + "x" +
-                             std::to_string(dims.second) + " for H.264 level 5.2 at " +
+                             std::to_string(dims.second) + " for H.264 level " + std::to_string(budget.max_h264_level_idc / 10) + "." +
+                             std::to_string(budget.max_h264_level_idc % 10) + " at " +
                              std::to_string(budget.fps) + " fps");
   }
   if (!plan.scaled()) return source;
-  return std::make_unique<ScaledCaptureSource>(std::move(source), plan);
+  return std::make_unique<ScaledCaptureSource>(std::move(source), plan, budget);
 }
 
 }  // namespace relay

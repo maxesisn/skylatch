@@ -2,6 +2,7 @@
 #include "backends/linux/keycodes.hpp"
 #include "backends/windows/output.hpp"
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <set>
@@ -46,9 +47,17 @@ INPUT keyInput(NativeKey key, bool press) {
 }
 /// Applies queued input with SendInput on one thread attached to the active input desktop.
 class WindowsInput final : public InputBackend {
-  RECT bounds{};
-  int desktopWidth = 0, desktopHeight = 0;
-  uint16_t width = 0, height = 0;
+  using Clock = std::chrono::steady_clock;
+  /// Where the streamed display sits on the desktop and how large its stream is, re-read a few times a second so a
+  /// resized display keeps pointer mapping right. Comes from DXGI, or from GDI when the session has no DXGI output.
+  struct Geometry {
+    RECT bounds{};
+    int desktopWidth = 0, desktopHeight = 0;
+    uint16_t width = 0, height = 0;
+  };
+  mutable Geometry geometry_;
+  mutable Clock::time_point geometryChecked{};
+  mutable std::mutex geometryMutex;
   std::set<NativeKey> held;
   mutable std::mutex mutex;
   std::condition_variable wake;
@@ -58,13 +67,8 @@ class WindowsInput final : public InputBackend {
 
  public:
   WindowsInput() {
-    const auto display = windows::findOutput();
-    bounds = display.bounds;
-    desktopWidth = display.width();
-    desktopHeight = display.height();
-    const auto size = display.streamSize();
-    width = uint16_t(size.first);
-    height = uint16_t(size.second);
+    geometry_ = readGeometry();
+    geometryChecked = Clock::now();
     worker = std::thread([this] { run(); });
   }
   ~WindowsInput() override {
@@ -72,7 +76,10 @@ class WindowsInput final : public InputBackend {
     wake.notify_all();
     if (worker.joinable()) worker.join();
   }
-  std::pair<uint16_t, uint16_t> dimensions() const override { return {width, height}; }
+  std::pair<uint16_t, uint16_t> dimensions() const override {
+    const Geometry now = geometry();
+    return {now.width, now.height};
+  }
   const char* name() const override { return "windows"; }
   std::optional<NativeKey> nativeKey(uint16_t usage) const override {
     const NativeKey key = scanCode(hidKeycode(usage));
@@ -117,6 +124,26 @@ class WindowsInput final : public InputBackend {
   }
 
  private:
+  static Geometry readGeometry() {
+    const auto display = windows::findGeometry();
+    Geometry geometry;
+    geometry.bounds = display.bounds;
+    geometry.desktopWidth = display.width();
+    geometry.desktopHeight = display.height();
+    const auto size = display.streamSize();
+    geometry.width = uint16_t(size.first);
+    geometry.height = uint16_t(size.second);
+    return geometry;
+  }
+  Geometry geometry() const {
+    std::lock_guard<std::mutex> lock(geometryMutex);
+    const auto now = Clock::now();
+    if (now - geometryChecked >= std::chrono::milliseconds(250)) {
+      geometryChecked = now;
+      try { geometry_ = readGeometry(); } catch (const std::exception&) {}  // keep the last known geometry while the display is briefly unavailable
+    }
+    return geometry_;
+  }
   void postKey(NativeKey key, bool press) {
     InputJob job{InputJob::Kind::key};
     job.code = key; job.press = press;
@@ -254,13 +281,14 @@ class WindowsInput final : public InputBackend {
     return input;
   }
   INPUT motion(int x, int y) {
+    const Geometry display = geometry();
     const int left = GetSystemMetrics(SM_XVIRTUALSCREEN), top = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int spanX = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
     const int spanY = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
     INPUT input{};
     input.type = INPUT_MOUSE;
-    const int64_t px = bounds.left + (int64_t(2 * x + 1) * desktopWidth) / (2 * width) - left;
-    const int64_t py = bounds.top + (int64_t(2 * y + 1) * desktopHeight) / (2 * height) - top;
+    const int64_t px = display.bounds.left + (int64_t(2 * x + 1) * display.desktopWidth) / (2 * std::max<int>(1, display.width)) - left;
+    const int64_t py = display.bounds.top + (int64_t(2 * y + 1) * display.desktopHeight) / (2 * std::max<int>(1, display.height)) - top;
     input.mi.dx = LONG((px * 65535 + spanX / 2) / spanX);
     input.mi.dy = LONG((py * 65535 + spanY / 2) / spanY);
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;

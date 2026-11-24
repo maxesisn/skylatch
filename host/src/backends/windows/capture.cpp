@@ -1,10 +1,14 @@
 #include "core/capture-source.hpp"
+#include "backends/windows/cursor.hpp"
+#include "backends/windows/gdi-capture.hpp"
+#include "backends/windows/hub-capture.hpp"
 #include "backends/windows/output.hpp"
 #include <d3d11.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -18,8 +22,6 @@
 namespace relay {
 namespace {
 using Microsoft::WRL::ComPtr;
-/// Damage rectangles a source holds before it treats the next capture as a full frame.
-constexpr size_t max_pending_rects = 256;
 /// Converts a duplication pointer shape to straight-alpha RGBA, box-filtered down to the stream's scale.
 CursorImage cursorImage(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info, const std::vector<uint8_t>& data, int level) {
   const bool mono = info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
@@ -42,35 +44,14 @@ CursorImage cursorImage(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info, const std::
       out[0] = in[2]; out[1] = in[1]; out[2] = in[0];
       out[3] = masked ? (in[3] ? (in[0] | in[1] | in[2] ? 255 : 0) : 255) : in[3];
     }
-  const int factor = 1 << level;
-  const int sw = std::min<int>(CursorImage::max_extent, std::max(1, w / factor));
-  const int sh = std::min<int>(CursorImage::max_extent, std::max(1, h / factor));
-  CursorImage image;
-  image.width = uint16_t(sw); image.height = uint16_t(sh);
-  image.xhot = uint16_t(std::min(sw - 1, int(info.HotSpot.x) / factor));
-  image.yhot = uint16_t(std::min(sh - 1, int(info.HotSpot.y) / factor));
-  image.rgba.assign(size_t(sw) * sh * 4, 0);
-  for (int y = 0; y < sh; ++y)
-    for (int x = 0; x < sw; ++x) {
-      unsigned sum[4] = {}, count = 0;
-      for (int dy = 0; dy < factor && y * factor + dy < h; ++dy)
-        for (int dx = 0; dx < factor && x * factor + dx < w; ++dx) {
-          const uint8_t* p = full.data() + (size_t(y * factor + dy) * w + x * factor + dx) * 4;
-          for (int c = 0; c < 3; ++c) sum[c] += p[c] * p[3];
-          sum[3] += p[3]; ++count;
-        }
-      uint8_t* out = image.rgba.data() + (size_t(y) * sw + x) * 4;
-      for (int c = 0; c < 3; ++c) out[c] = uint8_t(sum[3] ? sum[c] / sum[3] : 0);
-      out[3] = uint8_t(count ? sum[3] / count : 0);
-    }
-  return image;
+  return windows::scaleCursor(full, w, h, int(info.HotSpot.x), int(info.HotSpot.y), level);
 }
-class WindowsCapture;
+class Duplicator;
+using WindowsCapture = windows::HubCapture<Duplicator>;
 /// Owns the one Desktop Duplication a process may hold for a display and fans its frames out to every capture source.
 class Duplicator {
  public:
   windows::Output display;
-  int width = 0, height = 0;
 
   static std::shared_ptr<Duplicator> shared() {
     static std::mutex lock;
@@ -85,27 +66,8 @@ class Duplicator {
     return !failure.empty();
   }
   Duplicator() : display(windows::findOutput()) {
-    level = display.level();
-    std::tie(width, height) = display.streamSize();
-    requireSurfaceSize(width, height);
-    windows::check(D3D11CreateDevice(display.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                     D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
-                                     &device, nullptr, &context), "creating the Direct3D device");
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = UINT(width); desc.Height = UINT(height); desc.MipLevels = 1; desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    windows::check(device->CreateTexture2D(&desc, nullptr, &staging), "creating the readback texture");
-    if (level) {
-      desc.Width = UINT(display.width()); desc.Height = UINT(display.height()); desc.MipLevels = UINT(level + 1);
-      desc.Usage = D3D11_USAGE_DEFAULT; desc.CPUAccessFlags = 0;
-      desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-      desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-      windows::check(device->CreateTexture2D(&desc, nullptr, &mips), "creating the scaling texture");
-      windows::check(device->CreateShaderResourceView(mips.Get(), nullptr, &mipView), "creating the scaling view");
-    }
+    build();
     duplicate();
-    image.assign(size_t(width) * height * 4, 0);
     worker = std::thread([this] { run(); });
   }
   ~Duplicator() {
@@ -119,30 +81,37 @@ class Duplicator {
     std::unique_lock<std::mutex> lock(mutex);
     arrived.wait_for(lock, timeout, [this] { return haveFrame || !failure.empty(); });
   }
-  /// Copies the latest image into target, entirely or only inside rects.
-  void copy(std::vector<uint8_t>& target, const std::vector<DamageRect>* rects) {
+  /// The current stream size, which changes when the display is resized.
+  std::pair<int, int> size() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return {width, height};
+  }
+  /// Copies the latest image into target, entirely or only inside rects. When the display was resized since the
+  /// caller's width and height, copies the whole new image, updates them, and returns true.
+  bool copy(std::vector<uint8_t>& target, int& callerWidth, int& callerHeight, const std::vector<DamageRect>* rects) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!failure.empty()) throw std::runtime_error(failure);
-    if (!rects) { target = image; return; }
+    if (callerWidth != width || callerHeight != height) {
+      callerWidth = width; callerHeight = height;
+      target = image;
+      return true;
+    }
+    if (!rects) { target = image; return false; }
     for (const auto& rect : *rects)
       for (int y = rect.y; y < rect.y + rect.height; ++y)
         std::memcpy(target.data() + (size_t(y) * width + rect.x) * 4, image.data() + (size_t(y) * width + rect.x) * 4,
                     size_t(rect.width) * 4);
+    return false;
   }
   std::optional<CursorImage> currentCursor() {
     std::lock_guard<std::mutex> lock(mutex);
     if (!shape) return std::nullopt;
     return visible ? *shape : hidden();
   }
-  static CursorImage hidden() {
-    CursorImage image;
-    image.width = image.height = 1;
-    image.rgba.assign(4, 0);
-    return image;
-  }
+  static CursorImage hidden() { return windows::hiddenCursor(); }
 
  private:
-  int level = 0;
+  int level = 0, width = 0, height = 0;
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> context;
   ComPtr<IDXGIOutputDuplication> duplication;
@@ -162,8 +131,42 @@ class Duplicator {
     duplication.Reset();
     const HRESULT result = display.output->DuplicateOutput(device.Get(), &duplication);
     if (result == E_ACCESSDENIED || result == DXGI_ERROR_UNSUPPORTED || result == DXGI_ERROR_SESSION_DISCONNECTED)
-      throw std::runtime_error("Desktop Duplication is unavailable; start relay in the signed-in user's desktop session");
+      throw windows::DxgiUnavailable("Desktop Duplication is unavailable; start relay in the signed-in user's desktop session");
     windows::check(result, "duplicating the display");
+  }
+  /// Creates the Direct3D device and the readback and scaling textures for display, then publishes the new stream
+  /// size with a blank image. Throws before changing anything when a texture cannot be created.
+  void build() {
+    const int nextLevel = display.level();
+    const auto [nextWidth, nextHeight] = display.streamSize();
+    requireSurfaceSize(nextWidth, nextHeight);
+    ComPtr<ID3D11Device> nextDevice;
+    ComPtr<ID3D11DeviceContext> nextContext;
+    ComPtr<ID3D11Texture2D> nextStaging, nextMips;
+    ComPtr<ID3D11ShaderResourceView> nextMipView;
+    windows::check(D3D11CreateDevice(display.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                     D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                                     &nextDevice, nullptr, &nextContext), "creating the Direct3D device");
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = UINT(nextWidth); desc.Height = UINT(nextHeight); desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    windows::check(nextDevice->CreateTexture2D(&desc, nullptr, &nextStaging), "creating the readback texture");
+    if (nextLevel) {
+      desc.Width = UINT(display.width()); desc.Height = UINT(display.height()); desc.MipLevels = UINT(nextLevel + 1);
+      desc.Usage = D3D11_USAGE_DEFAULT; desc.CPUAccessFlags = 0;
+      desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+      desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+      windows::check(nextDevice->CreateTexture2D(&desc, nullptr, &nextMips), "creating the scaling texture");
+      windows::check(nextDevice->CreateShaderResourceView(nextMips.Get(), nullptr, &nextMipView), "creating the scaling view");
+    }
+    duplication.Reset();
+    device = nextDevice; context = nextContext; staging = nextStaging; mips = nextMips; mipView = nextMipView;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (shape && nextLevel != level) shape.reset();
+    level = nextLevel; width = nextWidth; height = nextHeight;
+    image.assign(size_t(width) * height * 4, 0);
+    haveFrame = false;
   }
   void run();
   bool reconnect();
@@ -171,87 +174,6 @@ class Duplicator {
   void pointer(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector<uint8_t>& data);
   bool dirtyRects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector<uint8_t>& metadata, std::vector<DamageRect>& damage);
   void copyFrame(const ComPtr<IDXGIResource>& resource, const std::vector<DamageRect>& damage, bool full);
-};
-/// One consumer of the shared duplication, such as the stream encoder or a screenshot, with its own damage and image.
-class WindowsCapture final : public CaptureSource {
- public:
-  WindowsCapture() : duplicator(Duplicator::shared()) {
-    width = duplicator->width; height = duplicator->height;
-    ready = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-    if (!ready) throw std::runtime_error("creating the capture event failed");
-    front.assign(size_t(width) * height * 4, 0);
-    duplicator->subscribe(this);
-    duplicator->waitForFrame(std::chrono::seconds(2));
-  }
-  ~WindowsCapture() override {
-    duplicator->unsubscribe(this);
-    CloseHandle(ready);
-  }
-  WaitHandle fd() const override { return ready; }
-  std::pair<int, int> dimensions() const override { return {width, height}; }
-  PixelFormat pixelFormat() const override { return PixelFormat::BGRA; }
-  bool drainDamage() override {
-    std::lock_guard<std::mutex> lock(mutex);
-    ResetEvent(ready);
-    return pendingFull || !pending.empty();
-  }
-  FrameView capture() override { return captureChanged(true); }
-  FrameView captureChanged(bool full) override {
-    std::vector<DamageRect> rects;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      lastFull = full || pendingFull;
-      rects.swap(pending);
-      pendingFull = false;
-      last = lastFull ? std::vector<DamageRect>{} : rects;
-    }
-    duplicator->copy(front, lastFull ? nullptr : &rects);
-    return {front.data(), width * 4, width, height, PixelFormat::BGRA};
-  }
-  bool changedRects(std::vector<DamageRect>& rects) override {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (lastFull) return false;
-    rects = last;
-    return true;
-  }
-  bool cursorSupported() const override { return true; }
-  std::optional<CursorImage> cursor(bool force) override {
-    if (force) return duplicator->currentCursor();
-    std::lock_guard<std::mutex> lock(mutex);
-    auto next = std::move(cursorPending);
-    cursorPending.reset();
-    return next;
-  }
-  /// Called by the duplicator with the damage of each new frame.
-  void damaged(const std::vector<DamageRect>& rects, bool full) {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!full && !pendingFull) pending.insert(pending.end(), rects.begin(), rects.end());
-    if (full || pending.size() > max_pending_rects) { pendingFull = true; pending.clear(); }
-    SetEvent(ready);
-  }
-  /// Called by the duplicator when the pointer shape or visibility changes.
-  void cursorChanged(const CursorImage& image) {
-    std::lock_guard<std::mutex> lock(mutex);
-    cursorPending = image;
-    SetEvent(ready);
-  }
-  /// Called by the duplicator when capture fails; the pending full frame makes the next capture throw the error.
-  void failed() {
-    std::lock_guard<std::mutex> lock(mutex);
-    pendingFull = true;
-    pending.clear();
-    SetEvent(ready);
-  }
-
- private:
-  std::shared_ptr<Duplicator> duplicator;
-  int width = 0, height = 0;
-  HANDLE ready = nullptr;
-  std::mutex mutex;
-  std::vector<uint8_t> front;
-  std::vector<DamageRect> pending, last;
-  bool pendingFull = true, lastFull = true;
-  std::optional<CursorImage> cursorPending;
 };
 void Duplicator::subscribe(WindowsCapture* source) {
   std::lock_guard<std::mutex> lock(mutex);
@@ -287,23 +209,49 @@ void Duplicator::run() {
     duplication->ReleaseFrame();
   }
 }
+/// Re-establishes the duplication after access was lost. When the display changed size or moved, the Direct3D
+/// textures are rebuilt for the new size first and every source sees a full frame at that size. Duplication
+/// itself is retried until it works, since it is refused while the secure desktop is showing; a display that
+/// cannot be found at all for a minute ends the stream.
 bool Duplicator::reconnect() {
+  duplication.Reset();
+  std::optional<std::chrono::steady_clock::time_point> missing_since;
+  // Counts a failure to find or size the display; true once it has lasted a minute.
+  const auto give_up = [&] {
+    if (!missing_since) missing_since = std::chrono::steady_clock::now();
+    return std::chrono::steady_clock::now() - *missing_since > std::chrono::seconds(60);
+  };
   while (!stopping) {
-    try { duplicate(); break; } catch (const std::exception&) {}
+    try {
+      windows::Output now;
+      try {
+        now = windows::findOutput();
+      } catch (const std::exception& error) {
+        if (give_up()) { fail(error.what()); return false; }
+        throw;
+      }
+      if (!EqualRect(&now.bounds, &display.bounds)) {
+        std::fprintf(stderr, "capture: display changed from %dx%d to %dx%d; rebuilding duplication\n",
+                     display.width(), display.height(), now.width(), now.height());
+        windows::Output previous = std::move(display);
+        display = std::move(now);
+        try {
+          build();
+        } catch (const std::exception& error) {
+          display = std::move(previous);
+          if (give_up()) { fail(error.what()); return false; }
+          throw;
+        }
+      } else {
+        display = std::move(now);
+      }
+      missing_since.reset();
+      duplicate();
+      break;
+    } catch (const std::exception&) {}
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  try {
-    const RECT now = windows::findOutput().bounds;
-    if (!EqualRect(&now, &display.bounds)) {
-      fail("The display changed from " + std::to_string(display.width()) + "x" + std::to_string(display.height()) + " to " +
-           std::to_string(now.right - now.left) + "x" + std::to_string(now.bottom - now.top) +
-           " or moved; restart relay to stream it");
-      return false;
-    }
-  } catch (const std::exception& error) {
-    fail(error.what());
-    return false;
-  }
+  if (stopping) return false;
   std::lock_guard<std::mutex> lock(mutex);
   for (auto* source : sources) source->damaged({}, true);
   return true;
@@ -388,6 +336,20 @@ void Duplicator::copyFrame(const ComPtr<IDXGIResource>& resource, const std::vec
 }
 }  // namespace
 namespace windows {
-std::unique_ptr<CaptureSource> makeCaptureSource() { return std::make_unique<WindowsCapture>(); }
+/// Picks the capture API: DXGI Desktop Duplication, or GDI for sessions that have no DXGI output, such as a VM
+/// whose only display adapter is a basic one. With --capture auto, DXGI is tried first.
+std::unique_ptr<CaptureSource> makeCaptureSource() {
+  const CaptureMode mode = captureMode();
+  if (mode == CaptureMode::gdi) return makeGdiCaptureSource();
+  if (mode == CaptureMode::dxgi) return std::make_unique<WindowsCapture>();
+  try {
+    return std::make_unique<WindowsCapture>();
+  } catch (const std::exception& error) {
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+      std::fprintf(stderr, "capture: DXGI is unavailable (%s); using GDI capture\n", error.what());
+  }
+  return makeGdiCaptureSource();
+}
 }
 }  // namespace relay
