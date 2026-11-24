@@ -301,6 +301,9 @@ public:
         }
         return gpu && manager ? "HW (DXGI surfaces)" : "SW";
     }
+    template <typename Drop> void dropPending(Drop&& drop) {
+        while (!pending.empty()) { drop(pending.front().frame); pending.pop_front(); }
+    }
     template <typename Output, typename Drop> void feed(View data, const FrameInfo& frame, bool key, Output&& output, Drop&& drop) {
         const auto start = Clock::now();
         if (!typed) {
