@@ -29,6 +29,10 @@ differently-licensed host or client can implement it independently.
 
 Upstream attribution for `screen-relay` is in [NOTICE](NOTICE).
 
+`skylatch-client-core` statically links and the host engine links `libopus`, which is under the
+BSD 3-Clause license and compatible with both Apache-2.0 and GPL-3.0; its notice is also in
+[NOTICE](NOTICE).
+
 ## Contributions
 
 Contributions to a directory are licensed under that directory's license. Do not move code across

@@ -9,12 +9,13 @@ endif
 BACKENDS ?= x11
 HAS_WAYLAND = $(filter wayland,$(BACKENDS))
 AVAILABLE_BACKENDS = x11 wayland windows macos
-BACKEND_PKGS_x11 = x11 xext xdamage xfixes xrandr xtst
-BACKEND_DIR_x11 = linux/x11
-BACKEND_PKGS_wayland = wayland-client xkbcommon
-BACKEND_DIR_wayland = linux/wayland
+# Both Linux backends capture desktop audio from the PulseAudio (or PipeWire-Pulse) default sink monitor.
+BACKEND_PKGS_x11 = x11 xext xdamage xfixes xrandr xtst libpulse-simple
+BACKEND_DIR_x11 = linux/x11 linux/pulse
+BACKEND_PKGS_wayland = wayland-client xkbcommon libpulse-simple
+BACKEND_DIR_wayland = linux/wayland linux/pulse
 BACKEND_DIR_windows = windows
-BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32 -lws2_32 -lmfplat -lmfuuid -lole32
+BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt -lgdi32 -luser32 -lws2_32 -lmfplat -lmfuuid -lole32 -lmmdevapi
 BACKEND_FLAGS_windows = -DNOMINMAX -D_WIN32_WINNT=0x0A00
 BACKEND_DIR_macos = macos
 BACKEND_FLAGS_macos = -mmacosx-version-min=12.3 -Werror=unguarded-availability-new
@@ -28,7 +29,7 @@ endif
 BACKEND_PKGS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_PKGS_$(backend))))
 BACKEND_DIRS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_DIR_$(backend))))
 BACKEND_CPPFLAGS = $(foreach backend,$(sort $(BACKENDS)),-DRELAY_BACKEND_$(backend) $(BACKEND_FLAGS_$(backend)))
-CODEC_PKGS = x264
+CODEC_PKGS = x264 opus
 # Linux hardware encoding (NVENC, VAAPI) goes through libavcodec when it is installed; macOS and Windows use the
 # system VideoToolbox and Media Foundation encoders and never link FFmpeg.
 ifneq ($(filter x11 wayland,$(BACKENDS)),)
@@ -56,7 +57,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/*/*.hpp src/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server test-keymap test-macos-keys test-macos-cursor clean FORCE
+.PHONY: all deps install test test-audio test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server test-keymap test-macos-keys test-macos-cursor clean FORCE
 all: skylatch-host-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -190,6 +191,13 @@ build/server-test: tests/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAN
 test-server: build/server-test
 	./build/server-test
 
+build/audio-test: tests/audio-test.cpp src/core/audio-encoder.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends
+	mkdir -p build
+	$(CXX) -Isrc $(BACKEND_CPPFLAGS) $(if $(HAS_WAYLAND),-Ibuild/protocols) $(shell pkg-config --cflags $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets opus) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) tests/audio-test.cpp src/core/audio-encoder.cpp $(SERVER_TEST_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(shell pkg-config --libs $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets opus) $(BACKEND_LIBS)
+
+test-audio: build/audio-test
+	./build/audio-test
+
 build/keymap-test: tests/keymap-test.cpp src/backends/linux/wayland/keymap.cpp
 	mkdir -p build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(shell pkg-config --cflags xkbcommon) $^ -o $@ $(shell pkg-config --libs xkbcommon)
@@ -211,7 +219,7 @@ build/macos-cursor-test: tests/macos-cursor-test.cpp src/backends/macos/cursor.h
 test-macos-cursor: build/macos-cursor-test
 	./build/macos-cursor-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys test-macos-cursor)
+test: test-audio test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-tile-diff test-capture-resize test-encoder test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys test-macos-cursor)
 
 clean:
 	rm -rf build skylatch-host-engine

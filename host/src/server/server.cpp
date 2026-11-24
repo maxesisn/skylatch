@@ -111,11 +111,44 @@ void Server::Stream::end() {
   buffered_stream_bytes = 0; stream_notsent_lowat = 0; flow_timer_due_us = 0;
   if (old) capture.endSession(old);
   clipboard_notices = clipboard_pending = smooth_wheel_reply = false;
+  audio = audio_config_pending = false; audio_sequence = 0; audio_pending.clear();
   monitors_pending.reset(); clipboard_data_pending.reset();
   lastSequence = 0; width = height = 0; received.clear(); viewer = nullptr;
 }
 Server::Server(Config settings) : config(std::move(settings)) {
   streams[0] = std::make_unique<Stream>(*this);
+  const auto source = backendFor(config.backend).audio;
+  if (config.no_audio || !source) return;
+  audio = std::make_unique<AudioCapture>(source, [this](AudioPacket&& packet) {
+    {
+      std::lock_guard<std::mutex> lock(audio_mutex);
+      if (audio_ready.size() >= max_pending_audio) audio_ready.pop_front();
+      audio_ready.push_back(std::make_shared<const AudioPacket>(std::move(packet)));
+    }
+    wake->cancel();
+  });
+}
+void Server::setAudio(Stream& stream, bool enabled) {
+  if (!audio || stream.audio == enabled) return;
+  stream.audio = stream.audio_config_pending = enabled;
+  stream.audio_pending.clear();
+  updateAudio();
+  lws_callback_on_writable(stream.viewer);
+}
+void Server::updateAudio() {
+  if (audio) audio->setActive(std::any_of(streams.begin(), streams.end(), [](const auto& s) { return s && s->viewer && s->audio; }));
+}
+void Server::deliverAudio() {
+  std::deque<std::shared_ptr<const AudioPacket>> ready;
+  { std::lock_guard<std::mutex> lock(audio_mutex); ready.swap(audio_ready); }
+  if (ready.empty()) return;
+  for (const auto& stream : streams) {
+    if (!stream || !stream->viewer || !stream->audio) continue;
+    for (const auto& packet : ready) {
+      if (stream->audio_pending.size() >= max_pending_audio) stream->audio_pending.pop_front();
+      stream->audio_pending.push_back(packet);
+    }
+  }
 }
 Server::Stream* Server::streamFor(lws* wsi) {
   for (auto& stream : streams) if (stream && stream->viewer == wsi) return stream.get();
@@ -162,6 +195,7 @@ int Server::startStream(lws* wsi, Socket socket, const ConnectionPlan& plan, boo
   if (auto list = monitorSnapshot(); !list.empty()) stream.monitors_pending = std::move(list);
   stream.begin(wsi, ++nextGeneration);
   stream.updateFlow(config.proxy);
+  updateAudio();
   return 0;
 }
 void Server::release() { if (input) input->releaseAll(); }
@@ -171,6 +205,7 @@ void Server::endStream(lws* wsi) {
     if (input_viewer == wsi) { release(); input->cancel(); input_viewer = nullptr; }
     (*slot)->end();
     if (slot != streams.begin()) slot->reset();
+    updateAudio();
     return;
   }
 }
@@ -251,6 +286,12 @@ bool Server::streamMessage(Stream& stream) {
         text.find('\0') != std::string::npos) return true;
     echo.applied(text);
     if (!clipboard.submitApply(std::move(text))) echo.reset();
+    return true;
+  }
+  if (b[5] == 22) {
+    bool enabled = false;
+    if (seq || !audioControlEnabled(b.data()+nsl1_header_bytes, b.size()-nsl1_header_bytes, enabled)) return false;
+    if (gen == stream.generation) setAudio(stream, enabled);
     return true;
   }
   if (b[5] != 3 || b.size() != 36 || seq || gen != stream.generation) return false;
@@ -433,8 +474,8 @@ int Server::Stream::write(bool proxy) {
   updateFlow(proxy);
   std::optional<EncodedFrame> frame;
   std::optional<CursorImage> cursor;
-  const bool send_control =
-      lastSequence && (smooth_wheel_reply || monitors_pending || clipboard_pending || clipboard_data_pending);
+  const bool send_control = lastSequence && (smooth_wheel_reply || audio_config_pending || !audio_pending.empty() ||
+                                             monitors_pending || clipboard_pending || clipboard_data_pending);
   { std::lock_guard<std::mutex> lock(mutex);
     if (failed) return -1;
     if (!send_control) {
@@ -456,6 +497,14 @@ int Server::Stream::write(bool proxy) {
     if (smooth_wheel_reply) {
       inputReply(wire, LWS_PRE, generation, 0, InputStatus::ok);
       smooth_wheel_reply = false;
+    } else if (audio_config_pending) {
+      audioConfigMessage(wire, LWS_PRE, generation);
+      audio_config_pending = false;
+    } else if (!audio_pending.empty()) {
+      const auto packet = std::move(audio_pending.front());
+      audio_pending.pop_front();
+      if (!++audio_sequence) audio_sequence = 1;
+      if (!audioFrameMessage(wire, LWS_PRE, generation, audio_sequence, *packet)) { lws_callback_on_writable(wsi); return 0; }
     } else if (monitors_pending) {
       monitorListMessage(wire, LWS_PRE, generation, *monitors_pending);
       monitors_pending.reset();
@@ -702,7 +751,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
             (backend == "wayland" ? "true" : "false") +
             ",\"max_input_pending\":32,\"cursor\":" + (s->streams[0]->capture.stats().cursor_supported ? "true" : "false") +
             ",\"input_endpoint\":\"/input\",\"max_input_batch\":" + std::to_string(max_input_batch) +
-            ",\"audio\":false,\"clipboard\":" + (s->clipboard.available() ? "true" : "false") +
+            ",\"audio\":" + (s->audio ? "true" : "false") + ",\"clipboard\":" + (s->clipboard.available() ? "true" : "false") +
             ",\"clipboard_endpoint\":\"/clipboard\",\"max_clipboard_bytes\":" + std::to_string(max_clipboard_bytes) +
             ",\"resize\":false,\"ime\":false}";
         return jsonResponse(wsi, response, HTTP_STATUS_OK, json);
@@ -859,6 +908,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       return s->control == wsi ? s->writeControl(wsi) : -1;
     }
     case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+      s->deliverAudio();
       if (s->clipboard_changed.exchange(false) && s->input_viewer) {
         if (auto* stream = s->streamFor(s->input_viewer); stream && stream->clipboard_notices) {
           stream->clipboard_pending = true;
