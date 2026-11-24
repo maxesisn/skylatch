@@ -13,20 +13,21 @@ namespace skylatch {
 struct Config {
     std::string hub, direct, token, device;
     unsigned smokeSeconds{};
-    bool list{}, noDirect{}, noClipboard{}, help{};
+    bool list{}, noDirect{}, noClipboard{}, noAudio{}, help{};
 };
 
 inline constexpr auto usage = R"(Usage:
   skylatch-client --hub <ws:// or wss:// URL> --token <token> --list
   skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]
-                  [--no-direct] [--no-clipboard] [--smoke-seconds N]
+                  [--no-direct] [--no-clipboard] [--no-audio] [--smoke-seconds N]
   skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]
-                  [--no-clipboard] [--smoke-seconds N]
+                  [--no-clipboard] [--no-audio] [--smoke-seconds N]
   skylatch-client --help
 
 Without --device, hub mode selects the sole device or prompts on a terminal.
 --no-direct forces hub relay. --no-clipboard disables text clipboard sync.
---smoke-seconds decodes headlessly without input or clipboard sync.
+--no-audio does not ask the host for its sound.
+--smoke-seconds decodes headlessly without input, clipboard sync or audio.
 F11 toggles fullscreen; Ctrl+Alt+G toggles keyboard grab.
 )";
 

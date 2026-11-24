@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/audio-encoder.hpp"
 #include "core/capture.hpp"
 #include "core/clipboard.hpp"
 #include "core/input.hpp"
@@ -77,4 +78,14 @@ bool clipboardDataText(const uint8_t* payload, size_t size, std::string& text);
 /** The largest total size, header included, a received viewer message may reach, judged from the type byte once it is known. */
 size_t maxViewerMessage(const std::vector<uint8_t>& received);
 void inputReply(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, InputStatus status);
+/// SL1 audio limits, as in docs/PROTOCOL.md.
+constexpr size_t max_audio_config_bytes = 4096;
+constexpr size_t max_audio_frame_bytes = 16 * 1024;
+constexpr size_t audio_frame_prefix_bytes = 8;
+/** Type 20 AudioConfig, host to viewer: the 48 kHz stereo 20 ms Opus format AudioEncoder produces. */
+void audioConfigMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation);
+/** Type 21 AudioFrame, host to viewer; false when sequence is zero or the packet is empty or too long. */
+bool audioFrameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, const AudioPacket& packet);
+/** Reads a Type 22 AudioControl payload; false unless it is the single byte 0 (disable) or 1 (enable). */
+bool audioControlEnabled(const uint8_t* payload, size_t size, bool& enabled);
 }  // namespace relay

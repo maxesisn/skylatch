@@ -290,6 +290,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (!preference) throw std::runtime_error("SKYLATCH_ENCODER must be auto, hw or sw");
     config.encoder = *preference;
   }
+  if (const char* value = std::getenv("SKYLATCH_NO_AUDIO"); value && *value && std::string(value) != "0") config.no_audio = true;
   const auto bitrate = [](const std::string& text) {
     uint64_t value;
     if (!unsignedNumber(text, value) || value < 250000 || value > 100000000)
@@ -300,7 +301,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
     const std::string option = argv[i];
     if (option == "--help") {
       std::cout << "Usage: skylatch-host-engine [--bind ADDRESS] [--port PORT] [--viewer-dir DIR | --no-viewer]\n"
-                   "  [--backend NAME] [--output NAME] [--check]\n"
+                   "  [--backend NAME] [--output NAME] [--check] [--no-audio]\n"
                    "  [--fps N] [--max-dimension N] [--capture auto|dxgi|gdi] [--encoder auto|hw|sw]\n"
                    "  [--bitrate-min BPS] [--bitrate-start BPS] [--bitrate-max BPS]\n"
                    "  [--token-file FILE [--public-origin https://HOST[:PORT]]\n"
@@ -321,6 +322,8 @@ bool parseConfig(int argc, char** argv, Config& config) {
                    "when there is none, unless --allow-origin lists its exact origin. Each allowed\n"
                    "origin is a lowercase https://HOST[:PORT] origin, or http://localhost[:PORT] or\n"
                    "http://127.0.0.1[:PORT] for a page served on the machine itself.\n"
+                   "--no-audio never captures desktop sound, even for viewers that ask for it (SKYLATCH_NO_AUDIO=1\n"
+                   "does the same). Otherwise it is captured and Opus-encoded only while a viewer listens.\n"
                    "--no-viewer skips the bundled web viewer; the engine then serves only its stream, input and\n"
                    "control endpoints (for agent-driven use).\n"
                    "--check initializes the backend and exits without starting capture or the server.\n"
@@ -333,6 +336,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (option == "--insecure-local") { config.insecure_local = true; continue; }
     if (option == "--check") { config.check = true; continue; }
     if (option == "--no-viewer") { config.no_viewer = true; continue; }
+    if (option == "--no-audio") { config.no_audio = true; continue; }
     if (++i == argc) throw std::runtime_error("Missing value for " + option);
     const std::string value = argv[i];
     if (option == "--bind") config.bind = value;

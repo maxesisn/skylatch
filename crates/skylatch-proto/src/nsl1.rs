@@ -44,6 +44,12 @@ pub const MAX_MONITOR_LIST: usize = 64 * 1024;
 pub const MAX_MONITOR_ID: usize = 256;
 /// Maximum UTF-8 byte length of clipboard text.
 pub const MAX_CLIPBOARD_DATA: usize = 1024 * 1024;
+/// Maximum UTF-8 JSON size of an audio configuration.
+pub const MAX_AUDIO_CONFIG: usize = 4096;
+/// Maximum audio frame payload: capture time plus one Opus packet.
+pub const MAX_AUDIO_FRAME: usize = 16 * 1024;
+/// Size of the capture time that prefixes an audio frame payload.
+pub const AUDIO_FRAME_PREFIX_SIZE: usize = 8;
 /// Largest smooth-wheel magnitude in 1/16 pixel (16384 pixels).
 pub const MAX_SMOOTH_WHEEL: i32 = 16384 * 16;
 /// Header flag marking a keyframe (frame messages only).
@@ -92,6 +98,9 @@ pub enum MessageType {
     MonitorList = 17,
     SelectMonitor = 18,
     ClipboardData = 19,
+    AudioConfig = 20,
+    AudioFrame = 21,
+    AudioControl = 22,
 }
 
 impl MessageType {
@@ -107,21 +116,39 @@ impl MessageType {
             17 => Self::MonitorList,
             18 => Self::SelectMonitor,
             19 => Self::ClipboardData,
+            20 => Self::AudioConfig,
+            21 => Self::AudioFrame,
+            22 => Self::AudioControl,
             other => return Err(Nsl1Error::UnknownType(other)),
         })
     }
 
-    fn sl1_payload_limit(self) -> Option<usize> {
+    fn payload_limit(self) -> usize {
         match self {
-            Self::MonitorList => Some(MAX_MONITOR_LIST),
-            Self::SelectMonitor => Some(MAX_MONITOR_ID),
-            Self::ClipboardData => Some(MAX_CLIPBOARD_DATA),
-            _ => None,
+            Self::MonitorList => MAX_MONITOR_LIST,
+            Self::SelectMonitor => MAX_MONITOR_ID,
+            Self::ClipboardData => MAX_CLIPBOARD_DATA,
+            Self::AudioConfig => MAX_AUDIO_CONFIG,
+            Self::AudioFrame => MAX_AUDIO_FRAME,
+            Self::AudioControl => 1,
+            _ => MAX_PAYLOAD,
         }
     }
 
+    /// SL1 types other than audio frames carry sequence 0.
+    fn zero_sequence(self) -> bool {
+        matches!(
+            self,
+            Self::MonitorList
+                | Self::SelectMonitor
+                | Self::ClipboardData
+                | Self::AudioConfig
+                | Self::AudioControl
+        )
+    }
+
     fn validate_payload_len(self, len: usize) -> Result<(), Nsl1Error> {
-        if len > self.sl1_payload_limit().unwrap_or(MAX_PAYLOAD) {
+        if len > self.payload_limit() {
             return Err(Nsl1Error::PayloadTooLarge(len));
         }
         if self == Self::SelectMonitor && len == 0 {
@@ -173,7 +200,7 @@ impl Header {
         }
         let sequence = b.get_u32();
         let payload_len = b.get_u32();
-        if msg_type.sl1_payload_limit().is_some() && sequence != 0 {
+        if msg_type.zero_sequence() && sequence != 0 {
             return Err(Nsl1Error::NonzeroSequence);
         }
         msg_type.validate_payload_len(payload_len as usize)?;
@@ -546,6 +573,42 @@ pub enum Message {
     SelectMonitor { generation: u32, id: String },
     /// Type 19: bidirectional text clipboard data.
     ClipboardData { generation: u32, text: String },
+    /// Type 20: the audio format, sent before the first audio frame.
+    AudioConfig {
+        generation: u32,
+        format: AudioFormat,
+    },
+    /// Type 21: one encoded audio packet. Sequence starts at 1 and grows by one per packet.
+    AudioFrame {
+        generation: u32,
+        sequence: u32,
+        /// Capture time in microseconds.
+        capture_us: u64,
+        data: Bytes,
+    },
+    /// Type 22: the viewer asks the host to start or stop audio.
+    AudioControl { generation: u32, enabled: bool },
+}
+
+/// The audio stream format announced by an audio configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFormat {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub frame_ms: u16,
+}
+
+impl AudioFormat {
+    /// 48 kHz stereo Opus in 20 ms packets, the format hosts send.
+    pub fn opus() -> Self {
+        Self {
+            codec: "opus".into(),
+            sample_rate: 48_000,
+            channels: 2,
+            frame_ms: 20,
+        }
+    }
 }
 
 /// One display as described by the host in a monitor list.
@@ -589,6 +652,9 @@ impl Message {
             Self::MonitorList { .. } => MessageType::MonitorList,
             Self::SelectMonitor { .. } => MessageType::SelectMonitor,
             Self::ClipboardData { .. } => MessageType::ClipboardData,
+            Self::AudioConfig { .. } => MessageType::AudioConfig,
+            Self::AudioFrame { .. } => MessageType::AudioFrame,
+            Self::AudioControl { .. } => MessageType::AudioControl,
         }
     }
 
@@ -699,6 +765,37 @@ impl Message {
                 MessageType::ClipboardData.validate_payload_len(text.len())?;
                 (0, *generation, 0, Bytes::copy_from_slice(text.as_bytes()))
             }
+            Self::AudioConfig { generation, format } => {
+                let payload = serde_json::to_vec(format)
+                    .map_err(|_| Nsl1Error::InvalidPayload("audio config"))?;
+                MessageType::AudioConfig.validate_payload_len(payload.len())?;
+                (0, *generation, 0, Bytes::from(payload))
+            }
+            Self::AudioFrame {
+                generation,
+                sequence,
+                capture_us,
+                data,
+            } => {
+                if *sequence == 0 || data.is_empty() {
+                    return Err(Nsl1Error::InvalidPayload("audio frame"));
+                }
+                MessageType::AudioFrame
+                    .validate_payload_len(AUDIO_FRAME_PREFIX_SIZE + data.len())?;
+                let mut p = BytesMut::with_capacity(AUDIO_FRAME_PREFIX_SIZE + data.len());
+                p.put_u64(*capture_us);
+                p.extend_from_slice(data);
+                (0, *generation, *sequence, p.freeze())
+            }
+            Self::AudioControl {
+                generation,
+                enabled,
+            } => (
+                0,
+                *generation,
+                0,
+                Bytes::copy_from_slice(&[u8::from(*enabled)]),
+            ),
         };
         if generation == 0 {
             return Err(Nsl1Error::ZeroGeneration);
@@ -855,6 +952,35 @@ impl Message {
                 text: String::from_utf8(payload.to_vec())
                     .map_err(|_| Nsl1Error::InvalidPayload("clipboard data"))?,
             }),
+            MessageType::AudioConfig => {
+                let invalid = |_| Nsl1Error::InvalidPayload("audio config");
+                let entry =
+                    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&payload)
+                        .map_err(invalid)?;
+                Ok(Self::AudioConfig {
+                    generation,
+                    format: serde_json::from_value(serde_json::Value::Object(entry))
+                        .map_err(invalid)?,
+                })
+            }
+            MessageType::AudioFrame => {
+                if payload.len() <= AUDIO_FRAME_PREFIX_SIZE || sequence == 0 {
+                    return Err(Nsl1Error::InvalidPayload("audio frame"));
+                }
+                Ok(Self::AudioFrame {
+                    generation,
+                    sequence,
+                    capture_us: (&payload[..AUDIO_FRAME_PREFIX_SIZE]).get_u64(),
+                    data: payload.slice(AUDIO_FRAME_PREFIX_SIZE..),
+                })
+            }
+            MessageType::AudioControl => match payload[..] {
+                [flag @ (0 | 1)] => Ok(Self::AudioControl {
+                    generation,
+                    enabled: flag == 1,
+                }),
+                _ => Err(Nsl1Error::InvalidPayload("audio control")),
+            },
         }
     }
 }
@@ -929,7 +1055,7 @@ mod tests {
         let mut b = good;
         b[4] = 2;
         assert_eq!(Header::decode(&b), Err(Nsl1Error::BadVersion(2)));
-        for t in [0u8, 8, 255] {
+        for t in [0u8, 8, 23, 255] {
             let mut b = good;
             b[5] = t;
             assert_eq!(Header::decode(&b), Err(Nsl1Error::UnknownType(t)));
@@ -1664,6 +1790,184 @@ mod tests {
             Message::decode(&sl1_wire(MessageType::SelectMonitor, b"")),
             Err(Nsl1Error::InvalidPayload("select monitor"))
         );
+    }
+
+    fn audio_frame(sequence: u32, data: &'static [u8]) -> Message {
+        Message::AudioFrame {
+            generation: 23,
+            sequence,
+            capture_us: 0x0102_0304_0506_0708,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    #[test]
+    fn audio_roundtrips_and_wire_layouts() {
+        let config = roundtrip(Message::AudioConfig {
+            generation: 23,
+            format: AudioFormat::opus(),
+        });
+        assert_eq!(
+            config,
+            sl1_wire(
+                MessageType::AudioConfig,
+                br#"{"codec":"opus","sample_rate":48000,"channels":2,"frame_ms":20}"#
+            )
+        );
+        let frame = roundtrip(audio_frame(7, &[0xfc, 0xff, 0xfe]));
+        assert_eq!(&frame[4..8], &[1, 21, 0, 0]);
+        assert_eq!(&frame[8..20], &[0, 0, 0, 23, 0, 0, 0, 7, 0, 0, 0, 11]);
+        assert_eq!(&frame[20..], &[1, 2, 3, 4, 5, 6, 7, 8, 0xfc, 0xff, 0xfe]);
+        let Message::AudioFrame { data, .. } = Message::decode(&frame).unwrap() else {
+            panic!("not an audio frame");
+        };
+        assert_eq!(
+            data.as_ptr(),
+            frame[HEADER_SIZE + AUDIO_FRAME_PREFIX_SIZE..].as_ptr()
+        );
+        for (enabled, byte) in [(true, 1), (false, 0)] {
+            let wire = roundtrip(Message::AudioControl {
+                generation: 23,
+                enabled,
+            });
+            assert_eq!(wire, sl1_wire(MessageType::AudioControl, &[byte]));
+        }
+    }
+
+    #[test]
+    fn audio_config_accepts_extra_members_and_rejects_bad_json() {
+        let extended =
+            br#"{"frame_ms":10,"channels":1,"sample_rate":24000,"codec":"opus","dtx":true}"#;
+        assert_eq!(
+            Message::decode(&sl1_wire(MessageType::AudioConfig, extended)),
+            Ok(Message::AudioConfig {
+                generation: 23,
+                format: AudioFormat {
+                    codec: "opus".into(),
+                    sample_rate: 24_000,
+                    channels: 1,
+                    frame_ms: 10,
+                },
+            })
+        );
+        for payload in [
+            &b""[..],
+            &b"[]"[..],
+            &br#"["opus",48000,2,20]"#[..],
+            &br#"{"codec":"opus","sample_rate":48000,"channels":2}"#[..],
+            &br#"{"codec":"opus","sample_rate":48000,"channels":256,"frame_ms":20}"#[..],
+            &b"{\"codec\":\"\xff\"}"[..],
+        ] {
+            assert_eq!(
+                Message::decode(&sl1_wire(MessageType::AudioConfig, payload)),
+                Err(Nsl1Error::InvalidPayload("audio config"))
+            );
+        }
+        let mut format = AudioFormat::opus();
+        format.codec = "x".repeat(MAX_AUDIO_CONFIG);
+        assert!(matches!(
+            Message::AudioConfig {
+                generation: 23,
+                format,
+            }
+            .encode(),
+            Err(Nsl1Error::PayloadTooLarge(_))
+        ));
+        let oversized = vec![b' '; MAX_AUDIO_CONFIG + 1];
+        assert_eq!(
+            Message::decode(&sl1_wire(MessageType::AudioConfig, &oversized)),
+            Err(Nsl1Error::PayloadTooLarge(MAX_AUDIO_CONFIG + 1))
+        );
+    }
+
+    #[test]
+    fn audio_frame_limits() {
+        static LARGEST: [u8; MAX_AUDIO_FRAME - AUDIO_FRAME_PREFIX_SIZE] =
+            [0; MAX_AUDIO_FRAME - AUDIO_FRAME_PREFIX_SIZE];
+        static TOO_LARGE: [u8; MAX_AUDIO_FRAME - AUDIO_FRAME_PREFIX_SIZE + 1] =
+            [0; MAX_AUDIO_FRAME - AUDIO_FRAME_PREFIX_SIZE + 1];
+        assert_eq!(
+            roundtrip(audio_frame(u32::MAX, &LARGEST)).len(),
+            HEADER_SIZE + MAX_AUDIO_FRAME
+        );
+        assert_eq!(
+            audio_frame(1, &TOO_LARGE).encode(),
+            Err(Nsl1Error::PayloadTooLarge(MAX_AUDIO_FRAME + 1))
+        );
+        assert_eq!(
+            audio_frame(1, &[]).encode(),
+            Err(Nsl1Error::InvalidPayload("audio frame"))
+        );
+        assert_eq!(
+            audio_frame(0, &[1]).encode(),
+            Err(Nsl1Error::InvalidPayload("audio frame"))
+        );
+        let wire = |sequence: u32, payload: &[u8]| {
+            let mut raw = BytesMut::new();
+            raw.extend_from_slice(
+                &Header {
+                    msg_type: MessageType::AudioFrame,
+                    flags: 0,
+                    generation: 1,
+                    sequence,
+                    payload_len: payload.len() as u32,
+                }
+                .encode(),
+            );
+            raw.extend_from_slice(payload);
+            raw.freeze()
+        };
+        for (sequence, payload) in [(1, &[0u8; 8][..]), (1, &[0u8; 3][..]), (0, &[0u8; 9][..])] {
+            assert_eq!(
+                Message::decode(&wire(sequence, payload)),
+                Err(Nsl1Error::InvalidPayload("audio frame"))
+            );
+        }
+        let oversized = wire(1, &[0; MAX_AUDIO_FRAME + 1]);
+        assert_eq!(
+            Header::decode(&oversized),
+            Err(Nsl1Error::PayloadTooLarge(MAX_AUDIO_FRAME + 1))
+        );
+        let mut flagged = wire(1, &[0; 9]).to_vec();
+        flagged[7] = 1;
+        assert_eq!(
+            Message::decode(&flagged.into()),
+            Err(Nsl1Error::BadFlags(1))
+        );
+    }
+
+    #[test]
+    fn audio_control_and_config_reject_malformed_headers() {
+        for payload in [&[2u8][..], &[][..]] {
+            assert_eq!(
+                Message::decode(&sl1_wire(MessageType::AudioControl, payload)),
+                Err(Nsl1Error::InvalidPayload("audio control"))
+            );
+        }
+        assert_eq!(
+            Message::decode(&sl1_wire(MessageType::AudioControl, &[1, 0])),
+            Err(Nsl1Error::PayloadTooLarge(2))
+        );
+        for (kind, payload) in [
+            (MessageType::AudioControl, &[1u8][..]),
+            (
+                MessageType::AudioConfig,
+                &br#"{"codec":"opus","sample_rate":48000,"channels":2,"frame_ms":20}"#[..],
+            ),
+        ] {
+            let mut sequenced = sl1_wire(kind, payload).to_vec();
+            sequenced[15] = 1;
+            assert_eq!(
+                Message::decode(&sequenced.into()),
+                Err(Nsl1Error::NonzeroSequence)
+            );
+            let mut flagged = sl1_wire(kind, payload).to_vec();
+            flagged[7] = 1;
+            assert_eq!(
+                Message::decode(&flagged.into()),
+                Err(Nsl1Error::BadFlags(1))
+            );
+        }
     }
 
     #[test]

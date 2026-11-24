@@ -31,6 +31,10 @@ trimmed build without the upstream web viewer, CLI or SDK.
   once and sticks for the rest of the run. `--encoder hw` fails instead of falling back and `--encoder sw` always uses
   `libx264`, which skips unchanged macroblocks. `/metrics` reports `encoder` and `hardware_encoder`. macOS and Windows
   builds link only system encoder libraries, never FFmpeg.
+- Streams desktop sound as 48 kHz stereo Opus (96 kbit/s VBR, 20 ms packets) to viewers that ask for it,
+  captured from ScreenCaptureKit (macOS 13+), WASAPI loopback (Windows) or the PulseAudio/PipeWire default
+  sink monitor (Linux). Capture runs only while a viewer listens; without a sound device or audio service
+  the stream stays silent. `--no-audio` (or `SKYLATCH_NO_AUDIO=1`) turns it off.
 - On Windows, `--capture auto` (the default) uses DXGI desktop duplication and falls back to GDI
   `BitBlt` capture when DXGI has no output, as in a VM whose only display adapter is a basic one.
   The GDI path finds damage by comparing 64x64 pixel tiles with the previous frame. `--capture dxgi`
@@ -38,7 +42,8 @@ trimmed build without the upstream web viewer, CLI or SDK.
 
 ## Build
 
-Requirements: a C++17 compiler, GNU make, `pkg-config`, `libx264`, `libwebsockets` and `zlib`.
+Requirements: a C++17 compiler, GNU make, `pkg-config`, `libx264`, `libopus`, `libwebsockets` and `zlib`
+(and `libpulse` on Linux).
 The build output is `host/skylatch-host-engine` (git-ignored, as is `host/build/`).
 
 ```sh
@@ -52,12 +57,13 @@ make -C host test       # build and run the unit tests (also needs libavcodec, l
 Needs macOS 12.3+ and Xcode command line tools (ScreenCaptureKit).
 
 ```sh
-brew install pkgconf x264 libwebsockets openssl
+brew install pkgconf x264 opus libwebsockets openssl
 # for make -C host test: brew install ffmpeg
 make -C host
 ```
 
-The first run asks for Screen Recording and Accessibility permission (input injection).
+The first run asks for Screen Recording (which also covers system audio) and Accessibility permission
+(input injection).
 
 ### Linux
 
@@ -66,7 +72,7 @@ both with `BACKENDS="x11 wayland"`.
 
 ```sh
 # Debian / Ubuntu
-sudo apt install build-essential pkg-config libx264-dev libwebsockets-dev zlib1g-dev \
+sudo apt install build-essential pkg-config libx264-dev libopus-dev libpulse-dev libwebsockets-dev zlib1g-dev \
   libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxtst-dev
 # for make -C host test: libavcodec-dev libavutil-dev libswscale-dev
 make -C host
@@ -79,7 +85,8 @@ Build in an MSYS2 UCRT64 shell (the Makefile selects the `windows` backend autom
 
 ```sh
 pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
-  mingw-w64-ucrt-x86_64-x264 mingw-w64-ucrt-x86_64-libwebsockets mingw-w64-ucrt-x86_64-zlib
+  mingw-w64-ucrt-x86_64-x264 mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-libwebsockets \
+  mingw-w64-ucrt-x86_64-zlib
 make -C host CXX=g++
 ```
 

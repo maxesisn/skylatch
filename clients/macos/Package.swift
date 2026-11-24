@@ -28,6 +28,7 @@ let package = Package(
             linkerSettings: [
                 .unsafeFlags(["\(coreLibDir)/libskylatch_client_core.a"]),
                 .linkedFramework("AppKit"),
+                .linkedFramework("AudioToolbox"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("VideoToolbox"),

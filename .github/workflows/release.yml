@@ -83,6 +83,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-x264
+            mingw-w64-x86_64-opus
             mingw-w64-x86_64-libwebsockets
             mingw-w64-x86_64-zlib
       - name: Build Win32 host and stage its runtime DLLs
@@ -136,7 +137,7 @@ jobs:
       - name: Build and package Skylatch for Apple silicon
         run: |
           test "$(uname -m)" = arm64
-          brew install pkgconf x264 libwebsockets openssl
+          brew install pkgconf x264 opus libwebsockets openssl
           openssl_prefix=$(brew --prefix openssl)
           export PKG_CONFIG_PATH="$openssl_prefix/lib/pkgconfig"
           cargo build --locked --release -p skylatch-client-core -p skylatch-agent
@@ -168,7 +169,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config musl-tools dpkg-dev \
-            libx264-dev libwebsockets-dev zlib1g-dev \
+            libx264-dev libopus-dev libpulse-dev libwebsockets-dev zlib1g-dev \
             libx11-dev libxext-dev libxdamage-dev libxfixes-dev libxrandr-dev libxtst-dev \
             libsdl2-dev libavcodec-dev libavutil-dev libjson-c-dev
       - name: Build native client and host packages

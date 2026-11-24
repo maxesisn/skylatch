@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "video.hpp"
+#include "audio.hpp"
 #include "discovery.hpp"
 #include <imm.h>
 #include <windowsx.h>
@@ -22,7 +23,7 @@ struct Config {
     std::string hub, direct, token, device;
     unsigned smoke{};
     int swapCmdCtrl{-1}; // -1 = automatic (on for macOS hosts reached through a hub), 0 = off, 1 = on
-    bool list{}, noDirect{}, noClipboard{}, help{};
+    bool list{}, noDirect{}, noClipboard{}, noAudio{}, help{};
 };
 
 // The viewer is a GUI-subsystem program, so it never owns a console window. For command-line output,
@@ -46,16 +47,17 @@ void usage() {
     std::puts("Usage:\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> --list\n"
               "  skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]\n"
-              "                  [--no-direct] [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]\n"
+              "                  [--no-direct] [--no-clipboard] [--no-audio] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]\n"
               "                  [--smoke-seconds N]\n"
               "  skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]\n"
-              "                  [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]\n"
+              "                  [--no-clipboard] [--no-audio] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]\n"
               "  skylatch-client --help\n\n"
               "Without --device, hub mode selects the sole device or opens a picker.\n"
               "--no-direct forces the hub relay. --no-clipboard disables text clipboard sync.\n"
+              "--no-audio does not ask the host for its sound.\n"
               "--swap-cmd-ctrl / --no-swap-cmd-ctrl force the Ctrl<->Cmd swap on or off; by default it\n"
               "is on for macOS devices reached through a hub.\n"
-              "--smoke-seconds runs hidden without input or clipboard sync;\n"
+              "--smoke-seconds runs hidden without input, clipboard sync or audio;\n"
               "specify --device if the hub has multiple devices.\n"
               "F11: toggle borderless fullscreen (system keys are captured while fullscreen).\n"
               "Double-tap Right Ctrl (or Ctrl+Alt+G): toggle system key capture.\n"
@@ -83,8 +85,9 @@ Config parseArgs(int argc, wchar_t** argv) {
             c.swapCmdCtrl = option == L"--swap-cmd-ctrl" ? 1 : 0;
             continue;
         }
-        if (option == L"--list" || option == L"--no-direct" || option == L"--no-clipboard") {
-            auto& flag = option == L"--list" ? c.list : option == L"--no-direct" ? c.noDirect : c.noClipboard;
+        if (option == L"--list" || option == L"--no-direct" || option == L"--no-clipboard" || option == L"--no-audio") {
+            auto& flag = option == L"--list" ? c.list : option == L"--no-direct" ? c.noDirect :
+                option == L"--no-clipboard" ? c.noClipboard : c.noAudio;
             require(!flag, "duplicate option; see --help");
             flag = true;
             continue;
@@ -110,7 +113,7 @@ Config parseArgs(int argc, wchar_t** argv) {
     require(websocketUrl(c.hub.empty() ? c.direct : c.hub), "endpoint must be a ws:// or wss:// URL without user information");
     if (!c.hub.empty()) {
         require(!c.token.empty(), "--hub requires --token");
-        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.smoke && c.swapCmdCtrl < 0),
+        require(!c.list || (c.device.empty() && !c.noDirect && !c.noClipboard && !c.noAudio && !c.smoke && c.swapCmdCtrl < 0),
             "--list cannot be used with session options");
     } else {
         require(!c.list && c.device.empty() && !c.noDirect, "--list, --device and --no-direct require --hub");
@@ -152,6 +155,7 @@ class Client {
     std::atomic<bool> smoothWheel{false}; // The host accepted smooth-wheel (type 9) records for this session.
     std::atomic<std::shared_ptr<Renderer>> activeRenderer{};
     std::shared_ptr<Hud> hud; // Null in smoke mode: no HUD, no Direct2D.
+    std::unique_ptr<AudioPlayer> audio; // Null in smoke mode and with --no-audio; outlives every session.
     std::thread worker;
     std::mutex videoLock, statsLock, cursorLock, endLock, clipboardLock, monitorLock;
     std::condition_variable videoReady;
@@ -253,6 +257,10 @@ class Client {
     }
     static void onInputResponse(void* ctx, uint32_t sequence, uint8_t status) noexcept {
         if (!sequence) static_cast<Client*>(ctx)->smoothWheel = status == SKYLATCH_INPUT_ACCEPTED;
+    }
+    static void onAudioPcm(void* ctx, uint64_t, uint32_t sampleRate, uint8_t channels, const int16_t* pcm,
+        size_t frames) noexcept {
+        if (const auto& player = static_cast<Client*>(ctx)->audio) player->push(pcm, frames, sampleRate, channels);
     }
     static void onDisconnected(void* ctx, const char* error) noexcept {
         static_cast<Client*>(ctx)->report(error ? error : "Remote session closed", error == nullptr);
@@ -398,7 +406,8 @@ class Client {
                 activeRenderer.store(render);
             }
             smoothWheel = false;
-            const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected, onInputResponse};
+            const SkylatchCallbacks callbacks{onFrame, onCursor, nullptr, onDisconnected, onInputResponse,
+                audio ? onAudioPcm : nullptr};
             char err[1024]{};
             auto active = config.hub.empty()
                 ? skylatch_connect_direct(config.direct.c_str(), config.token.empty() ? nullptr : config.token.c_str(),
@@ -1053,6 +1062,7 @@ public:
         wc.hIcon = icon(SM_CXICON, SM_CYICON); wc.hIconSm = icon(SM_CXSMICON, SM_CYSMICON);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = L"SkylatchNativeView";
         require(RegisterClassExW(&wc) != 0, "RegisterClassExW failed");
+        if (!config.smoke && !config.noAudio) audio = std::make_unique<AudioPlayer>();
         if (!config.smoke) {
             hud = std::make_shared<Hud>();
             if (config.hub.empty()) {

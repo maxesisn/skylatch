@@ -81,6 +81,9 @@ script needs the exit code or the output in order.
 - While connected, the viewer synchronizes local and remote plain text clipboard changes in both
   directions using SL1 Type 19 (UTF-8, up to 1 MiB). Local clipboard changes can be shared even when
   the viewer is not focused. Add **`--no-clipboard`** to disable both sending and receiving.
+- The host's sound plays through WASAPI with a 40 ms jitter buffer that never holds more than 120 ms,
+  when the host supports audio (older hosts are never asked); without an output device the viewer
+  stays silent. Add **`--no-audio`** to leave it off.
 - Add **`--smoke-seconds N`** to a connection command to exercise the decoder and presenter without
   displaying or activating the window. This mode disables input and clipboard sync; use `--device` when the hub lists
   multiple devices. After N seconds from the first successful present, it prints resolution, frame

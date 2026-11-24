@@ -92,6 +92,8 @@ networks. Avoid putting real tokens in scripts or shell history.
 - Losing keyboard focus releases every held key and button on the host.
 - Plain text clipboard changes are synchronized in both directions using SL1 Type 19 (UTF-8, up to
   1 MiB). Add **`--no-clipboard`** to disable sending and receiving.
+- The host's sound plays through an AudioQueue with a 40 ms jitter buffer that never holds more than
+  120 ms, when the host supports audio (older hosts are never asked). Add **`--no-audio`** to leave it off.
 
 ## Smoke mode
 

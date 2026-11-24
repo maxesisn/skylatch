@@ -4,7 +4,7 @@ use crate::{ClientError, Event, Frame};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::control::{ClientToHub, DeviceInfo, DirectEndpoint, HubToClient};
-use skylatch_proto::nsl1::{Message as Nsl1, HEADER_SIZE, MAX_PAYLOAD, SUBPROTOCOL};
+use skylatch_proto::nsl1::{AudioFormat, Message as Nsl1, HEADER_SIZE, MAX_PAYLOAD, SUBPROTOCOL};
 use std::{net::Ipv6Addr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, task::JoinSet, time::timeout};
 use tokio_tungstenite::{
@@ -37,9 +37,44 @@ fn ws_config() -> WebSocketConfig {
         .max_frame_size(Some(limit))
 }
 
+/// A host-to-viewer message: an event for the caller, or audio the session decodes first.
+pub(crate) enum Inbound {
+    Event(Event),
+    AudioConfig(AudioFormat),
+    AudioFrame {
+        sequence: u32,
+        capture_us: u64,
+        data: Bytes,
+    },
+}
+
 /// Direct and relay share the same host-to-viewer NSL1 message types.
-pub(crate) fn decode_stream_event(bytes: &Bytes) -> Result<(u32, Event), ClientError> {
-    Ok(match Nsl1::decode(bytes)? {
+pub(crate) fn decode_stream_event(bytes: &Bytes) -> Result<(u32, Inbound), ClientError> {
+    let message = Nsl1::decode(bytes)?;
+    Ok(match message {
+        Nsl1::AudioConfig { generation, format } => (generation, Inbound::AudioConfig(format)),
+        Nsl1::AudioFrame {
+            generation,
+            sequence,
+            capture_us,
+            data,
+        } => (
+            generation,
+            Inbound::AudioFrame {
+                sequence,
+                capture_us,
+                data,
+            },
+        ),
+        other => {
+            let (generation, event) = stream_event(other)?;
+            (generation, Inbound::Event(event))
+        }
+    })
+}
+
+fn stream_event(message: Nsl1) -> Result<(u32, Event), ClientError> {
+    Ok(match message {
         Nsl1::Frame {
             generation,
             sequence,

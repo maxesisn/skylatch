@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/audio-source.hpp"
 #include "core/backend-options.hpp"
 #include "core/capture-source.hpp"
 #include "core/clipboard.hpp"
@@ -22,6 +23,8 @@ struct Backend {
   /// Makes the display with this id the one that capture sources created afterwards, and the input mapping, use.
   /// False when no display has that id or it cannot be streamed; nothing changes then.
   bool (*selectMonitor)(const std::string& id);
+  /// A new, stopped loopback capture of the desktop's sound output.
+  std::unique_ptr<AudioSource> (*audio)();
 };
 const Backend& defaultBackend();
 const Backend& backendFor(const std::string& name);

@@ -48,6 +48,51 @@ static_assert(SDL_SCANCODE_UNKNOWN == 0 && SDL_SCANCODE_A == 4 && SDL_SCANCODE_Z
 
 struct Device { std::string id, name, os, monitors, endpoints; };
 
+// Plays host audio through an SDL queue. Up to 120 ms may queue up; beyond that the backlog is
+// dropped so audio stays close to the video. Created before the session and destroyed after it,
+// so no audio callback outlives the device.
+class AudioOut {
+    static constexpr int rate = 48000, channels = 2;
+    static constexpr Uint32 maxQueuedBytes = rate * channels * sizeof(int16_t) * 120 / 1000;
+    SDL_AudioDeviceID device{};
+
+public:
+    AudioOut() {
+        SDL_SetMainReady();
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+            std::cerr << "Audio unavailable: " << SDL_GetError() << '\n';
+            return;
+        }
+        SDL_AudioSpec want{};
+        want.freq = rate;
+        want.format = AUDIO_S16SYS;
+        want.channels = channels;
+        want.samples = 480;
+        device = SDL_OpenAudioDevice(nullptr, 0, &want, nullptr, 0);
+        if (!device) {
+            std::cerr << "Audio unavailable: " << SDL_GetError() << '\n';
+            SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            return;
+        }
+        SDL_PauseAudioDevice(device, 0);
+    }
+    ~AudioOut() {
+        if (!device) return;
+        SDL_CloseAudioDevice(device);
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    AudioOut(const AudioOut&) = delete;
+    AudioOut& operator=(const AudioOut&) = delete;
+    bool available() const { return device != 0; }
+    static void pcm(void* user, uint64_t, uint32_t sampleRate, uint8_t count, const int16_t* samples,
+                    size_t frames) noexcept {
+        const auto& self = *static_cast<const AudioOut*>(user);
+        if (!self.device || sampleRate != rate || count != channels || !samples) return;
+        if (SDL_GetQueuedAudioSize(self.device) > maxQueuedBytes) SDL_ClearQueuedAudio(self.device);
+        SDL_QueueAudio(self.device, samples, static_cast<Uint32>(frames * channels * sizeof(int16_t)));
+    }
+};
+
 std::vector<Device> discover(const Config& config) {
     char error[512]{};
     const std::unique_ptr<char, decltype(&skylatch_free_string)> raw(
@@ -125,6 +170,7 @@ using Update = std::variant<Frame, Cursor, std::string, End>;
 
 class Mailbox {
     std::mutex mutex;
+    AudioOut* audio{};
     std::condition_variable ready;
     std::deque<Update> queue;
     static constexpr size_t maxQueuedBytes = 16 * 1024 * 1024;
@@ -145,7 +191,12 @@ class Mailbox {
     }
 
 public:
-    explicit Mailbox(bool show) : display(show) {}
+    Mailbox(bool show, AudioOut* sound) : audio(sound), display(show) {}
+    static void audioPcm(void* user, uint64_t captureUs, uint32_t sampleRate, uint8_t channels,
+                         const int16_t* samples, size_t frames) noexcept {
+        AudioOut::pcm(static_cast<Mailbox*>(user)->audio, captureUs, sampleRate, channels, samples, frames);
+    }
+    bool wantsAudio() const { return audio && audio->available(); }
     static void frame(void* user, uint32_t generation, uint32_t sequence, uint16_t, uint16_t, uint64_t,
                       bool keyframe, const uint8_t* data, size_t size) noexcept {
         const auto arrival = Clock::now();
@@ -194,7 +245,7 @@ public:
 ClientPtr connect(const Config& config, Mailbox& mailbox) {
     char error[512]{};
     const SkylatchCallbacks callbacks{Mailbox::frame, Mailbox::cursor, nullptr, Mailbox::disconnected,
-                                      Mailbox::inputResponse};
+                                      Mailbox::inputResponse, mailbox.wantsAudio() ? Mailbox::audioPcm : nullptr};
     ClientPtr client(config.hub.empty()
         ? skylatch_connect_direct(config.direct.c_str(), config.token.empty() ? nullptr : config.token.c_str(),
                                   &callbacks, &mailbox, error, sizeof(error))
@@ -224,7 +275,7 @@ struct VideoSubsystem {
 #endif
         sdlCheck(SDL_Init(SDL_INIT_VIDEO) == 0, "initialize SDL video");
     }
-    ~VideoSubsystem() { SDL_Quit(); }
+    ~VideoSubsystem() { SDL_QuitSubSystem(SDL_INIT_VIDEO); }
 };
 
 template<class T, void (*Free)(T*)> struct SdlFree { void operator()(T* ptr) const { Free(ptr); } };
@@ -563,8 +614,10 @@ int run(Config config) {
     if (config.help) { std::cout << usage; return 0; }
     if (!selectDevice(config)) return 0;
     const bool smoke = config.smokeSeconds != 0;
-    // Set up the blocking connection before initializing SDL. Callbacks only enqueue updates.
-    Mailbox mailbox(!smoke);
+    // Set up the blocking connection before initializing SDL video. Callbacks only enqueue updates.
+    std::optional<AudioOut> audio;
+    if (!smoke && !config.noAudio) audio.emplace();
+    Mailbox mailbox(!smoke, audio ? &*audio : nullptr);
     auto client = connect(config, mailbox);
     std::optional<Viewer> viewer;
     if (!smoke) viewer.emplace(client.get(), mailbox, !config.noClipboard);

@@ -64,6 +64,12 @@ struct Server {
     /// SL1 messages waiting for the first frame to go out: the monitor list (Type 17) and desktop clipboard text (Type 19).
     std::optional<std::vector<MonitorInfo>> monitors_pending;
     std::optional<std::string> clipboard_data_pending;
+    /// The viewer asked for audio (Type 22); the AudioConfig (Type 20) it gets before the first AudioFrame (Type 21)
+    /// may still be pending.
+    bool audio = false, audio_config_pending = false;
+    uint32_t audio_sequence = 0;
+    /// Opus packets waiting for the socket, oldest first.
+    std::deque<std::shared_ptr<const AudioPacket>> audio_pending;
     size_t buffered_stream_bytes = 0;
     uint32_t stream_notsent_lowat = 0;
     uint64_t flow_timer_due_us = 0;
@@ -105,6 +111,14 @@ struct Server {
   std::unique_ptr<InputController> input;
   uint32_t nextGeneration = 0;
   uint16_t width = 0, height = 0;
+  /// Audio packets the capture thread finished, for the service thread to hand to the listening streams.
+  std::mutex audio_mutex;
+  std::deque<std::shared_ptr<const AudioPacket>> audio_ready;
+  /// Packets kept per stream and in audio_ready; older ones are dropped so audio never lags.
+  static constexpr size_t max_pending_audio = 8;
+  /// Desktop audio, captured only while a stream listens; null with --no-audio. Declared last so its capture
+  /// thread stops before the members its packets reach.
+  std::unique_ptr<AudioCapture> audio;
   explicit Server(Config settings);
   Stream* streamFor(lws* wsi);
   ConnectionPlan planConnection(Socket socket, bool grant);
@@ -126,6 +140,11 @@ struct Server {
   void selectMonitor(Stream& stream, const std::string& id);
   /// Routes the replies of SL1 clipboard requests that the ClipboardWorker finished.
   void clipboardFinished(const ClipboardWorker::Reply& reply);
+  /// Handles a Type 22 AudioControl: the stream starts or stops receiving audio, and capture runs while any does.
+  void setAudio(Stream& stream, bool enabled);
+  void updateAudio();
+  /// Queues the captured packets on every listening stream.
+  void deliverAudio();
   bool controlMessage();
   std::string metrics();
   /// Holds the HTTP response until the backend applied or dropped the batch; posted counts records that reached it.

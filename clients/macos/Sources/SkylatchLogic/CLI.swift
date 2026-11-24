@@ -10,6 +10,7 @@ public struct Config: Equatable {
     public var list = false
     public var noDirect = false
     public var noClipboard = false
+    public var noAudio = false
     /// nil = automatic (on for Windows and Linux devices reached through a hub), otherwise forced.
     public var swapCmdCtrl: Bool?
     public var help = false
@@ -30,15 +31,16 @@ public enum CLI {
         Usage:
           skylatch-client --hub <ws:// or wss:// URL> --token <token> --list
           skylatch-client --hub <ws:// or wss:// URL> --token <token> [--device <id>]
-                          [--no-direct] [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]
+                          [--no-direct] [--no-clipboard] [--no-audio] [--swap-cmd-ctrl | --no-swap-cmd-ctrl]
                           [--smoke-seconds N]
           skylatch-client --direct <ws:// or wss:// URL> [--token <64-hex>]
-                          [--no-clipboard] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]
+                          [--no-clipboard] [--no-audio] [--swap-cmd-ctrl | --no-swap-cmd-ctrl] [--smoke-seconds N]
           skylatch-client --help
 
         Without --device, hub mode selects the sole device or opens a picker.
         --no-direct forces the hub relay. --no-clipboard disables text clipboard sync.
-        --smoke-seconds runs hidden without input or clipboard sync;
+        --no-audio does not ask the host for its sound.
+        --smoke-seconds runs hidden without input, clipboard sync or audio;
         specify --device if the hub has multiple devices.
         --swap-cmd-ctrl / --no-swap-cmd-ctrl force the Cmd<->Ctrl swap on or off; by default it is on
         for Windows and Linux devices reached through a hub. The HUD toggles it live.
@@ -82,6 +84,9 @@ public enum CLI {
             case "--no-clipboard":
                 if c.noClipboard { throw UsageError("duplicate option; see --help") }
                 c.noClipboard = true
+            case "--no-audio":
+                if c.noAudio { throw UsageError("duplicate option; see --help") }
+                c.noAudio = true
             case "--swap-cmd-ctrl", "--no-swap-cmd-ctrl":
                 if c.swapCmdCtrl != nil { throw UsageError("duplicate or conflicting Cmd/Ctrl swap option; see --help") }
                 c.swapCmdCtrl = option == "--swap-cmd-ctrl"
@@ -122,7 +127,7 @@ public enum CLI {
         }
         if !c.hub.isEmpty {
             if c.token.isEmpty { throw UsageError("--hub requires --token") }
-            if c.list && (!c.device.isEmpty || c.noDirect || c.noClipboard || c.isSmoke || c.swapCmdCtrl != nil) {
+            if c.list && (!c.device.isEmpty || c.noDirect || c.noClipboard || c.noAudio || c.isSmoke || c.swapCmdCtrl != nil) {
                 throw UsageError("--list cannot be used with session options")
             }
         } else {

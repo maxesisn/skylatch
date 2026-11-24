@@ -184,6 +184,26 @@ size_t maxViewerMessage(const std::vector<uint8_t>& received) {
   }
   return 36;
 }
+void audioConfigMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation) {
+  const std::string json = "{\"codec\":\"opus\",\"sample_rate\":" + std::to_string(audio_sample_rate) +
+      ",\"channels\":" + std::to_string(audio_channels) + ",\"frame_ms\":" + std::to_string(AudioEncoder::frame_ms) + "}";
+  auto* p = start(out, pre, nsl1_header_bytes + json.size(), 20, generation);
+  put(p+16, json.size(), 4);
+  std::memcpy(p+nsl1_header_bytes, json.data(), json.size());
+}
+bool audioFrameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, const AudioPacket& packet) {
+  const size_t payload = audio_frame_prefix_bytes + packet.data.size();
+  if (!sequence || packet.data.empty() || payload > max_audio_frame_bytes) return false;
+  auto* p = start(out, pre, nsl1_header_bytes + payload, 21, generation);
+  put(p+12, sequence, 4); put(p+16, payload, 4); put(p+20, packet.capture_us, 8);
+  std::memcpy(p+28, packet.data.data(), packet.data.size());
+  return true;
+}
+bool audioControlEnabled(const uint8_t* payload, size_t size, bool& enabled) {
+  if (size != 1 || payload[0] > 1) return false;
+  enabled = payload[0] == 1;
+  return true;
+}
 void inputReply(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t sequence, InputStatus status) {
   auto* p = start(out, pre, 21, 5, generation);
   put(p+12, sequence, 4); put(p+16, 1, 4);

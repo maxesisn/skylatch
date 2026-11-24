@@ -22,6 +22,8 @@ struct Config {
   EncoderPreference encoder = EncoderPreference::automatic;
   uint64_t bitrate_min = 1000000, bitrate_start = 8000000, bitrate_max = 40000000;
   bool proxy = false, insecure_local = false, check = false, no_viewer = false;
+  /// --no-audio, or SKYLATCH_NO_AUDIO set to anything but 0: viewers asking for audio get none.
+  bool no_audio = false;
   std::vector<std::string> allowed_origins;
 };
 bool unsignedNumber(const std::string& text, uint64_t& value);

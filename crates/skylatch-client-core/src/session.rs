@@ -1,6 +1,7 @@
 //! Async viewing sessions and the `NSL1` WebSocket data pump.
 
-use crate::transport::{self, Socket, WRITE_TIMEOUT};
+use crate::audio::{AudioDecoder, AudioPcm};
+use crate::transport::{self, Inbound, Socket, WRITE_TIMEOUT};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use skylatch_proto::nsl1::{
@@ -84,6 +85,8 @@ pub enum Event {
         sequence: u32,
         status: InputStatus,
     },
+    /// Decoded host audio, delivered while audio is enabled.
+    Audio(AudioPcm),
     Disconnected(Result<(), ClientError>),
 }
 
@@ -113,6 +116,7 @@ pub struct SessionClient {
     stop: watch::Sender<bool>,
     generation: Arc<AtomicU32>,
     smooth_wheel: Arc<AtomicBool>,
+    audio: watch::Sender<bool>,
 }
 
 impl SessionClient {
@@ -126,7 +130,7 @@ impl SessionClient {
         callback: impl FnMut(Event) + Send + 'static,
     ) -> Result<Self, ClientError> {
         let connection = Connection::hub(hub_url, token, device_id, prefer_direct).await?;
-        let (client, pump) = connection.start(callback);
+        let (client, pump) = connection.start(false, callback);
         tokio::spawn(pump);
         Ok(client)
     }
@@ -139,13 +143,20 @@ impl SessionClient {
         callback: impl FnMut(Event) + Send + 'static,
     ) -> Result<Self, ClientError> {
         let connection = Connection::direct(ws_url, token).await?;
-        let (client, pump) = connection.start(callback);
+        let (client, pump) = connection.start(false, callback);
         tokio::spawn(pump);
         Ok(client)
     }
 
     pub fn transport_mode(&self) -> TransportMode {
         self.mode
+    }
+
+    /// Starts or stops host audio ([`Event::Audio`]); it is off after connecting. The request
+    /// reaches the host only after it accepted the query the session sends after its first
+    /// message, so hosts without audio never receive an audio control message.
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio.send_replace(enabled);
     }
 
     /// True once the host accepted the smooth-wheel query; until then smooth-wheel sends fail.
@@ -316,13 +327,16 @@ impl Connection {
         })
     }
 
+    /// Starts the data pump. `audio` is the initial [`SessionClient::set_audio_enabled`] state.
     pub(crate) fn start(
         self,
+        audio: bool,
         mut callback: impl FnMut(Event) + Send + 'static,
     ) -> (SessionClient, impl Future<Output = ()> + Send + 'static) {
         let Self { mut socket, mode } = self;
         let (outbound, mut queue) = mpsc::channel(OUTBOUND_CAPACITY);
         let (stop, mut stopped) = watch::channel(false);
+        let (audio, audio_wanted) = watch::channel(audio);
         let generation = Arc::new(AtomicU32::new(0));
         let smooth_wheel = Arc::new(AtomicBool::new(false));
         let client = SessionClient {
@@ -331,13 +345,24 @@ impl Connection {
             stop,
             generation: generation.clone(),
             smooth_wheel: smooth_wheel.clone(),
+            audio,
         };
         let pump = async move {
             let relay = mode == TransportMode::Relay;
+            let mut state = PumpState {
+                generation: &generation,
+                smooth_wheel: &smooth_wheel,
+                audio: AudioLink {
+                    wanted: audio_wanted,
+                    accepted: false,
+                    requested: false,
+                    decoder: None,
+                },
+            };
             let result = tokio::select! {
                 biased;
                 _ = stopped.changed() => Ok(()),
-                result = pump_messages(&mut socket, &mut queue, &generation, &smooth_wheel, relay, &mut callback) => result,
+                result = pump_messages(&mut socket, &mut queue, &mut state, relay, &mut callback) => result,
             };
             queue.close();
             transport::close(&mut socket, relay).await;
@@ -347,28 +372,107 @@ impl Connection {
     }
 }
 
-/// Asks whether the host accepts smooth-wheel records. Older hosts ignore an ACK of sequence 0.
-async fn send_smooth_wheel_query(socket: &mut Socket, generation: u32) -> Result<(), ClientError> {
-    let query = Message::Ack {
-        generation,
-        sequence: 0,
-        viewer_wait_us: None,
-    }
-    .encode()?;
+async fn send_now(socket: &mut Socket, message: Message) -> Result<(), ClientError> {
     timeout(
         WRITE_TIMEOUT,
-        socket.send(tungstenite::Message::Binary(query)),
+        socket.send(tungstenite::Message::Binary(message.encode()?)),
     )
     .await
     .map_err(|_| ClientError::Timeout("WebSocket write"))??;
     Ok(())
 }
 
+/// Whether the caller wants audio, and what the host has been asked for.
+struct AudioLink {
+    wanted: watch::Receiver<bool>,
+    /// The host accepted the capability query, so it understands audio control.
+    accepted: bool,
+    requested: bool,
+    decoder: Option<AudioDecoder>,
+}
+
+struct PumpState<'a> {
+    generation: &'a AtomicU32,
+    smooth_wheel: &'a AtomicBool,
+    audio: AudioLink,
+}
+
+impl PumpState<'_> {
+    /// Sends an audio control when the caller's choice differs from what the host was asked for.
+    async fn update_audio(&mut self, socket: &mut Socket) -> Result<(), ClientError> {
+        let wanted = *self.audio.wanted.borrow_and_update();
+        if !self.audio.accepted || wanted == self.audio.requested {
+            return Ok(());
+        }
+        let generation = self.generation.load(Ordering::Relaxed);
+        send_now(
+            socket,
+            Message::AudioControl {
+                generation,
+                enabled: wanted,
+            },
+        )
+        .await?;
+        self.audio.requested = wanted;
+        Ok(())
+    }
+
+    async fn receive(
+        &mut self,
+        socket: &mut Socket,
+        bytes: &Bytes,
+        callback: &mut (impl FnMut(Event) + Send),
+    ) -> Result<(), ClientError> {
+        let (current, inbound) = transport::decode_stream_event(bytes)?;
+        if self.generation.swap(current, Ordering::Relaxed) == 0 {
+            // The smooth-wheel query, which also tells new hosts from those without audio.
+            // Older hosts ignore an ACK of sequence 0.
+            send_now(
+                socket,
+                Message::Ack {
+                    generation: current,
+                    sequence: 0,
+                    viewer_wait_us: None,
+                },
+            )
+            .await?;
+        }
+        match inbound {
+            Inbound::Event(event) => {
+                if let Event::InputResponse {
+                    sequence: 0,
+                    status,
+                } = event
+                {
+                    let accepted = status == InputStatus::Accepted;
+                    self.smooth_wheel.store(accepted, Ordering::Relaxed);
+                    self.audio.accepted = accepted;
+                    self.update_audio(socket).await?;
+                }
+                callback(event);
+            }
+            Inbound::AudioConfig(format) => self.audio.decoder = AudioDecoder::new(&format),
+            Inbound::AudioFrame {
+                sequence,
+                capture_us,
+                data,
+            } => {
+                if let Some(decoder) = self.audio.decoder.as_mut().filter(|_| self.audio.requested)
+                {
+                    for pcm in decoder.decode(sequence, capture_us, &data) {
+                        callback(Event::Audio(pcm));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 async fn pump_messages(
     socket: &mut Socket,
     queue: &mut mpsc::Receiver<Bytes>,
-    generation: &AtomicU32,
-    smooth_wheel: &AtomicBool,
+    state: &mut PumpState<'_>,
     relay: bool,
     callback: &mut (impl FnMut(Event) + Send),
 ) -> Result<(), ClientError> {
@@ -376,14 +480,7 @@ async fn pump_messages(
         tokio::select! {
             incoming = socket.next() => match incoming {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
-                    let (current, event) = transport::decode_stream_event(&bytes)?;
-                    if generation.swap(current, Ordering::Relaxed) == 0 {
-                        send_smooth_wheel_query(socket, current).await?;
-                    }
-                    if let Event::InputResponse { sequence: 0, status } = event {
-                        smooth_wheel.store(status == InputStatus::Accepted, Ordering::Relaxed);
-                    }
-                    callback(event);
+                    state.receive(socket, &bytes, callback).await?;
                     // A socket with many already-buffered frames can remain ready without
                     // touching Tokio I/O. Cooperate so the enclosing cancel select is polled.
                     tokio::task::consume_budget().await;
@@ -410,6 +507,7 @@ async fn pump_messages(
                 timeout(WRITE_TIMEOUT, socket.send(tungstenite::Message::Binary(bytes)))
                     .await.map_err(|_| ClientError::Timeout("WebSocket write"))??;
             }
+            Ok(()) = state.audio.wanted.changed() => state.update_audio(socket).await?,
         }
     }
 }
