@@ -1,0 +1,4 @@
+# Only affects cargo runs started inside clients/desktop-ui.
+# Keeps builds free of the dependency-only future-incompat notice (proc-macro-error2).
+[future-incompat-report]
+frequency = "never"
