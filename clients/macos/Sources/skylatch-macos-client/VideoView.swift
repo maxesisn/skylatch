@@ -16,6 +16,16 @@ final class VideoView: NSView, NSTextInputClient {
     var videoSize: () -> (width: Int, height: Int) = { (0, 0) }
     /// False after the session ended; all input is dropped.
     var inputEnabled = true
+    /// In-window HUD over the video; pointer events it owns are never forwarded to the host.
+    var hud: HudOverlay?
+    /// Cross-OS swap: local Cmd drives the remote Ctrl and local Ctrl drives the remote GUI key.
+    var swapCmdCtrl = false
+    /// Called when Right Ctrl is double-tapped (toggle system key capture).
+    var onToggleCapture: (() -> Void)?
+    /// Called when Esc has been held long enough in fullscreen (leave fullscreen).
+    var onEscapeHold: (() -> Void)?
+    /// How long Esc must stay down in fullscreen before it leaves fullscreen.
+    static let escapeHoldSeconds = 1.2
 
     private var held = Set<UInt8>()
     private var buttons: UInt16 = 0
@@ -24,6 +34,10 @@ final class VideoView: NSView, NSTextInputClient {
     private var lastY: UInt16 = 0
     private var wheelX = WheelAccumulator()
     private var wheelY = WheelAccumulator()
+    private var rightCtrlTap = DoubleTapDetector()
+    private var escapeTimer: Timer?
+    /// Key codes whose key-down the system-key tap consumed, so their key-up is consumed too.
+    private var capturedKeys = Set<UInt16>()
 
     // IME state.
     private var markedString = ""
@@ -139,6 +153,9 @@ final class VideoView: NSView, NSTextInputClient {
 
     /// Forgets every held key and button and tells the host to release them.
     func releaseAll() {
+        escapeTimer?.invalidate()
+        escapeTimer = nil
+        capturedKeys.removeAll()
         held.removeAll()
         buttons = 0
         modifiers = 0
@@ -165,11 +182,14 @@ final class VideoView: NSView, NSTextInputClient {
     }
 
     private func pointerMoved(_ event: NSEvent) {
+        // The HUD owns the top strip, the pill and the disconnect card; a drag in progress is never hijacked.
+        if buttons == 0, let hud, hud.pointerMoved(to: convert(event.locationInWindow, from: nil)) { return }
         updatePosition(event)
         if ready { send(InputType.pointerMove) }
     }
 
     override func mouseMoved(with event: NSEvent) { pointerMoved(event) }
+    override func mouseExited(with event: NSEvent) { hud?.pointerLeft() }
     override func mouseDragged(with event: NSEvent) { pointerMoved(event) }
     override func rightMouseDragged(with event: NSEvent) { pointerMoved(event) }
     override func otherMouseDragged(with event: NSEvent) { pointerMoved(event) }
@@ -205,7 +225,8 @@ final class VideoView: NSView, NSTextInputClient {
 
     // MARK: Keyboard
 
-    private func remoteKey(_ code: UInt8, down: Bool) {
+    private func remoteKey(_ hid: UInt8, down: Bool) {
+        let code = ModifierSwap.map(hid, enabled: swapCmdCtrl)
         guard inputEnabled, videoSize().width > 0, (down || held.contains(code)) else { return }
         if down { held.insert(code) } else { held.remove(code) }
         if code >= 224 {
@@ -225,6 +246,7 @@ final class VideoView: NSView, NSTextInputClient {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown else { return false }
+        rightCtrlTap.cancel()
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
         if flags == [.command, .control] && event.keyCode == UInt16(kVK_ANSI_F) {
             if !event.isARepeat { window?.toggleFullScreen(nil) }
@@ -242,7 +264,11 @@ final class VideoView: NSView, NSTextInputClient {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard inputEnabled else { return }
+        if !inputEnabled {
+            if event.keyCode == UInt16(kVK_Return), !event.isARepeat, hud?.isLostCardVisible == true { hud?.onAction?(.reconnect) }
+            return
+        }
+        rightCtrlTap.cancel()
         let hid = KeyMap.hid(forVirtualKey: event.keyCode)
         let shortcut = !event.modifierFlags.intersection([.command, .control]).isEmpty
         var consumed = false
@@ -265,12 +291,59 @@ final class VideoView: NSView, NSTextInputClient {
             // An input method that swallowed the key without text or a command also consumes it.
             consumed = wasComposing || didSetMarkedText || typed || (handled && texts.isEmpty && !didRunCommand)
         }
-        if !consumed, let hid { remoteKey(hid, down: true) }
+        if !consumed, let hid {
+            remoteKey(hid, down: true)
+            // A short Esc press has already gone out; only a long hold in fullscreen leaves fullscreen.
+            if event.keyCode == UInt16(kVK_Escape), !event.isARepeat, isFullScreen { startEscapeHold() }
+        }
     }
 
     override func keyUp(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Escape) { cancelEscapeHold() }
         guard let hid = KeyMap.hid(forVirtualKey: event.keyCode) else { return }
         remoteKey(hid, down: false)
+    }
+
+    private var isFullScreen: Bool { window?.styleMask.contains(.fullScreen) == true }
+
+    private func startEscapeHold() {
+        cancelEscapeHold()
+        let timer = Timer(timeInterval: Self.escapeHoldSeconds, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.escapeTimer = nil
+            guard self.isFullScreen else { return }
+            // Release Esc on the host before leaving, so it does not stay held there.
+            self.remoteKey(UInt8(KeyMap.hid(forVirtualKey: UInt16(kVK_Escape)) ?? 41), down: false)
+            self.onEscapeHold?()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        escapeTimer = timer
+    }
+
+    private func cancelEscapeHold() {
+        escapeTimer?.invalidate()
+        escapeTimer = nil
+    }
+
+    /// Entry point for the system-key tap: Command and Control shortcuts that the system would otherwise
+    /// act on are forwarded to the host as complete key presses. Returns true when the event was consumed.
+    func handleCapturedKey(keyCode: UInt16, down: Bool, flags: NSEvent.ModifierFlags, isRepeat: Bool) -> Bool {
+        guard inputEnabled, videoSize().width > 0, !hasMarkedText(),
+              !KeyMap.isModifierVirtualKey(keyCode), let hid = KeyMap.hid(forVirtualKey: keyCode) else { return false }
+        if !down {
+            guard capturedKeys.remove(keyCode) != nil else { return false }
+            remoteKey(hid, down: false)
+            return true
+        }
+        let f = flags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+        guard f.contains(.command) || f.contains(.control) else { return false }
+        // The same two shortcuts that stay local without capture: quit, and fullscreen.
+        if f == .command && keyCode == UInt16(kVK_ANSI_Q) { return false }
+        if f == [.command, .control] && keyCode == UInt16(kVK_ANSI_F) { return false }
+        capturedKeys.insert(keyCode)
+        rightCtrlTap.cancel()
+        remoteKey(hid, down: true)
+        return true
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -287,6 +360,16 @@ final class VideoView: NSView, NSTextInputClient {
         guard let hid = KeyMap.hid(forVirtualKey: vk),
               let down = KeyMap.modifierIsDown(virtualKey: vk, rawFlags: UInt(event.modifierFlags.rawValue)) else { return }
         if down && hasMarkedText() { return }
+        if vk == UInt16(kVK_RightControl) {
+            // Double-tap Right Ctrl toggles system key capture: the first tap goes to the host like any
+            // Ctrl tap, the second is consumed here. Any other key press in between cancels the gesture.
+            if down && rightCtrlTap.press(at: DispatchTime.now().uptimeNanoseconds) {
+                onToggleCapture?()
+                return
+            }
+        } else if down {
+            rightCtrlTap.cancel()
+        }
         remoteKey(hid, down: down)
     }
 
