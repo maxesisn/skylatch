@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod ffi;
+mod http;
 pub mod parser;
 mod session;
 mod transport;
@@ -17,3 +18,6 @@ pub use skylatch_proto::{
     nsl1::{Header, Message, MonitorInfo},
 };
 pub use transport::list_devices;
+
+pub use http::{create_pairing_code, enroll, login};
+pub use skylatch_proto::onboarding::{LoginResponse, PairingCodeResponse};

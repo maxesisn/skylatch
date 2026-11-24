@@ -125,10 +125,60 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
+| `GET /` | none | Embedded Hub Web console |
+| `POST /api/v1/login` | username and password | Return a client-session token |
+| `POST /api/v1/pairing-codes` | account Bearer token | Mint a one-time device pairing code |
+| `POST /api/v1/enroll` | pairing code or username and password | Enroll a host and return its device token |
+| `DELETE /api/v1/devices/:id/token` | account Bearer token | Revoke the specified device token |
+| `POST /api/v1/direct-sessions` | account Bearer token | Get a short-lived direct-stream ticket for a connected host |
 | `GET /healthz` | none | Liveness: `{"status":"ok","version":"…"}` |
 | `GET /api/v1/devices` | `Authorization: Bearer <token>` | `{"devices":[DeviceInfo…]}` for the token's account |
 | `GET /ws/host` | first message | Host registration socket |
 | `GET /ws/client` | first message | Client session socket |
+
+### Onboarding and credentials
+
+Run the hub behind HTTPS/WSS. Configure password users with repeatable `--user username=password`
+flags or comma-delimited `SKYLATCH_USERS`. Usernames are also account names. The legacy
+`--account name=token` and `SKYLATCH_ACCOUNTS` settings work as before. A matching static account
+and username share a device directory. Pass `--state-file` or `SKYLATCH_STATE_FILE` to keep users,
+client-session tokens, and device token digests across restarts. The hub saves salted Argon2id
+password hashes, not plaintext passwords, and atomically replaces the JSON file (mode `0600` on
+Unix). A changed configured password rotates the affected client-session token. Without a state
+file, newly issued credentials last until the process exits. Pairing codes are never persisted.
+
+Use JSON request bodies with `Content-Type: application/json`. An account bearer is either a static
+account token or a login session token. Device tokens cannot access the client directory, issue
+codes, or manage credentials.
+
+- **`POST /api/v1/login`** accepts `{"username":"…","password":"…"}` and returns
+  `{"account":"…","token":"…"}`. The same session token can be used with the HTTP directory and
+  `/ws/client` and is returned on subsequent successful logins.
+- **`POST /api/v1/pairing-codes`** has no request body. It returns
+  `{"code":"482-917","expires_in_secs":600}`. Each code belongs to the requesting account, expires
+  after 10 minutes, and can be consumed by exactly one successful enrollment.
+- **`POST /api/v1/enroll`** accepts `{"code":"482-917","device_id":"…","name":"…"}` or
+  `{"username":"…","password":"…","device_id":"…","name":"…"}`. The latter works even when the
+  account has no registered hosts. It returns `{"account":"…","device_id":"…","device_token":"…"}`.
+  Device IDs have at most 128 ASCII characters (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`) and cannot be
+  `.` or `..`. The returned 64-hex credential is only sent once. An already-enrolled ID in that
+  account returns `409 Conflict` until its token is revoked.
+- **`DELETE /api/v1/devices/:id/token`** returns `204 No Content` if the device credential was
+  revoked or `404 Not Found` if that account has no such credential. The active host connection
+  using the device credential is disconnected. Static account tokens are not revoked or altered.
+
+Invalid or expired credentials return `401 Unauthorized`; the hub limits password and pairing-code
+attempts and may return `429 Too Many Requests`.
+
+Use `skylatch-agent join https://hub.example.com --code 482-917` or replace `--code` with
+`--username <user>` to enter a password. With neither option the agent prompts for both; automation
+can set `SKYLATCH_PASSWORD`. The agent never saves the password. It saves the hub address, device
+ID, name, device token, and optional room and slot in the per-user `agent.json`: under
+`$XDG_CONFIG_HOME/skylatch` (by default `~/.config/skylatch`) on Linux,
+`~/Library/Application Support/Skylatch` on macOS, or `%APPDATA%\Skylatch` on Windows. On Unix the
+file is mode `0600`. Subsequent runs use that configuration and can find `skylatch-host-engine`
+next to the agent or on `PATH`. Explicit `--hub` and `--token` still support manual configuration;
+provide `--engine-bin` or `--engine-url` to select a different local engine.
 
 ### Shared types
 
@@ -165,9 +215,10 @@ Host to hub:
 
 | Type | Fields | Meaning |
 | --- | --- | --- |
-| `register` | `token`, `device` | Must be first. Adds the host to its account's directory |
+| `register` | `token`, `device` | Must be first. A static account token or a device token for exactly `device.device_id` |
 | `heartbeat` | `seq` | Liveness; any message resets the idle timer |
 | `direct_endpoints` | `endpoints` | Replaces the advertised direct endpoints |
+| `direct_access` | `key` | Optional 64-hex signing key for the lifetime of this host connection; never sent to clients |
 | `session_ready` | `session_id` | Host is ready to stream |
 | `session_closed` | `session_id` | Host ended the session |
 
@@ -206,7 +257,7 @@ Hub to client:
 | `devices` | `devices` | Reply to `list_devices` |
 | `direct_hint` | `device_id`, `endpoints` | Direct endpoints to try before relaying (may be empty) |
 | `relay_stream` | `session_id`, `device_id` | Binary messages on this socket are now the relayed `NSL1` stream |
-| `session_closed` | `session_id`, `reason` | Session ended: `host_disconnected`, `host_closed`, `host_replaced`, `client_disconnect` |
+| `session_closed` | `session_id`, `reason` | Session ended: `host_disconnected`, `host_closed`, `host_replaced`, `client_disconnect`, `token_revoked` |
 | `error` | `code`, `message` | `unauthorized`, `invalid`, `not_found`, `busy`, `unavailable` |
 
 ### Session flow
@@ -221,3 +272,24 @@ client                      hub                         host
   │ ◀═══ NSL1 frames ═══════ │ ◀═════ NSL1 frames ═══════ │
   │ ═══ NSL1 ACK / input ══▶ │ ═════ NSL1 ACK / input ══▶ │
 ```
+
+### Authenticated direct fast path
+
+Set `--direct-port <port>` to enable the agent's IPv4 `/stream` listener, or `--enable-direct`
+to let the OS choose the port. Otherwise the listener is disabled. The agent advertises
+non-loopback IPv4 addresses as `lan` or `overlay`; the engine remains on loopback. One viewer at a
+time can use that engine, via either direct or relay.
+
+An account-authenticated client can send `POST /api/v1/direct-sessions` with
+`{"device_id":"…"}` to receive `{"ticket":"…","endpoints":[DirectEndpoint…]}`. A hub without
+support for direct tickets or a host without a ticket listener is handled by falling back to
+relay (including legacy unauthenticated direct hints). New agents generate a fresh signing key for each hub
+registration and invalidate it and close active direct sessions when the hub connection ends.
+Tickets expire after 30 seconds and are scoped to that host registration. A direct client offers
+`Sec-WebSocket-Protocol: nsl1, bearer.<ticket>`; the server selects only `nsl1`. A saved or explicitly
+configured per-device token (`--device-token` with `--token`) can also authenticate a direct
+connection, but automatic probing never transmits a static account token or long-lived device token.
+
+The direct listener is plain WebSocket for trusted LAN or encrypted overlay use. Its traffic,
+including input and screen contents, is not encrypted by the agent. Use the TLS-protected relay
+on untrusted networks and avoid sending a long-lived device token over plain WebSocket.

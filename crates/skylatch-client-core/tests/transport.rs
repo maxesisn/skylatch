@@ -901,3 +901,50 @@ async fn wss_sends_tls_before_the_websocket_upgrade() {
             .await;
     assert!(matches!(client, Err(ClientError::WebSocket(_))));
 }
+
+#[tokio::test]
+async fn onboarding_helpers_sign_in_and_create_code() {
+    use skylatch_client_core::{create_pairing_code, enroll, login};
+    use skylatch_proto::onboarding::{CodeEnrollment, EnrollRequest};
+
+    let listener = loopback().await;
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let state = AppState::with_auth(
+        HubConfig::new(vec![]),
+        None,
+        vec![(ACCOUNT.into(), "example passphrase".into())],
+    )
+    .unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let hub = Hub { url, task };
+    let login = login(
+        &format!("{}/ws/host", hub.url),
+        ACCOUNT,
+        "example passphrase",
+    )
+    .await
+    .unwrap();
+    assert_eq!(login.account, ACCOUNT);
+    assert!(list_devices(&hub.url, &login.token)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        matches!(create_pairing_code(&hub.url, "incorrect").await, Err(ClientError::Hub { code, .. }) if code == "401")
+    );
+    let pair = create_pairing_code(&hub.url, &login.token).await.unwrap();
+    assert_eq!(pair.expires_in_secs, 600);
+    let request = EnrollRequest::Code(CodeEnrollment {
+        code: pair.code,
+        device_id: DEVICE.into(),
+        name: "Example host".into(),
+    });
+    let credential = enroll(&hub.url, &request).await.unwrap();
+    assert_eq!(credential.device_id, DEVICE);
+    assert!(skylatch_proto::credentials::is_token(
+        &credential.device_token
+    ));
+    assert!(
+        matches!(enroll(&hub.url, &request).await, Err(ClientError::Hub { code, .. }) if code == "401")
+    );
+}

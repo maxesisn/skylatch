@@ -259,9 +259,23 @@ impl Connection {
         device: &str,
         prefer_direct: bool,
     ) -> Result<Self, ClientError> {
+        // Ticket-aware agents share one engine between direct and relay. Try the direct connection
+        // before opening a relay, so fallback never takes over its own viewer.
+        if prefer_direct {
+            if let Ok(access) = crate::http::direct_session(url, token, device).await {
+                if let Some(socket) =
+                    transport::probe_direct(&access.endpoints, Some(&access.ticket)).await
+                {
+                    return Ok(Self {
+                        socket,
+                        mode: TransportMode::Direct,
+                    });
+                }
+            }
+        }
         let (mut relay, endpoints) = transport::open_relay(url, token, device).await?;
         if prefer_direct && !endpoints.is_empty() {
-            if let Some(socket) = transport::probe_direct(&endpoints).await {
+            if let Some(socket) = transport::probe_direct(&endpoints, None).await {
                 transport::close(&mut relay, true).await;
                 return Ok(Self {
                     socket,
