@@ -376,15 +376,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
 
     private func refreshPerf() {
         guard let session, !finished, hud?.isLostCardVisible != true else { return }
-        let (stats, rates) = session.perfSnapshot()
+        let (stats, rates, path) = session.perfSnapshot()
         let decoder: String
         switch stats.mode {
         case "VideoToolbox": decoder = "VT"
         case "VideoToolbox-software": decoder = "SW"
         default: decoder = ""
         }
-        // The core does not report which path a hub session settled on, so only a forced path is shown.
-        let path: PerfPath = config.hub.isEmpty ? .direct : config.noDirect ? .relay : .unknown
         let audio: PerfAudio = !session.hasAudio ? .off : audioOn ? .on : .muted
         perfHud?.update(PerfReadout(width: stats.width, height: stats.height, decoder: decoder, path: path,
                                     audio: audio, rates: rates))

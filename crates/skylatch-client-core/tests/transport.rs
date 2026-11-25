@@ -5,9 +5,10 @@ use skylatch_client_core::{
         skylatch_connect_direct, skylatch_connect_hub, skylatch_destroy, skylatch_free_string,
         skylatch_list_devices_json, skylatch_proto_version, skylatch_select_monitor,
         skylatch_send_ack, skylatch_send_clipboard, skylatch_send_input,
-        skylatch_set_sl1_callbacks, SkylatchCallbacks, SkylatchClient, SkylatchSl1Callbacks,
-        SKYLATCH_ERR_INVALID, SKYLATCH_ERR_NOT_READY, SKYLATCH_ERR_NULL, SKYLATCH_ERR_TOO_LARGE,
-        SKYLATCH_ERR_UNSUPPORTED, SKYLATCH_INPUT_UNSUPPORTED, SKYLATCH_OK,
+        skylatch_set_sl1_callbacks, skylatch_transport_mode, SkylatchCallbacks, SkylatchClient,
+        SkylatchSl1Callbacks, SKYLATCH_ERR_INVALID, SKYLATCH_ERR_NOT_READY, SKYLATCH_ERR_NULL,
+        SKYLATCH_ERR_TOO_LARGE, SKYLATCH_ERR_UNSUPPORTED, SKYLATCH_INPUT_UNSUPPORTED, SKYLATCH_OK,
+        SKYLATCH_TRANSPORT_DIRECT, SKYLATCH_TRANSPORT_RELAY, SKYLATCH_TRANSPORT_UNKNOWN,
     },
     list_devices, ClientError, Event, Frame, SessionClient, TransportMode,
 };
@@ -588,6 +589,14 @@ fn c_transaction(
             );
             let handle = NativeHandle(client);
             assert_eq!(error[0], 0);
+            assert_eq!(
+                skylatch_transport_mode(client),
+                if direct {
+                    SKYLATCH_TRANSPORT_DIRECT
+                } else {
+                    SKYLATCH_TRANSPORT_RELAY
+                }
+            );
             // Waiting for the frame callback from the async side proves the generation has arrived.
             assert_eq!(destroy.blocking_recv(), Some(()));
             assert_eq!(skylatch_send_ack(client, 0, 1, WAIT), SKYLATCH_ERR_INVALID);
@@ -1249,4 +1258,63 @@ async fn an_offline_device_record_can_be_deleted_but_an_online_one_cannot() {
         deadline(delete_device(&url, HUB_TOKEN, DEVICE)).await,
         Err(ClientError::Hub { code, .. }) if code == "404"
     ));
+}
+
+fn hub_transport_mode(url: String, prefer_direct: bool) -> JoinHandle<u8> {
+    tokio::task::spawn_blocking(move || unsafe {
+        let url = CString::new(url).unwrap();
+        let token = CString::new(HUB_TOKEN).unwrap();
+        let device_id = CString::new(DEVICE).unwrap();
+        let client = skylatch_connect_hub(
+            url.as_ptr(),
+            token.as_ptr(),
+            device_id.as_ptr(),
+            prefer_direct,
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        );
+        assert!(!client.is_null());
+        let mode = skylatch_transport_mode(client);
+        skylatch_destroy(client);
+        mode
+    })
+}
+
+#[tokio::test]
+async fn transport_mode_is_unknown_for_null() {
+    assert_eq!(
+        unsafe { skylatch_transport_mode(ptr::null()) },
+        SKYLATCH_TRANSPORT_UNKNOWN
+    );
+}
+
+#[tokio::test]
+async fn hub_c_abi_reports_relay_after_direct_fallback() {
+    let hub = Hub::start().await;
+    let closed = loopback().await;
+    let unreachable = endpoint(closed.local_addr().unwrap().port());
+    drop(closed);
+    let _host = register(&hub, device(vec![unreachable])).await;
+    let mode = deadline(hub_transport_mode(hub.url.clone(), true))
+        .await
+        .unwrap();
+    assert_eq!(mode, SKYLATCH_TRANSPORT_RELAY);
+}
+
+#[tokio::test]
+async fn hub_c_abi_reports_direct_when_fast_path_connects() {
+    let hub = Hub::start().await;
+    let listener = loopback().await;
+    let _host = register(
+        &hub,
+        device(vec![endpoint(listener.local_addr().unwrap().port())]),
+    )
+    .await;
+    let (mode, _direct) = tokio::join!(
+        deadline(hub_transport_mode(hub.url.clone(), true)),
+        start_direct(listener, None)
+    );
+    assert_eq!(mode.unwrap(), SKYLATCH_TRANSPORT_DIRECT);
 }

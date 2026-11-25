@@ -327,6 +327,10 @@ impl Connection {
         })
     }
 
+    pub(crate) fn transport_mode(&self) -> TransportMode {
+        self.mode
+    }
+
     /// Starts the data pump. `audio` is the initial [`SessionClient::set_audio_enabled`] state.
     pub(crate) fn start(
         self,

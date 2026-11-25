@@ -89,7 +89,7 @@ public struct PerfWindow {
     }
 }
 
-/// How the stream reaches this viewer. `unknown` when the core picked the path itself.
+/// How the stream reaches this viewer. `unknown` before a connection is established.
 public enum PerfPath { case direct, relay, unknown }
 
 public enum PerfAudio: Equatable { case off, muted, on }

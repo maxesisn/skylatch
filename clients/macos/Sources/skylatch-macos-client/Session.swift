@@ -59,6 +59,7 @@ final class Session: @unchecked Sendable {
     private var smoothWheel = SmoothWheelSupport()
     private var stats = SessionStats()
     private var perf = PerfWindow()
+    private var path = PerfPath.unknown
     private var end: SessionEnd?
     private var thread: Thread?
     /// Created before connecting and stopped after the core client is destroyed, so audio
@@ -85,11 +86,11 @@ final class Session: @unchecked Sendable {
     }
 
     /// Totals since connect and the averages over the last second.
-    func perfSnapshot() -> (stats: SessionStats, rates: PerfRates) {
+    func perfSnapshot() -> (stats: SessionStats, rates: PerfRates, path: PerfPath) {
         let now = DispatchTime.now().uptimeNanoseconds
         stateLock.lock()
         defer { stateLock.unlock() }
-        return (stats, perf.rates(at: now))
+        return (stats, perf.rates(at: now), path)
     }
 
     var endStatus: SessionEnd? {
@@ -293,6 +294,11 @@ final class Session: @unchecked Sendable {
         // Frames can arrive before connect returns; publish the handle before any ACK or input.
         stateLock.lock()
         client = active
+        switch skylatch_transport_mode(active) {
+        case UInt8(SKYLATCH_TRANSPORT_DIRECT): path = .direct
+        case UInt8(SKYLATCH_TRANSPORT_RELAY): path = .relay
+        default: path = .unknown
+        }
         stateLock.unlock()
         if isStopping() { return }
 

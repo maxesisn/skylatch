@@ -186,6 +186,7 @@ class Client {
     std::atomic<bool> stopping{false};
     std::atomic<bool> resumePending{false}; // Set while a reconnect waits for its first presented frame.
     std::atomic<SkylatchClient*> client{nullptr};
+    std::atomic<PerfPath> perfPath{PerfPath::Unknown};
     std::atomic<bool> smoothWheel{false}; // The host accepted smooth-wheel (type 9) records for this session.
     std::atomic<std::shared_ptr<Renderer>> activeRenderer{};
     std::shared_ptr<Hud> hud; // Null in smoke mode: no HUD, no Direct2D.
@@ -460,6 +461,9 @@ class Client {
             require(active != nullptr, err[0] ? err : "connection failed");
             // Callbacks can queue video before connect returns. Publish before any input or ACK.
             client.store(active);
+            const auto transport = skylatch_transport_mode(active);
+            perfPath = transport == SKYLATCH_TRANSPORT_DIRECT ? PerfPath::Direct :
+                transport == SKYLATCH_TRANSPORT_RELAY ? PerfPath::Relay : PerfPath::Unknown;
             if (stopping) return;
             if (!config.smoke) {
                 const SkylatchSl1Callbacks sl1Callbacks{onMonitorList, clipboardEnabled() ? onClipboardData : nullptr};
@@ -648,8 +652,7 @@ class Client {
         const std::string_view mode = s.mode;
         r.width = s.width; r.height = s.height;
         r.decoder = mode == "HW (DXGI surfaces)" ? L"DXGI" : mode == "HW" ? L"DXVA" : mode == "SW" ? L"SW" : L"";
-        // The core does not report which path a hub session settled on, so only a forced path is shown.
-        r.path = config.hub.empty() ? PerfPath::Direct : config.noDirect ? PerfPath::Relay : PerfPath::Unknown;
+        r.path = perfPath;
         r.audio = !audio ? PerfAudio::Off : audioOn ? PerfAudio::On : PerfAudio::Muted;
         hud->setPerf(r);
     }
