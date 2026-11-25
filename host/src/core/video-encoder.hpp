@@ -138,6 +138,23 @@ class FfmpegHwVideoEncoder final : public VideoEncoder {
  */
 bool repeatParameterSets(std::vector<uint8_t>& annex_b, std::vector<uint8_t>& parameter_sets, bool& keyframe);
 
+/** The bitstream_restriction fields of an SPS NAL unit (no start code) that decoders size their output delay by. */
+struct H264SpsRestriction {
+  unsigned max_num_reorder_frames = 0, max_dec_frame_buffering = 0;
+};
+/** nullopt when the SPS has no bitstream_restriction or does not parse. */
+std::optional<H264SpsRestriction> readH264SpsRestriction(const std::vector<uint8_t>& sps);
+
+/**
+ * Declares in an SPS NAL unit (no start code) that pictures leave in decoding order, which Windows' H.264 decoder
+ * needs to output the first frame without waiting for later ones. An SPS that already has bitstream_restriction, or
+ * that does not parse, comes back unchanged.
+ */
+std::vector<uint8_t> patchH264SpsZeroReorder(const std::vector<uint8_t>& sps);
+
+/** Applies patchH264SpsZeroReorder to every SPS of an Annex-B stream. */
+void ensureAnnexBZeroReorder(std::vector<uint8_t>& annex_b);
+
 using VideoEncoderFactory = std::function<std::unique_ptr<VideoEncoder>()>;
 /** The platform hardware encoder compiled into this build, or null when there is none. */
 std::unique_ptr<VideoEncoder> makeHardwareVideoEncoder();

@@ -69,12 +69,23 @@ Filename: "{app}\skylatch-agent.exe"; Parameters: "service uninstall"; Flags: ru
 [Code]
 // The service keeps skylatch-agent.exe and the engine it started open; stop it before files are
 // replaced. `net stop` returns once the service has stopped, and fails harmlessly when it is not
-// installed.
+// installed. The tray UI ignores WM_CLOSE and the agent has no window, so Inno Setup's own closing of
+// applications cannot end them; kill what is left.
+procedure KillImage(Image, Extra: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F ' + Extra + '/IM ' + Image, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
   if IsAdminInstallMode then
     Exec(ExpandConstant('{sys}\net.exe'), 'stop SkylatchAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  KillImage('skylatch-ui.exe', '/T ');
+  KillImage('skylatch-agent.exe', '');
+  KillImage('skylatch-host-engine.exe', '');
   Result := '';
 end;
