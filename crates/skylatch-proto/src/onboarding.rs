@@ -1,6 +1,7 @@
 //! HTTP onboarding request and response bodies.
 
 use crate::control::DirectEndpoint;
+use crate::mesh::MeshInviteCiphertext;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -15,6 +16,18 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub account: String,
     pub token: String,
+}
+
+/// Body of `POST /api/v1/signup`; answered with a [`LoginResponse`].
+pub type SignupRequest = LoginRequest;
+
+/// Optional body of `POST /api/v1/pairing-codes`. An empty body is the same as the default.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePairingCodeRequest {
+    /// Released once, to the host that consumes the code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_invite: Option<MeshInviteCiphertext>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +65,8 @@ pub struct EnrollResponse {
     pub account: String,
     pub device_id: String,
     pub device_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_invite: Option<MeshInviteCiphertext>,
 }
 
 #[derive(Serialize, Deserialize)]

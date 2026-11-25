@@ -173,8 +173,10 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
 | `GET /` | none | Embedded Hub Web console |
+| `GET /api/v1/info` | none | Public `HubInfo`: version, mode, EasyTier peers, signup and device-limit policy |
 | `POST /api/v1/login` | username and password | Return a client-session token |
-| `POST /api/v1/pairing-codes` | account Bearer token | Mint a one-time device pairing code |
+| `POST /api/v1/signup` | none (only with `--allow-signup`) | Create a password account and return its client-session token |
+| `POST /api/v1/pairing-codes` | account Bearer token | Mint a one-time device pairing code, optionally carrying an encrypted mesh invite |
 | `POST /api/v1/enroll` | pairing code or username and password | Enroll a host and return its device token |
 | `DELETE /api/v1/devices/:id/token` | account Bearer token | Revoke the specified device token |
 | `POST /api/v1/direct-sessions` | account Bearer token | Get a short-lived direct-stream ticket for a connected host |
@@ -182,6 +184,7 @@ Every message is a JSON object with a `type` field in `snake_case`. Unknown type
 | `GET /healthz` | none | Liveness: `{"status":"ok","version":"…","mode":"relay"}` |
 | `GET /api/v1/layout` | account Bearer token | The account's saved `WorkspaceLayout` (empty default if none) |
 | `PUT /api/v1/layout` | account Bearer token | Replace the account's `WorkspaceLayout` |
+| `GET` / `PUT` / `DELETE /api/v1/mesh-vault` | account Bearer token | The account's end-to-end encrypted mesh configuration |
 | `GET /api/v1/devices` | `Authorization: Bearer <token>` | `{"devices":[DeviceInfo…]}` for the token's account, online first. Disconnected hosts stay listed with `online:false`, empty `direct_endpoints` and `last_seen_unix`; `?online_only=true` hides them. Hubs started with `--mode signaling-only` (`SKYLATCH_HUB_MODE`) answer `connect_device` with `direct_hint` and `relay_disabled` instead of relaying; connecting to an offline device returns `device_offline` |
 | `GET /ws/host` | first message | Host registration socket |
 | `GET /ws/client` | first message | Client session socket |
@@ -204,7 +207,13 @@ codes, or manage credentials.
 - **`POST /api/v1/login`** accepts `{"username":"…","password":"…"}` and returns
   `{"account":"…","token":"…"}`. The same session token can be used with the HTTP directory and
   `/ws/client` and is returned on subsequent successful logins.
-- **`POST /api/v1/pairing-codes`** has no request body. It returns
+- **`POST /api/v1/signup`** exists only when the hub runs with `--allow-signup`
+  (`SKYLATCH_ALLOW_SIGNUP=true`); otherwise it returns `403 Forbidden`. It accepts the login body
+  and returns `201 Created` with the login response. Usernames are 1–64 ASCII letters, digits, `.`,
+  `_` or `-` starting with a letter or digit; passwords are 8–1024 characters. Invalid input returns
+  `400`, and a name that is already a user or a static account returns `409 Conflict`.
+- **`POST /api/v1/pairing-codes`** takes no body or `{}`, or `{"mesh_invite":{"nonce_b64":"…",
+  "ct_b64":"…"}}` (see [Mesh invites](#mesh-invites)). It returns
   `{"code":"482-917","expires_in_secs":600}`. Each code belongs to the requesting account, expires
   after 10 minutes, and can be consumed by exactly one successful enrollment.
 - **`POST /api/v1/enroll`** accepts `{"code":"482-917","device_id":"…","name":"…"}` or
@@ -212,13 +221,21 @@ codes, or manage credentials.
   account has no registered hosts. It returns `{"account":"…","device_id":"…","device_token":"…"}`.
   Device IDs have at most 128 ASCII characters (`A–Z`, `a–z`, `0–9`, `.`, `_`, `-`) and cannot be
   `.` or `..`. The returned 64-hex credential is only sent once. An already-enrolled ID in that
-  account returns `409 Conflict` until its token is revoked.
+  account returns `409 Conflict` until its token is revoked. A code minted with a mesh invite adds
+  `"mesh_invite":{"nonce_b64":"…","ct_b64":"…"}` to the response; the hub forgets it together
+  with the code.
+- With `--max-devices-per-account N` (`SKYLATCH_MAX_DEVICES_PER_ACCOUNT`), enrolling a device or
+  registering a new device ID with a static account token on `/ws/host` fails once the account
+  has `N` distinct enrolled or known devices: enrollment returns `403 Forbidden`, and the socket
+  receives `{"type":"error","code":"device_limit",…}`. Devices already counted reconnect freely.
 - **`DELETE /api/v1/devices/:id/token`** returns `204 No Content` if the device credential was
   revoked or `404 Not Found` if that account has no such credential. The active host connection
   using the device credential is disconnected. Static account tokens are not revoked or altered.
 
 Invalid or expired credentials return `401 Unauthorized`; the hub limits password and pairing-code
-attempts and may return `429 Too Many Requests`.
+attempts and may return `429 Too Many Requests`. In addition, `login` and `enroll` accept 30 and
+`signup` 10 requests per client IP per minute. The client IP is the TCP peer; when the peer is a
+loopback reverse proxy, the last `X-Forwarded-For` (or `X-Real-IP`) entry is used instead.
 
 Use `skylatch-agent join https://hub.example.com --code 482-917` or replace `--code` with
 `--username <user>` to enter a password. With neither option the agent prompts for both; automation
@@ -266,6 +283,76 @@ wins. All fields except those marked required default when absent.
 - Limits: 32 rooms, 32 furniture items per room, 512 placements; room, furniture, room-reference
   and device IDs are non-empty and at most 128 characters; room names and custom names at most 64
   characters; room IDs are unique, furniture IDs are unique within their room.
+
+### Hub info
+
+`GET /api/v1/info` needs no credentials:
+
+```json
+{"version":"0.1.0","mode":"relay","easytier_peers":["tcp://public.example.com:11010"],
+ "allow_signup":false,"max_devices_per_account":20}
+```
+
+`max_devices_per_account` is omitted when unlimited. `easytier_peers` comes from repeatable
+`--easytier-peer URL` flags (or comma-delimited `SKYLATCH_EASYTIER_PEERS`). Clients read it at
+runtime for every mesh profile with `use_hub_peer: true`; peers are never stored in the encrypted
+vault, so changing them or switching to another hub needs no vault rewrite.
+
+### Mesh vault
+
+Each account can store one encrypted `MeshVault` describing any number of isolated EasyTier
+networks. The hub only ever sees the envelope:
+
+```json
+{"version":3,"kdf":"argon2id-v1","kdf_salt_b64":"…","wrapped_dek_nonce_b64":"…",
+ "wrapped_dek_ct_b64":"…","payload_nonce_b64":"…","payload_ct_b64":"…","updated_at_unix":1764000000}
+```
+
+The client generates a random 32-byte data key (DEK) and seals the vault JSON with
+ChaCha20-Poly1305 (`payload_*`, AAD `skylatch:mesh-vault:payload:v1`). `argon2id-v1` derives a
+32-byte key from the login password and the 16-byte `kdf_salt_b64` with Argon2id v1.3, 19 MiB,
+2 passes, 1 lane; it seals the DEK with ChaCha20-Poly1305 (`wrapped_dek_*`, AAD
+`skylatch:mesh-vault:dek:argon2id-v1`). Nonces are 12 random bytes; all binary fields are
+padded standard base64. Changing the password replaces only the salt and the wrapped DEK. The
+recovery key is the DEK itself, written as `SLK1-` and 14 groups of four Crockford base32
+symbols that encode the DEK followed by the first 3 bytes of
+`SHA-256("skylatch:recovery-key:v1:" ‖ DEK)`; input ignores case, dashes and spaces and reads
+`O` as `0` and `I`/`L` as `1`.
+
+- **`GET`** returns `200` with the envelope, or `404` before one is saved.
+- **`PUT`** takes `{"expected_version":N,"envelope":{…}}` (at most 64 KiB; larger bodies get
+  `413`). `expected_version` `0` creates the vault; otherwise it must equal the stored version.
+  The hub checks the envelope's shape (kdf, base64 and lengths; `400` otherwise), stores it with
+  `version = expected_version + 1` and its own `updated_at_unix`, and returns the stored
+  envelope. On a mismatch it returns `409` with `{"error":"…","current":Envelope|null}` so the
+  client can merge and retry. `version` and `updated_at_unix` are not authenticated.
+- **`DELETE`** removes the vault and returns `204` (also when none exists).
+
+Vaults are kept in the state file under `mesh_vaults`; older state files load unchanged.
+
+The decrypted vault:
+
+```json
+{"schema_version":1,"profiles":[
+  {"id":"default","name":"默认组网","subnet":"10.126.1.0/24","listen_port":11010,
+   "network_name":"skylatch-…","network_secret":"…","custom_peers":[],"use_hub_peer":true}]}
+```
+
+Profile IDs are 1–32 of `a–z`, `0–9`, `-`, `_` and unique; names have 1–64 characters; subnets
+are private IPv4 `/24` networks (`10/8`, `172.16/12`, `192.168/16`) with a zero host part and no
+two profiles share one; listen ports are non-zero and distinct; network names have 1–128 bytes and
+secrets 16–256 bytes; at most 32 `scheme://…` custom peers per profile and 32 profiles. New
+isolated profiles take the lowest free `10.126.N.0/24` and the lowest free port from `11010`.
+
+### Mesh invites
+
+A pairing code can carry one `MeshProfile` for the host that consumes it. The hub mints the
+code and therefore knows it, so the code is not the key: the client generates a 100-bit invite
+secret (20 Crockford base32 symbols), derives a key with HKDF-SHA256 (salt and AAD
+`skylatch:mesh-invite:v1`, info `chacha20-poly1305`) and seals the profile JSON with
+ChaCha20-Poly1305. It sends `{"mesh_invite":{"nonce_b64":"…","ct_b64":"…"}}` (`ct_b64` at most
+16 KiB) and shows the join code `482-917-XXXX-XXXX-XXXX-XXXX-XXXX`. The host sends only the first
+seven characters to `POST /api/v1/enroll` and decrypts the returned `mesh_invite` with the rest.
 
 ### Shared types
 
