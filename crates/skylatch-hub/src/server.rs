@@ -3,6 +3,7 @@
 use crate::api;
 use crate::auth::{Auth, AuthError};
 use crate::config::{HubConfig, HubMode};
+use crate::ratelimit::Limits;
 use crate::registry::{ClientOut, HostCommand, OpenError, Registry, CLIENT_QUEUE, HOST_QUEUE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
@@ -13,6 +14,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use skylatch_proto::control::{ClientToHub, DeviceInfo, HostToHub, HubToClient, HubToHost};
 use skylatch_proto::credentials::is_token;
+use skylatch_proto::mesh::{MESH_INVITE_CT_LIMIT, MESH_VAULT_BODY_LIMIT};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,7 @@ pub struct AppState {
     pub config: Arc<HubConfig>,
     pub registry: Arc<Registry>,
     pub(crate) auth: Arc<Auth>,
+    pub(crate) limits: Arc<Limits>,
 }
 
 impl AppState {
@@ -44,10 +47,12 @@ impl AppState {
         state_file: Option<PathBuf>,
         users: Vec<(String, String)>,
     ) -> std::io::Result<Self> {
+        let auth = Auth::new(state_file, users, config.max_devices_per_account)?;
         Ok(Self {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),
-            auth: Arc::new(Auth::new(state_file, users)?),
+            auth: Arc::new(auth),
+            limits: Arc::default(),
         })
     }
 }
@@ -56,8 +61,13 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(api::console))
+        .route("/api/v1/info", get(api::info))
         .route("/api/v1/login", post(api::login))
-        .route("/api/v1/pairing-codes", post(api::create_code))
+        .route("/api/v1/signup", post(api::signup))
+        .route(
+            "/api/v1/pairing-codes",
+            post(api::create_code).layer(DefaultBodyLimit::max(MESH_INVITE_CT_LIMIT * 2)),
+        )
         .route("/api/v1/enroll", post(api::enroll))
         .route("/api/v1/devices/{device_id}/token", delete(api::revoke))
         .route("/api/v1/devices/{device_id}", delete(api::delete_device))
@@ -67,6 +77,13 @@ pub fn router(state: AppState) -> Router {
             get(api::get_layout)
                 .put(api::put_layout)
                 .layer(DefaultBodyLimit::max(LAYOUT_BODY_LIMIT)),
+        )
+        .route(
+            "/api/v1/mesh-vault",
+            get(api::get_mesh_vault)
+                .put(api::put_mesh_vault)
+                .delete(api::delete_mesh_vault)
+                .layer(DefaultBodyLimit::max(MESH_VAULT_BODY_LIMIT)),
         )
         .route("/healthz", get(healthz))
         .route("/api/v1/devices", get(list_devices))
@@ -186,6 +203,12 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
             Err(AuthError::Invalid) => {
                 let _ = socket
                     .send(reject("invalid", "device_id must not be empty"))
+                    .await;
+                return;
+            }
+            Err(AuthError::DeviceLimit) => {
+                let _ = socket
+                    .send(reject("device_limit", "account device limit reached"))
                     .await;
                 return;
             }

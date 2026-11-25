@@ -9,13 +9,14 @@ use skylatch_proto::credentials::{
     constant_time_eq, is_token, random_bytes, random_token, token_digest, write_private_file,
 };
 use skylatch_proto::layout::WorkspaceLayout;
+use skylatch_proto::mesh::{MeshInviteCiphertext, MeshVaultEnvelope, PutMeshVaultRequest};
 use skylatch_proto::onboarding::{
-    EnrollResponse, LoginRequest, LoginResponse, PairingCodeResponse,
+    EnrollResponse, LoginRequest, LoginResponse, PairingCodeResponse, SignupRequest,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
@@ -33,6 +34,11 @@ pub(crate) enum AuthError {
     Offline,
     Online,
     Limited,
+    BadRequest(&'static str),
+    SignupDisabled,
+    AccountExists,
+    DeviceLimit,
+    VaultConflict(Option<Box<MeshVaultEnvelope>>),
     Storage(io::Error),
 }
 
@@ -52,6 +58,9 @@ struct Credentials {
     /// Last known host records by account and device. Absent in state files written by older hubs.
     #[serde(default)]
     known_devices: BTreeMap<String, BTreeMap<String, DeviceInfo>>,
+    /// Per-account encrypted mesh vaults. Absent in state files written by older hubs.
+    #[serde(default)]
+    mesh_vaults: HashMap<String, MeshVaultEnvelope>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -64,6 +73,7 @@ struct Code {
     account: String,
     expires: Instant,
     used: bool,
+    mesh_invite: Option<MeshInviteCiphertext>,
 }
 
 #[derive(Default)]
@@ -77,8 +87,9 @@ struct Data {
 pub(crate) struct Auth {
     path: Option<PathBuf>,
     data: Mutex<Data>,
-    dummy_hash: Option<String>,
+    dummy_hash: OnceLock<String>,
     password_workers: Semaphore,
+    max_devices: Option<u32>,
 }
 
 fn hash_password(password: &str) -> io::Result<String> {
@@ -135,6 +146,19 @@ fn pairing_code() -> io::Result<String> {
     }
 }
 
+fn validate_username(username: &str) -> Result<(), AuthError> {
+    let mut bytes = username.bytes();
+    if username.len() > 64
+        || !bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(AuthError::BadRequest(
+            "username must be 1-64 ASCII letters, digits, '.', '_' or '-' and start with a letter or digit",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_device(device_id: &str, name: &str) -> Result<(), AuthError> {
     if device_id.is_empty()
         || device_id.len() > 128
@@ -151,7 +175,11 @@ fn validate_device(device_id: &str, name: &str) -> Result<(), AuthError> {
 }
 
 impl Auth {
-    pub(crate) fn new(path: Option<PathBuf>, users: Vec<(String, String)>) -> io::Result<Self> {
+    pub(crate) fn new(
+        path: Option<PathBuf>,
+        users: Vec<(String, String)>,
+        max_devices: Option<u32>,
+    ) -> io::Result<Self> {
         let mut credentials = Credentials::default();
         if let Some(path) = &path {
             match std::fs::read(path) {
@@ -194,9 +222,10 @@ impl Auth {
                 },
             );
         }
-        let dummy_hash = (!credentials.users.is_empty())
-            .then(|| hash_password(&random_token()?))
-            .transpose()?;
+        let dummy_hash = OnceLock::new();
+        if !credentials.users.is_empty() {
+            let _ = dummy_hash.set(hash_password(&random_token()?)?);
+        }
         write(path.as_deref(), &credentials)?;
         Ok(Self {
             path,
@@ -206,7 +235,16 @@ impl Auth {
             }),
             dummy_hash,
             password_workers: Semaphore::new(2),
+            max_devices,
         })
+    }
+
+    fn dummy_hash(&self) -> io::Result<&str> {
+        if let Some(hash) = self.dummy_hash.get() {
+            return Ok(hash);
+        }
+        let hash = hash_password(&random_token()?)?;
+        Ok(self.dummy_hash.get_or_init(|| hash))
     }
 
     fn lock(&self) -> MutexGuard<'_, Data> {
@@ -234,9 +272,10 @@ impl Auth {
         if request.username.len() > 128 || request.password.len() > 1024 {
             return Err(AuthError::Unauthorized);
         }
-        let Some(dummy_hash) = &self.dummy_hash else {
+        if self.lock().credentials.users.is_empty() {
             return Err(AuthError::Unauthorized);
-        };
+        }
+        let dummy_hash = self.dummy_hash()?;
         let _worker = self
             .password_workers
             .try_acquire()
@@ -248,7 +287,7 @@ impl Auth {
         };
         let hash = user
             .as_ref()
-            .map_or(dummy_hash.as_str(), |u| u.password_hash.as_str());
+            .map_or(dummy_hash, |u| u.password_hash.as_str());
         let valid = verify(&request.password, hash);
         match user.filter(|_| valid) {
             Some(user) => Ok(LoginResponse {
@@ -259,7 +298,92 @@ impl Auth {
         }
     }
 
-    pub(crate) fn create_code(&self, account: String) -> Result<PairingCodeResponse, AuthError> {
+    /// Creates a password account and returns its client-session token.
+    pub(crate) fn signup(
+        &self,
+        config: &HubConfig,
+        request: SignupRequest,
+    ) -> Result<LoginResponse, AuthError> {
+        if !config.allow_signup {
+            return Err(AuthError::SignupDisabled);
+        }
+        validate_username(&request.username)?;
+        if request.password.chars().count() < 8 || request.password.len() > 1024 {
+            return Err(AuthError::BadRequest(
+                "password must be 8-1024 characters long",
+            ));
+        }
+        let exists = |data: &Data| {
+            data.credentials.users.contains_key(&request.username)
+                || config
+                    .accounts
+                    .iter()
+                    .any(|(name, _)| *name == request.username)
+        };
+        if exists(&self.lock()) {
+            return Err(AuthError::AccountExists);
+        }
+        let _worker = self
+            .password_workers
+            .try_acquire()
+            .map_err(|_| AuthError::Limited)?;
+        self.dummy_hash()?;
+        let user = User {
+            password_hash: hash_password(&request.password)?,
+            session_token: random_token()?,
+        };
+        let mut data = self.lock();
+        if exists(&data) {
+            return Err(AuthError::AccountExists);
+        }
+        let mut updated = data.credentials.clone();
+        updated.users.insert(request.username.clone(), user.clone());
+        write(self.path.as_deref(), &updated)?;
+        data.credentials = updated;
+        Ok(LoginResponse {
+            account: request.username,
+            token: user.session_token,
+        })
+    }
+
+    /// Whether registering `device_id` would exceed the account's device limit.
+    fn over_device_limit(
+        &self,
+        data: &Data,
+        live: &[DeviceInfo],
+        account: &str,
+        device_id: &str,
+    ) -> bool {
+        let Some(max) = self.max_devices else {
+            return false;
+        };
+        let credentials = &data.credentials;
+        let ids: BTreeSet<&str> = credentials
+            .devices
+            .get(account)
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .chain(
+                credentials
+                    .known_devices
+                    .get(account)
+                    .into_iter()
+                    .flat_map(BTreeMap::keys),
+            )
+            .map(String::as_str)
+            .chain(live.iter().map(|d| d.device_id.as_str()))
+            .collect();
+        !ids.contains(device_id) && ids.len() >= max as usize
+    }
+
+    pub(crate) fn create_code(
+        &self,
+        account: String,
+        mesh_invite: Option<MeshInviteCiphertext>,
+    ) -> Result<PairingCodeResponse, AuthError> {
+        if let Some(invite) = &mesh_invite {
+            invite.validate_shape().map_err(AuthError::BadRequest)?;
+        }
         let mut data = self.lock();
         let now = Instant::now();
         data.codes.retain(|_, code| code.expires > now);
@@ -285,6 +409,7 @@ impl Auth {
                 account,
                 expires: now + PAIRING_LIFETIME,
                 used: false,
+                mesh_invite,
             },
         );
         Ok(PairingCodeResponse {
@@ -320,11 +445,10 @@ impl Auth {
             .ok_or(AuthError::Unauthorized)?
             .account
             .clone();
-        let enrolled = self.enroll_locked(&mut data, account, device_id)?;
-        data.codes
-            .get_mut(code)
-            .expect("code was checked above")
-            .used = true;
+        let mut enrolled = self.enroll_locked(&mut data, account, device_id)?;
+        let code = data.codes.get_mut(code).expect("code was checked above");
+        code.used = true;
+        enrolled.mesh_invite = code.mesh_invite.take();
         Ok(enrolled)
     }
 
@@ -353,6 +477,9 @@ impl Auth {
         {
             return Err(AuthError::Conflict);
         }
+        if self.over_device_limit(data, &[], &account, &device_id) {
+            return Err(AuthError::DeviceLimit);
+        }
         let device_token = random_token()?;
         let mut updated = data.credentials.clone();
         updated
@@ -366,6 +493,7 @@ impl Auth {
             account,
             device_id,
             device_token,
+            mesh_invite: None,
         })
     }
 
@@ -380,6 +508,10 @@ impl Auth {
         if let Some(account) = config.account_for_token(token) {
             if device.device_id.is_empty() {
                 return Err(AuthError::Invalid);
+            }
+            let data = self.lock();
+            if self.over_device_limit(&data, &registry.list(account), account, &device.device_id) {
+                return Err(AuthError::DeviceLimit);
             }
             let (id, cancel) = registry.register_host(account, device, tx, false);
             return Ok((account.into(), id, cancel));
@@ -515,6 +647,51 @@ impl Auth {
         Ok(layout)
     }
 
+    pub(crate) fn mesh_vault(&self, account: &str) -> Option<MeshVaultEnvelope> {
+        self.lock().credentials.mesh_vaults.get(account).cloned()
+    }
+
+    /// Compare-and-swap on the vault version; a mismatch reports the current envelope.
+    pub(crate) fn put_mesh_vault(
+        &self,
+        account: &str,
+        request: PutMeshVaultRequest,
+    ) -> Result<MeshVaultEnvelope, AuthError> {
+        request
+            .envelope
+            .validate_shape()
+            .map_err(AuthError::BadRequest)?;
+        let mut data = self.lock();
+        let current = data.credentials.mesh_vaults.get(account);
+        if current.map_or(0, |v| v.version) != request.expected_version {
+            return Err(AuthError::VaultConflict(current.cloned().map(Box::new)));
+        }
+        let envelope = MeshVaultEnvelope {
+            version: request.expected_version + 1,
+            updated_at_unix: unix_now(),
+            ..request.envelope
+        };
+        let mut updated = data.credentials.clone();
+        updated
+            .mesh_vaults
+            .insert(account.to_string(), envelope.clone());
+        write(self.path.as_deref(), &updated)?;
+        data.credentials = updated;
+        Ok(envelope)
+    }
+
+    pub(crate) fn delete_mesh_vault(&self, account: &str) -> Result<(), AuthError> {
+        let mut data = self.lock();
+        if !data.credentials.mesh_vaults.contains_key(account) {
+            return Ok(());
+        }
+        let mut updated = data.credentials.clone();
+        updated.mesh_vaults.remove(account);
+        write(self.path.as_deref(), &updated)?;
+        data.credentials = updated;
+        Ok(())
+    }
+
     pub(crate) fn revoke(
         &self,
         registry: &Registry,
@@ -547,8 +724,8 @@ mod tests {
 
     #[test]
     fn expired_code_cannot_enroll() {
-        let auth = Auth::new(None, vec![]).unwrap();
-        let code = auth.create_code("demo".into()).unwrap().code;
+        let auth = Auth::new(None, vec![], None).unwrap();
+        let code = auth.create_code("demo".into(), None).unwrap().code;
         auth.lock().codes.get_mut(&code).unwrap().expires = Instant::now();
         assert!(matches!(
             auth.enroll_with_code(&code, "demo".into(), "Demo"),

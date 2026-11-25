@@ -42,6 +42,12 @@ pub struct HubConfig {
     /// Heartbeat interval announced to hosts. A host silent for three intervals is dropped.
     pub heartbeat_interval: Duration,
     pub mode: HubMode,
+    /// EasyTier peers announced by `GET /api/v1/info`.
+    pub easytier_peers: Vec<String>,
+    /// Whether `POST /api/v1/signup` may create password accounts.
+    pub allow_signup: bool,
+    /// Distinct devices an account may enroll or register; `None` is unlimited.
+    pub max_devices_per_account: Option<u32>,
 }
 
 impl HubConfig {
@@ -50,6 +56,9 @@ impl HubConfig {
             accounts,
             heartbeat_interval: Duration::from_secs(15),
             mode: HubMode::Relay,
+            easytier_peers: vec![],
+            allow_signup: false,
+            max_devices_per_account: None,
         }
     }
 

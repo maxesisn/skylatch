@@ -3,6 +3,7 @@
 # One-line Skylatch Hub installer for x86_64 Linux with systemd.
 #   curl -fsSL https://raw.githubusercontent.com/maxesisn/skylatch/main/packaging/install-hub.sh | sudo sh
 #   ... | sudo sh -s -- --version 1.2.3 --user admin --password '...' --port 17920
+#   ... | sudo sh -s -- --easytier-peer tcp://hub.example.com:11010
 set -eu
 # shellcheck disable=SC3040
 (set -o pipefail) 2>/dev/null && set -o pipefail
@@ -13,13 +14,14 @@ user=
 password=
 port=17920
 mode=relay
+peers=
 generated=
 
 die() { echo "install-hub: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --version|--user|--password|--port|--repo|--mode)
+        --version|--user|--password|--port|--repo|--mode|--easytier-peer)
             [ $# -ge 2 ] || die "$1 needs a value"
             case $1 in
                 --version) version=${2#v} ;;
@@ -28,10 +30,18 @@ while [ $# -gt 0 ]; do
                 --port) port=$2 ;;
                 --repo) repo=$2 ;;
                 --mode) mode=$2 ;;
+                --easytier-peer)
+                    case $2 in
+                        *://*) ;;
+                        *) die '--easytier-peer must look like tcp://host:port' ;;
+                    esac
+                    case $2 in *[,\"\'\\\ ]*|*[![:print:]]*) die '--easytier-peer must not contain commas, quotes, backslashes or spaces' ;; esac
+                    peers=${peers:+$peers,}$2 ;;
             esac
             shift 2 ;;
         -h|--help)
-            echo 'Usage: sudo sh install-hub.sh [--version VER] [--user NAME] [--password PASS] [--port PORT] [--repo OWNER/REPO] [--mode relay|signaling-only]'
+            echo 'Usage: sudo sh install-hub.sh [--version VER] [--user NAME] [--password PASS] [--port PORT] [--repo OWNER/REPO] [--mode relay|signaling-only] [--easytier-peer URL]...'
+            echo '  --easytier-peer  EasyTier node announced to clients by /api/v1/info (repeatable); stored as SKYLATCH_EASYTIER_PEERS in /etc/skylatch/hub.env'
             exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -108,6 +118,14 @@ if [ ! -e /etc/skylatch/hub.env ]; then
 else
     echo 'Keeping existing /etc/skylatch/hub.env'
 fi
+if [ -n "$peers" ]; then
+    tmp_env=$(mktemp /etc/skylatch/.hub.env.XXXXXX)
+    grep -v '^SKYLATCH_EASYTIER_PEERS=' /etc/skylatch/hub.env >"$tmp_env" || true
+    printf 'SKYLATCH_EASYTIER_PEERS=%s\n' "$peers" >>"$tmp_env"
+    chmod 600 "$tmp_env"
+    mv "$tmp_env" /etc/skylatch/hub.env
+    echo "EasyTier peers announced by /api/v1/info: $peers"
+fi
 
 cat >/etc/systemd/system/skylatch-hub.service <<UNIT
 [Unit]
@@ -150,9 +168,15 @@ Put a TLS reverse proxy in front (WebSocket upgrades must pass through):
         proxy_pass http://127.0.0.1:$port;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
     }
 
 Sign in at https://hub.example.com/ (your own domain) to add devices.
+
+Optional settings in /etc/skylatch/hub.env (then: systemctl restart skylatch-hub):
+  SKYLATCH_EASYTIER_PEERS=tcp://hub.example.com:11010   EasyTier nodes announced by /api/v1/info
+  SKYLATCH_ALLOW_SIGNUP=true                            open POST /api/v1/signup
+  SKYLATCH_MAX_DEVICES_PER_ACCOUNT=20                   cap devices per account
 NOTES
 if [ -n "$generated" ]; then
     echo "Generated login (shown once): user=$user password=$password"

@@ -1,6 +1,7 @@
 //! The hub's HTTP onboarding and direct-ticket endpoints.
 
 use crate::auth::AuthError;
+use crate::ratelimit::ClientIp;
 use crate::server::{bearer, AppState};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -10,8 +11,10 @@ use axum::Json;
 use serde::Serialize;
 use skylatch_proto::credentials::direct_ticket;
 use skylatch_proto::layout::WorkspaceLayout;
+use skylatch_proto::mesh::{HubInfo, MeshVaultConflict, PutMeshVaultRequest};
 use skylatch_proto::onboarding::{
-    DirectTicketRequest, DirectTicketResponse, EnrollRequest, LoginRequest,
+    CreatePairingCodeRequest, DirectTicketRequest, DirectTicketResponse, EnrollRequest,
+    LoginRequest, SignupRequest,
 };
 
 pub(crate) async fn console() -> impl IntoResponse {
@@ -29,6 +32,25 @@ pub(crate) async fn console() -> impl IntoResponse {
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            Self::VaultConflict(current) => {
+                let body = MeshVaultConflict {
+                    error: "mesh vault version conflict".into(),
+                    current: current.map(|envelope| *envelope),
+                };
+                return (
+                    StatusCode::CONFLICT,
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(body),
+                )
+                    .into_response();
+            }
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::SignupDisabled => (StatusCode::FORBIDDEN, "signup is disabled on this hub"),
+            Self::AccountExists => (StatusCode::CONFLICT, "account already exists"),
+            Self::DeviceLimit => (
+                StatusCode::FORBIDDEN,
+                "this account has reached its device limit",
+            ),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid or expired credentials"),
             Self::Invalid => (
                 StatusCode::BAD_REQUEST,
@@ -83,27 +105,70 @@ async fn blocking<T: Send + 'static>(
         .map_err(std::io::Error::other)?
 }
 
+pub(crate) async fn info(State(state): State<AppState>) -> Json<HubInfo> {
+    Json(HubInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        mode: state.config.mode.as_str().into(),
+        easytier_peers: state.config.easytier_peers.clone(),
+        allow_signup: state.config.allow_signup,
+        max_devices_per_account: state.config.max_devices_per_account,
+    })
+}
+
 pub(crate) async fn login(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AuthError> {
+    if !state.limits.login.allow(ip) {
+        return Err(AuthError::Limited);
+    }
     blocking(move || state.auth.login(request))
         .await
         .map(secret)
 }
 
+pub(crate) async fn signup(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(request): Json<SignupRequest>,
+) -> Result<impl IntoResponse, AuthError> {
+    if !state.config.allow_signup {
+        return Err(AuthError::SignupDisabled);
+    }
+    if !state.limits.signup.allow(ip) {
+        return Err(AuthError::Limited);
+    }
+    let created = blocking(move || state.auth.signup(&state.config, request)).await?;
+    Ok((StatusCode::CREATED, secret(created)))
+}
+
 pub(crate) async fn create_code(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, AuthError> {
     let account = account(&state, &headers)?;
-    state.auth.create_code(account).map(secret)
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        CreatePairingCodeRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| AuthError::BadRequest("invalid pairing code request"))?
+    };
+    state
+        .auth
+        .create_code(account, request.mesh_invite)
+        .map(secret)
 }
 
 pub(crate) async fn enroll(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(request): Json<EnrollRequest>,
 ) -> Result<impl IntoResponse, AuthError> {
+    if !state.limits.enroll.allow(ip) {
+        return Err(AuthError::Limited);
+    }
     blocking(move || match request {
         EnrollRequest::Code(request) => {
             state
@@ -203,4 +268,42 @@ pub(crate) async fn put_layout(
     }
     let saved = blocking(move || state.auth.set_layout(&account, layout)).await?;
     Ok(secret(saved).into_response())
+}
+
+pub(crate) async fn get_mesh_vault(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AuthError> {
+    let account = account(&state, &headers)?;
+    Ok(match state.auth.mesh_vault(&account) {
+        Some(envelope) => secret(envelope).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"error": "no mesh vault"})),
+        )
+            .into_response(),
+    })
+}
+
+pub(crate) async fn put_mesh_vault(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, AuthError> {
+    let account = account(&state, &headers)?;
+    let request: PutMeshVaultRequest = serde_json::from_slice(&body)
+        .map_err(|_| AuthError::BadRequest("invalid mesh vault request"))?;
+    blocking(move || state.auth.put_mesh_vault(&account, request))
+        .await
+        .map(secret)
+}
+
+pub(crate) async fn delete_mesh_vault(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AuthError> {
+    let account = account(&state, &headers)?;
+    blocking(move || state.auth.delete_mesh_vault(&account)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

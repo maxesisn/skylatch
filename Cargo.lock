@@ -1324,7 +1324,9 @@ dependencies = [
 name = "skylatch-client-core"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "opusic-sys",
@@ -1339,6 +1341,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@
 pub mod control;
 pub mod credentials;
 pub mod layout;
+pub mod mesh;
 pub mod nsl1;
 pub mod onboarding;
 

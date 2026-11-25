@@ -8,6 +8,7 @@ mod api;
 mod auth;
 pub mod config;
 pub mod gate;
+mod ratelimit;
 pub mod registry;
 pub mod server;
 
