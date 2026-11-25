@@ -30,6 +30,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
     private var shown = false
     private var finished = false
     private var hud: HudOverlay?
+    private var perfHud: PerfHudView?
+    private var perfTimer: Timer?
     private let keyCapture = KeyCapture()
     private let text = HudText.current
     private var deviceID = ""
@@ -104,6 +106,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         view.smoothWheel = { [weak self] in self?.session?.smoothWheelEnabled ?? false }
         view.onToggleCapture = { [weak self] in self?.toggleCapture() }
         view.onEscapeHold = { [weak self] in self?.window?.toggleFullScreen(nil) }
+        view.onTogglePerf = { [weak self] in self?.togglePerf() }
+        let perfHud = PerfHudView(frame: .zero)
+        view.addSubview(perfHud)
+        view.perfHud = perfHud
+        self.perfHud = perfHud
         let hud = HudOverlay(frame: view.bounds)
         hud.onAction = { [weak self] action in self?.handleHud(action) }
         view.addSubview(hud)
@@ -310,6 +317,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         case .capture: toggleCapture()
         case .swap: toggleSwap()
         case .fullscreen: window?.toggleFullScreen(nil)
+        case .perf: togglePerf()
         case .disconnect: userDisconnect()
         case .reconnect: reconnect()
         case .close: window?.close()
@@ -349,6 +357,37 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
         // In fullscreen the capture follows the fullscreen state; only the windowed choice is remembered.
         if !fullscreen { windowedCapture = captureOn }
         hud?.toast(captureOn ? text.captureOn : text.captureOff)
+    }
+
+    /// Steps the performance HUD through hidden, card and strip; it refreshes twice a second while shown.
+    private func togglePerf() {
+        guard let perfHud else { return }
+        let mode = perfHud.mode.next
+        perfHud.setMode(mode)
+        hud?.setPerfOn(mode != .hidden)
+        perfTimer?.invalidate()
+        perfTimer = nil
+        guard mode != .hidden else { return }
+        refreshPerf()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.refreshPerf() }
+        RunLoop.main.add(timer, forMode: .common)
+        perfTimer = timer
+    }
+
+    private func refreshPerf() {
+        guard let session, !finished, hud?.isLostCardVisible != true else { return }
+        let (stats, rates) = session.perfSnapshot()
+        let decoder: String
+        switch stats.mode {
+        case "VideoToolbox": decoder = "VT"
+        case "VideoToolbox-software": decoder = "SW"
+        default: decoder = ""
+        }
+        // The core does not report which path a hub session settled on, so only a forced path is shown.
+        let path: PerfPath = config.hub.isEmpty ? .direct : config.noDirect ? .relay : .unknown
+        let audio: PerfAudio = !session.hasAudio ? .off : audioOn ? .on : .muted
+        perfHud?.update(PerfReadout(width: stats.width, height: stats.height, decoder: decoder, path: path,
+                                    audio: audio, rates: rates))
     }
 
     private func toggleSwap() {
@@ -469,6 +508,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Se
     private func teardown() {
         finished = true
         timer?.invalidate()
+        perfTimer?.invalidate()
         revealFallback?.cancel()
         keyCapture.stop()
         clipboard?.stop()

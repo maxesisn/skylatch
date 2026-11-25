@@ -42,9 +42,10 @@ final class AudioPlayer {
         }
     }
 
-    /// Queues decoded PCM; mono is played on both channels and other sample rates are ignored.
-    func push(_ pcm: UnsafePointer<Int16>, frames: Int, channels: Int, sampleRate: UInt32) {
-        guard sampleRate == Self.sampleRate, channels == 1 || channels == 2 else { return }
+    /// Queues decoded PCM; mono is played on both channels and other sample rates are ignored (false).
+    @discardableResult
+    func push(_ pcm: UnsafePointer<Int16>, frames: Int, channels: Int, sampleRate: UInt32) -> Bool {
+        guard sampleRate == Self.sampleRate, channels == 1 || channels == 2 else { return false }
         lock.lock()
         defer { lock.unlock() }
         if channels == 2 {
@@ -54,6 +55,14 @@ final class AudioPlayer {
             for i in 0..<frames { stereo.append(pcm[i]); stereo.append(pcm[i]) }
             stereo.withUnsafeBufferPointer { jitter.write($0) }
         }
+        return true
+    }
+
+    /// Milliseconds of audio queued ahead of the speaker.
+    var bufferedMs: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return Double(jitter.queuedFrames) * 1000 / Double(Self.sampleRate)
     }
 
     func clear() {
