@@ -3,10 +3,11 @@
 use crate::cli::{AgentArgs, DaemonCredentials};
 use crate::direct::{self, Direct};
 use crate::engine::{EngineEvent, EngineSource, LocalLink};
-use crate::hardware::detect_hardware_profile;
+use crate::hardware::{detect_hardware_profile, detect_monitors};
 use futures_util::{SinkExt, StreamExt};
-use skylatch_proto::control::{DeviceInfo, HostToHub, HubToHost};
+use skylatch_proto::control::{DeviceInfo, DirectEndpoint, HostToHub, HubToHost};
 use skylatch_proto::credentials::random_token;
+use skylatch_proto::nsl1::MonitorInfo;
 use std::{io, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
@@ -15,6 +16,51 @@ use tokio_tungstenite::tungstenite::Message;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+const TOPOLOGY_POLL: Duration = Duration::from_secs(5);
+
+/// Display geometry and direct endpoints as currently observed on the host.
+struct Observed {
+    monitor_list: Vec<MonitorInfo>,
+    /// `None` when interface enumeration failed; the last known endpoints stay advertised.
+    direct_endpoints: Option<Vec<DirectEndpoint>>,
+}
+
+type Probe = Arc<dyn Fn() -> Observed + Send + Sync>;
+
+impl Observed {
+    /// Folds the observation into `device`, returning the control messages that announce changes.
+    fn apply(self, device: &mut DeviceInfo) -> Vec<HostToHub> {
+        let mut updates = Vec::new();
+        if self.monitor_list != device.monitor_list {
+            device.monitors = self.monitor_list.len().max(1) as u32;
+            device.monitor_list = self.monitor_list;
+            tracing::info!(monitors = device.monitors, "display topology changed");
+            updates.push(HostToHub::Monitors {
+                monitors: device.monitors,
+                monitor_list: device.monitor_list.clone(),
+            });
+        }
+        if let Some(endpoints) = self
+            .direct_endpoints
+            .filter(|e| *e != device.direct_endpoints)
+        {
+            device.direct_endpoints = endpoints;
+            tracing::info!(
+                count = device.direct_endpoints.len(),
+                "direct endpoints changed"
+            );
+            updates.push(HostToHub::DirectEndpoints {
+                endpoints: device.direct_endpoints.clone(),
+            });
+        }
+        updates
+    }
+}
+
+async fn observe(probe: &Probe) -> Option<Observed> {
+    let probe = probe.clone();
+    tokio::task::spawn_blocking(move || probe()).await.ok()
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ConnError {
@@ -62,22 +108,33 @@ pub async fn run(mut cli: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let hardware = tokio::task::spawn_blocking(detect_hardware_profile)
         .await
         .unwrap_or_default();
-    let mut endpoints = cli.direct_endpoints.clone();
-    if let Some(listener) = &listener {
-        let port = listener.local_addr()?.port();
-        match direct::endpoints(port) {
-            Ok(detected) => {
-                for endpoint in detected {
-                    if !endpoints.contains(&endpoint) {
-                        endpoints.push(endpoint);
+    let direct_port = match &listener {
+        Some(listener) => {
+            let port = listener.local_addr()?.port();
+            tracing::info!(port, "direct listener enabled");
+            Some(port)
+        }
+        None => None,
+    };
+    let static_endpoints = cli.direct_endpoints.clone();
+    let probe: Probe = Arc::new(move || Observed {
+        monitor_list: detect_monitors(),
+        direct_endpoints: direct_port.map(|port| {
+            let mut endpoints = static_endpoints.clone();
+            match direct::endpoints(port) {
+                Ok(detected) => {
+                    for endpoint in detected {
+                        if !endpoints.contains(&endpoint) {
+                            endpoints.push(endpoint);
+                        }
                     }
                 }
+                Err(err) => tracing::debug!(%err, "could not detect direct interfaces"),
             }
-            Err(err) => tracing::warn!(%err, "could not detect direct interfaces"),
-        }
-        tracing::info!(port, "direct listener enabled");
-    }
-    let device = DeviceInfo {
+            endpoints
+        }),
+    });
+    let mut device = DeviceInfo {
         device_id: cli.resolved_device_id(),
         name: cli.resolved_name(),
         os: std::env::consts::OS.to_string(),
@@ -88,10 +145,13 @@ pub async fn run(mut cli: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
         room: cli.room.clone(),
         slot: cli.slot,
         hardware_model: cli.model.clone().or(hardware.hardware_model),
-        direct_endpoints: endpoints,
+        direct_endpoints: cli.direct_endpoints.clone(),
         online: true,
         last_seen_unix: None,
     };
+    if let Some(observed) = observe(&probe).await {
+        observed.apply(&mut device);
+    }
     let engine = Arc::new(Mutex::new(match (&cli.engine_bin, &cli.engine_url) {
         (Some(bin), _) => EngineSource::spawn(bin.clone(), cli.engine_port, cli.engine_args()),
         (None, Some(url)) => EngineSource::attach(url.clone()),
@@ -124,26 +184,50 @@ pub async fn run(mut cli: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .then(|| Arc::from(credentials.token.as_str())),
         };
         tokio::select! {
-            _ = reconnect(&credentials, &device, &engine, &viewer, Some(&key)) => {},
+            _ = reconnect(&credentials, device, &engine, &viewer, Some(&key), probe, TOPOLOGY_POLL) => {},
             result = direct::serve(listener, direct) => result?,
         }
     } else {
-        reconnect(&credentials, &device, &engine, &viewer, None).await;
+        reconnect(
+            &credentials,
+            device,
+            &engine,
+            &viewer,
+            None,
+            probe,
+            TOPOLOGY_POLL,
+        )
+        .await;
     }
     Ok(())
 }
 
 async fn reconnect(
     credentials: &DaemonCredentials,
-    device: &DeviceInfo,
+    mut device: DeviceInfo,
     engine: &Mutex<EngineSource>,
     viewer: &Arc<Semaphore>,
     key: Option<&watch::Sender<Option<String>>>,
+    probe: Probe,
+    poll: Duration,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
         let mut registered = false;
-        let result = connection(credentials, device, engine, viewer, key, &mut registered).await;
+        if let Some(observed) = observe(&probe).await {
+            observed.apply(&mut device);
+        }
+        let result = connection(
+            credentials,
+            &mut device,
+            engine,
+            viewer,
+            key,
+            &mut registered,
+            &probe,
+            poll,
+        )
+        .await;
         if let Some(key) = key {
             key.send_replace(None);
         }
@@ -164,13 +248,16 @@ fn json(msg: &HostToHub) -> Message {
     Message::Text(serde_json::to_string(msg).expect("serialisable").into())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connection(
     credentials: &DaemonCredentials,
-    device: &DeviceInfo,
+    device: &mut DeviceInfo,
     engine: &Mutex<EngineSource>,
     viewer: &Arc<Semaphore>,
     key: Option<&watch::Sender<Option<String>>>,
     registered: &mut bool,
+    probe: &Probe,
+    poll: Duration,
 ) -> Result<(), ConnError> {
     tracing::info!(hub = %credentials.hub, "connecting to hub");
     let (ws, _) =
@@ -221,6 +308,8 @@ async fn connection(
     let period = Duration::from_secs(heartbeat_secs);
     let mut ticker = interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut topology = interval_at(Instant::now() + poll, poll);
+    topology.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut seq = 0u64;
     let mut last_rx = Instant::now();
     let (events_tx, mut events_rx) = mpsc::channel::<EngineEvent>(64);
@@ -355,6 +444,14 @@ async fn connection(
                         None => unreachable!("events_tx is held by this loop"),
                     }
                 }
+                _ = topology.tick() => {
+                    let Some(observed) = observe(probe).await else { continue };
+                    for update in observed.apply(device) {
+                        sink.send(json(&update))
+                            .await
+                            .map_err(|e| ConnError::Ws(e.to_string()))?;
+                    }
+                }
                 _ = ticker.tick() => {
                     if last_rx.elapsed() > period * 3 {
                         return Err(ConnError::HeartbeatTimeout);
@@ -377,4 +474,172 @@ async fn connection(
     }
     let _ = sink.close().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skylatch_proto::control::DeviceFormFactor;
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
+
+    fn monitor(id: &str, x: i32, width: u16, height: u16) -> MonitorInfo {
+        MonitorInfo {
+            id: id.into(),
+            name: id.into(),
+            x,
+            y: 0,
+            width,
+            height,
+            primary: x == 0,
+            active: true,
+        }
+    }
+
+    fn endpoint(host: &str) -> DirectEndpoint {
+        DirectEndpoint {
+            kind: skylatch_proto::control::EndpointKind::Lan,
+            host: host.into(),
+            port: 7001,
+        }
+    }
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            device_id: "box".into(),
+            name: "Box".into(),
+            os: "linux".into(),
+            host_version: "1".into(),
+            monitors: 1,
+            monitor_list: vec![monitor("a", 0, 1920, 1080)],
+            form_factor: DeviceFormFactor::Mini,
+            room: None,
+            slot: None,
+            hardware_model: None,
+            direct_endpoints: vec![endpoint("192.0.2.1")],
+            online: true,
+            last_seen_unix: None,
+        }
+    }
+
+    fn observed(monitors: Vec<MonitorInfo>, endpoints: Option<Vec<DirectEndpoint>>) -> Observed {
+        Observed {
+            monitor_list: monitors,
+            direct_endpoints: endpoints,
+        }
+    }
+
+    #[test]
+    fn unchanged_topology_sends_nothing() {
+        let mut device = device();
+        let same = observed(
+            device.monitor_list.clone(),
+            Some(device.direct_endpoints.clone()),
+        );
+        assert!(same.apply(&mut device).is_empty());
+    }
+
+    #[test]
+    fn each_change_is_announced_once() {
+        let mut device = device();
+        let two = vec![monitor("a", 0, 1920, 1080), monitor("b", 1920, 1080, 1920)];
+        let updates = observed(two.clone(), Some(vec![endpoint("192.0.2.2")])).apply(&mut device);
+        assert_eq!(
+            updates,
+            [
+                HostToHub::Monitors {
+                    monitors: 2,
+                    monitor_list: two.clone()
+                },
+                HostToHub::DirectEndpoints {
+                    endpoints: vec![endpoint("192.0.2.2")]
+                },
+            ]
+        );
+        assert_eq!(device.monitors, 2);
+        assert!(observed(two, Some(vec![endpoint("192.0.2.2")]))
+            .apply(&mut device)
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_endpoint_probe_keeps_advertised_endpoints() {
+        let mut device = device();
+        assert!(observed(device.monitor_list.clone(), None)
+            .apply(&mut device)
+            .is_empty());
+        assert_eq!(device.direct_endpoints, [endpoint("192.0.2.1")]);
+    }
+
+    #[tokio::test]
+    async fn connected_agent_reports_display_changes_to_the_hub() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = listener.local_addr().unwrap();
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                match serde_json::from_str::<HostToHub>(t.as_str()).unwrap() {
+                    HostToHub::Register { .. } => {
+                        let ack = HubToHost::Registered {
+                            heartbeat_interval_secs: 60,
+                        };
+                        ws.send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+                            .await
+                            .unwrap();
+                    }
+                    other => seen_tx.send(other).unwrap(),
+                }
+            }
+        });
+
+        let current = Arc::new(StdMutex::new(vec![monitor("a", 0, 1920, 1080)]));
+        let probe: Probe = {
+            let current = current.clone();
+            Arc::new(move || observed(current.lock().unwrap().clone(), None))
+        };
+        let credentials = DaemonCredentials {
+            hub: format!("ws://{hub}/ws/host").parse().unwrap(),
+            token: "t".into(),
+            device_token: false,
+        };
+        let engine = Mutex::new(EngineSource::attach("http://127.0.0.1:9".parse().unwrap()));
+        let viewer = Arc::new(Semaphore::new(1));
+        let mut device = device();
+        let agent = async {
+            let mut registered = false;
+            connection(
+                &credentials,
+                &mut device,
+                &engine,
+                &viewer,
+                None,
+                &mut registered,
+                &probe,
+                Duration::from_millis(20),
+            )
+            .await
+        };
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(seen.try_recv().is_err(), "no change, no message");
+            let two = vec![monitor("a", 0, 1920, 1080), monitor("b", -1080, 1080, 1920)];
+            *current.lock().unwrap() = two.clone();
+            let msg = timeout(Duration::from_secs(5), seen.recv()).await.unwrap();
+            assert_eq!(
+                msg,
+                Some(HostToHub::Monitors {
+                    monitors: 2,
+                    monitor_list: two
+                })
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(seen.try_recv().is_err(), "change is not repeated");
+        };
+        tokio::select! {
+            _ = agent => panic!("connection ended"),
+            _ = driver => {}
+        }
+    }
 }

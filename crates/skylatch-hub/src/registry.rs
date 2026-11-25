@@ -3,6 +3,7 @@
 use crate::gate::{FrameGate, Verdict};
 use bytes::Bytes;
 use skylatch_proto::control::{DeviceInfo, DirectEndpoint, HubToClient, HubToHost};
+use skylatch_proto::nsl1::MonitorInfo;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -216,6 +217,25 @@ impl Registry {
         {
             if d.conn_id == conn_id {
                 d.info.direct_endpoints = endpoints;
+                d.info.last_seen_unix = Some(unix_now());
+            }
+        }
+    }
+
+    pub fn set_monitors(
+        &self,
+        account: &str,
+        device_id: &str,
+        conn_id: u64,
+        monitor_list: Vec<MonitorInfo>,
+    ) {
+        if let Some(d) = self
+            .lock()
+            .get_mut(&(account.to_string(), device_id.to_string()))
+        {
+            if d.conn_id == conn_id {
+                d.info.monitors = monitor_list.len().max(1) as u32;
+                d.info.monitor_list = monitor_list;
                 d.info.last_seen_unix = Some(unix_now());
             }
         }

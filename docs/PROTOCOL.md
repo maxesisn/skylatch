@@ -307,6 +307,7 @@ Host to hub:
 | `register` | `token`, `device` | Must be first. A static account token or a device token for exactly `device.device_id` |
 | `heartbeat` | `seq` | Liveness; any message resets the idle timer |
 | `direct_endpoints` | `endpoints` | Replaces the advertised direct endpoints |
+| `monitors` | `monitors`, `monitor_list` | Replaces the advertised display topology; the hub stores `monitors` as `max(len(monitor_list), 1)`. Sent when the host's displays change while connected. A hub that predates it answers `error` `invalid` and keeps the connection |
 | `direct_access` | `key` | Optional 64-hex signing key for the lifetime of this host connection; never sent to clients |
 | `session_ready` | `session_id` | Host is ready to stream |
 | `session_closed` | `session_id` | Host ended the session |
