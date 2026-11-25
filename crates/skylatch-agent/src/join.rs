@@ -3,7 +3,14 @@
 use crate::cli::{hostname, parse_hub_url, sanitize_id};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use skylatch_client_core::mesh_vault::{open_mesh_invite, split_join_code, InviteSecret};
+use skylatch_mesh::service::{is_elevated, CommandSpec};
+use skylatch_mesh::{
+    detect_conflicts, find_binaries, install::ACCEPTED_VERSION, write_managed_profiles,
+    ManagedWriteOptions, MeshManager, MeshPaths,
+};
 use skylatch_proto::credentials::{is_token, write_private_file};
+use skylatch_proto::mesh::MeshInviteCiphertext;
 use skylatch_proto::onboarding::{CodeEnrollment, EnrollRequest, PasswordEnrollment};
 use std::env;
 use std::io::{self, IsTerminal, Write};
@@ -14,7 +21,8 @@ use url::Url;
 pub struct Join {
     /// Public HTTP(S) or WS(S) address of the hub.
     hub_url: String,
-    /// Single-use pairing code, such as 482-917.
+    /// Single-use pairing code, such as 482-917, optionally followed by the mesh invite secret
+    /// (482-917-XXXX-XXXX-XXXX-XXXX-XXXX) to also join the invited EasyTier network.
     #[arg(long, conflicts_with = "username")]
     code: Option<String>,
     /// Hub username. When no code is supplied, prompts for any missing credentials.
@@ -133,6 +141,81 @@ fn join_url(address: &str) -> Result<Url, String> {
     parse_hub_url(url.as_str())
 }
 
+/// Splits `--code` into what is sent to the hub and the invite secret that stays on this machine.
+/// A plain pairing code is sent exactly as typed.
+fn split_code(raw: String) -> Result<(String, Option<InviteSecret>), &'static str> {
+    match split_join_code(&raw) {
+        Ok((code, Some(secret))) => Ok((code, Some(secret))),
+        Ok((_, None)) => Ok((raw, None)),
+        Err(_) if raw.trim().len() <= 7 => Ok((raw, None)),
+        Err(_) => Err("the mesh invite part of the join code is malformed; check for typos"),
+    }
+}
+
+/// Decrypts the invite, writes its owner-only EasyTier profile into the Skylatch-managed
+/// directory next to `config_path`, and starts the managed service when that is safe.
+/// Returns the status line to print; it never contains the network secret.
+async fn join_mesh(
+    hub_url: &Url,
+    config_path: &Path,
+    hostname: &str,
+    invite: &MeshInviteCiphertext,
+    secret: &InviteSecret,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let profile = open_mesh_invite(invite, secret)?;
+    let hub_peers = match skylatch_client_core::hub_info(hub_url.as_str()).await {
+        Ok(info) => info.easytier_peers,
+        Err(err) => {
+            tracing::warn!(%err, "cannot read the hub's EasyTier peers");
+            vec![]
+        }
+    };
+    let app_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let paths = MeshPaths::new(app_dir);
+    let launch = write_managed_profiles(
+        &paths.profiles_dir(),
+        std::slice::from_ref(&profile),
+        std::slice::from_ref(&profile.id),
+        &hub_peers,
+        &ManagedWriteOptions::new(hostname),
+    )?;
+    let manager = MeshManager::system(paths.clone());
+    manager.bind_managed(&launch, None, false, Some(hub_url.as_str()))?;
+    let saved = format!(
+        "Mesh network \"{}\" ({}) saved to {}",
+        profile.name,
+        profile.subnet,
+        paths.profiles_dir().display()
+    );
+    let Some(core) = find_binaries(&[]).core else {
+        return Ok(format!(
+            "{saved}; install EasyTier {ACCEPTED_VERSION} to connect."
+        ));
+    };
+    let conflicts = detect_conflicts();
+    if !conflicts.is_empty() {
+        let titles: Vec<&str> = conflicts.iter().map(|c| c.title.as_str()).collect();
+        return Ok(format!("{saved}; not started: {}.", titles.join("; ")));
+    }
+    if is_elevated() {
+        manager.apply(&core)?;
+        return Ok(format!(
+            "{saved}; the Skylatch EasyTier service is running."
+        ));
+    }
+    let command = CommandSpec {
+        program: core.to_string_lossy().into_owned(),
+        args: launch.args(),
+    };
+    let elevate = if cfg!(windows) { "" } else { "sudo " };
+    Ok(format!(
+        "{saved}; start it as administrator: {elevate}{command}"
+    ))
+}
+
 fn prompt(label: &str) -> io::Result<String> {
     let mut stderr = io::stderr().lock();
     write!(stderr, "{label}: ")?;
@@ -162,7 +245,10 @@ impl Join {
         }
         let device_id = self.device_id.unwrap_or_else(|| sanitize_id(&hostname()));
         let name = self.name.unwrap_or_else(hostname);
+        let mut invite_secret = None;
         let request = if let Some(code) = self.code {
+            let (code, secret) = split_code(code)?;
+            invite_secret = secret;
             EnrollRequest::Code(CodeEnrollment {
                 code,
                 device_id: device_id.clone(),
@@ -194,9 +280,9 @@ impl Join {
             return Err("hub returned invalid enrollment credentials".into());
         }
         let config = SavedConfig {
-            hub_url: hub_url.into(),
+            hub_url: hub_url.to_string(),
             device_id,
-            name,
+            name: name.clone(),
             device_token: result.device_token,
             room: self.room,
             slot: self.slot,
@@ -213,6 +299,20 @@ impl Join {
                 result.account
             );
         }
+        match (invite_secret, &result.mesh_invite) {
+            (Some(secret), Some(invite)) => {
+                let status = join_mesh(&hub_url, &path, &name, invite, &secret)
+                    .await
+                    .map_err(|err| format!("the mesh network was not set up: {err}"))?;
+                println!("{status}");
+            }
+            (Some(_), None) => {
+                eprintln!(
+                    "The hub returned no mesh invite for this code; only the device was enrolled."
+                )
+            }
+            (None, _) => {}
+        }
         Ok(())
     }
 }
@@ -220,6 +320,21 @@ impl Join {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_codes_reach_the_hub_unchanged() {
+        for raw in ["482-917", " 482-917 ", "482917", "12"] {
+            let (code, secret) = split_code(raw.into()).unwrap();
+            assert_eq!(code, raw);
+            assert!(secret.is_none());
+        }
+        let secret = InviteSecret::generate().unwrap();
+        let joined = skylatch_client_core::mesh_vault::format_join_code("482-917", &secret);
+        let (code, parsed) = split_code(joined.to_lowercase()).unwrap();
+        assert_eq!(code, "482-917");
+        assert_eq!(parsed.unwrap().display(), secret.display());
+        assert!(split_code("482-917-ABCD".into()).is_err());
+    }
 
     #[test]
     fn system_configuration_lives_under_program_data() {

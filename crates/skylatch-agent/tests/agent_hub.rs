@@ -716,3 +716,136 @@ async fn join_saves_config_and_direct_listener_authenticates_and_streams() {
         );
     }
 }
+
+async fn record_request(
+    axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<String>>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    seen.lock().unwrap().push(format!(
+        "{} {:?} {}",
+        parts.uri,
+        parts.headers,
+        String::from_utf8_lossy(&body)
+    ));
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(body),
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn join_code_with_invite_secret_writes_the_managed_mesh_profile() {
+    use skylatch_client_core::mesh_vault::{format_join_code, seal_mesh_invite, InviteSecret};
+    use skylatch_client_core::{create_pairing_code_with_invite, MeshVault};
+
+    let mut cfg = HubConfig::new(vec![("demo".into(), "example-static-token".into())]);
+    cfg.easytier_peers = vec!["tcp://relay.example.com:11010".into()];
+    let state = AppState::with_auth(cfg, None, vec![]).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = router(state).layer(axum::middleware::from_fn_with_state(
+        seen.clone(),
+        record_request,
+    ));
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let _hub_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let vault = MeshVault::new_default().unwrap();
+    let mut profile = vault.next_isolated_defaults().unwrap();
+    profile.custom_peers = vec!["udp://own.example.com:11010".into()];
+    let secret = InviteSecret::generate().unwrap();
+    let invite = seal_mesh_invite(&profile, &secret).unwrap();
+    let pair = create_pairing_code_with_invite(&origin, "example-static-token", &invite)
+        .await
+        .unwrap();
+    let join_code = format_join_code(&pair.code, &secret);
+
+    let config = ConfigDirectory::new();
+    let output = timeout(
+        WAIT,
+        config
+            .command()
+            .args([
+                "join",
+                &origin,
+                "--code",
+                &join_code,
+                "--device-id",
+                "lab-vm",
+                "--name",
+                "Lab VM",
+            ])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+
+    let secret_symbols = secret.display().replace('-', "");
+    for leak in [
+        profile.network_secret.as_str(),
+        &secret.display(),
+        &secret_symbols,
+    ] {
+        assert!(
+            !stdout.contains(leak) && !stderr.contains(leak),
+            "{stdout}{stderr}"
+        );
+        for request in seen.lock().unwrap().iter() {
+            assert!(!request.contains(leak), "hub saw a secret: {request}");
+        }
+    }
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|r| r.contains(&invite.ct_b64)));
+    assert!(seen.iter().any(
+        |r| r.contains("/api/v1/enroll") && r.contains(&format!("\"code\":\"{}\"", pair.code))
+    ));
+    assert!(seen.iter().any(|r| r.starts_with("/api/v1/info")));
+    let status = stdout.lines().last().unwrap();
+    assert!(
+        status.starts_with(&format!(
+            "Mesh network \"{}\" ({})",
+            profile.name, profile.subnet
+        )),
+        "{stdout}"
+    );
+
+    let app_dir = config.path().parent().unwrap().to_path_buf();
+    let toml_path = app_dir
+        .join("easytier")
+        .join(format!("net-{}.toml", profile.id));
+    let written = std::fs::read_to_string(&toml_path).unwrap();
+    assert!(written.contains(&profile.network_secret));
+    assert!(written.contains("uri = \"tcp://relay.example.com:11010\""));
+    assert!(written.contains("uri = \"udp://own.example.com:11010\""));
+    assert!(written.contains(&format!("tcp://0.0.0.0:{}", profile.listen_port)));
+    assert!(written.contains("dhcp = true"));
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(app_dir.join("mesh-state.json")).unwrap()).unwrap();
+    assert_eq!(state["binding"]["mode"], "managed");
+    assert_eq!(
+        state["binding"]["active_profile_ids"][0],
+        profile.id.as_str()
+    );
+    assert!(!state.to_string().contains(&profile.network_secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&toml_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let agent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+    assert_eq!(agent["device_id"], "lab-vm");
+}
