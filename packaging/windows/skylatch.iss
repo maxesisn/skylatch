@@ -62,6 +62,12 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: 
 [Run]
 Filename: "{app}\skylatch-agent.exe"; Parameters: "service install --start"; StatusMsg: "Starting the Skylatch host agent service..."; Flags: runhidden waituntilterminated; Tasks: agentservice
 Filename: "{app}\skylatch-agent.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; Tasks: not agentservice; Check: IsAdminInstallMode
+; Launch the UI after an interactive install (finish-page checkbox, checked by default) and after a
+; silent install or self-update (which shows no finish page). runasoriginaluser starts it with the
+; pre-UAC credentials of the user who launched Setup, so an all-users install does not run the UI
+; elevated; Setup documents it as valid in any [Run] entry and a no-op when not elevated.
+Filename: "{app}\skylatch-ui.exe"; Description: "Launch Skylatch"; Flags: nowait postinstall runasoriginaluser skipifsilent
+Filename: "{app}\skylatch-ui.exe"; Flags: nowait runasoriginaluser skipifnotsilent
 
 [UninstallRun]
 Filename: "{app}\skylatch-agent.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "SkylatchAgentService"; Check: IsAdminInstallMode
