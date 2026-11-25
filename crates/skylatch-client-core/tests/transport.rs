@@ -1212,3 +1212,41 @@ async fn http_requests_do_not_stall_behind_parked_caller_runtime() {
         "HTTP requests stalled behind parked caller runtime: took {elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn an_offline_device_record_can_be_deleted_but_an_online_one_cannot() {
+    use skylatch_client_core::delete_device;
+    let hub = Hub::start().await;
+    let url = hub.url.replacen("ws://", "http://", 1);
+    let host = register(&hub, device(vec![])).await;
+    assert!(matches!(
+        deadline(delete_device(&url, HUB_TOKEN, DEVICE)).await,
+        Err(ClientError::Hub { code, .. }) if code == "409"
+    ));
+    drop(host);
+    let mut offline = false;
+    for _ in 0..100 {
+        let listed = deadline(list_devices(&url, HUB_TOKEN)).await.unwrap();
+        if listed.iter().any(|d| d.device_id == DEVICE && !d.online) {
+            offline = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(offline, "device was not marked offline after disconnect");
+    assert!(matches!(
+        deadline(delete_device(&url, "wrong", DEVICE)).await,
+        Err(ClientError::Hub { code, .. }) if code == "401"
+    ));
+    deadline(delete_device(&url, HUB_TOKEN, DEVICE))
+        .await
+        .unwrap();
+    assert!(deadline(list_devices(&url, HUB_TOKEN))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        deadline(delete_device(&url, HUB_TOKEN, DEVICE)).await,
+        Err(ClientError::Hub { code, .. }) if code == "404"
+    ));
+}

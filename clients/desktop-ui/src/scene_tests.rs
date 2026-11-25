@@ -1282,8 +1282,10 @@ fn no_user_facing_text_uses_the_middot_separator() {
         ("scene.rs", include_str!("scene.rs")),
         ("scene_layout.rs", include_str!("scene_layout.rs")),
         ("scene_tests.rs", include_str!("scene_tests.rs")),
+        ("seen.rs", include_str!("seen.rs")),
         ("theme.rs", include_str!("theme.rs")),
         ("tray.rs", include_str!("tray.rs")),
+        ("update.rs", include_str!("update.rs")),
     ] {
         assert!(!src.contains(mid), "{file} contains a middot");
     }
@@ -2172,4 +2174,120 @@ fn an_empty_room_can_be_deleted_but_never_one_with_devices_or_the_last() {
         placements: vec![],
     };
     assert!(remove_room(&mut single, "ghost", &online).is_err());
+}
+
+// ───────────────────────────── offline machines ─────────────────────────────
+
+fn offline(mut d: DeviceInfo, last_seen: Option<u64>) -> DeviceInfo {
+    d.online = false;
+    d.last_seen_unix = last_seen;
+    d
+}
+
+/// Strokes drawn for `scene` that are dashed.
+fn dashed_strokes(scene: &Scene) -> usize {
+    scene
+        .items
+        .iter()
+        .filter(|p| p.stroke.is_some_and(|s| s.dash.is_some()))
+        .count()
+}
+
+#[test]
+fn offline_machines_keep_their_seat_as_a_ghost() {
+    let (devs, layout) = arranged();
+    let online = build_scene_with_layout(&devs, Some(&layout), None);
+    let seen = crate::seen::now_unix() - 12 * 60 - 5;
+    let gone: Vec<DeviceInfo> = devs
+        .iter()
+        .cloned()
+        .map(|d| match d.device_id.as_str() {
+            "studio" | "tp" | "vm-b" => offline(d, Some(seen)),
+            _ => d,
+        })
+        .collect();
+    let sc = build_scene_with_layout(&gone, Some(&layout), None);
+    // same machines, same seats, same order
+    assert_eq!(signature(&sc), signature(&online));
+    let office = desk(&sc, "Office");
+    assert_eq!(
+        keys(&sc, &office.devs),
+        keys(&online, &desk(&online, "Office").devs)
+    );
+    for (f, s, key) in [
+        ("d1", 0, "tp#d1"),
+        ("d1", 1, "studio#d1"),
+        ("r1", 1, "vm-b#d1"),
+    ] {
+        let snap = office
+            .scene
+            .snaps
+            .iter()
+            .find(|n| n.furniture_id == f && n.slot == s)
+            .unwrap();
+        assert_eq!(snap.occupied_by, Some(dev(&sc, key)), "{key} keeps {f}/{s}");
+    }
+    for key in ["studio#d1", "studio#d2", "tp#d1", "vm-b#d1"] {
+        let d = &sc.devices[dev(&sc, key)];
+        assert_eq!(d.link, Link::Offline, "{key}");
+        assert!(link_hollow(d.link), "{key}: hollow status dot");
+        assert_eq!(d.last_seen, Some(seen));
+        assert_eq!(
+            detail_text(d),
+            format!("离线{DETAIL_SEP}12 分钟前"),
+            "{key}: the label says since when"
+        );
+        assert_eq!(last_seen_phrase(d), "上次在线 12 分钟前");
+        assert!(
+            office.scene.screen(dev(&sc, key)).is_some(),
+            "{key} is drawn"
+        );
+    }
+    assert!(!is_offline(sc.devices[dev(&sc, "a#d1")].link));
+    // a tab opens on a machine that can be taken over
+    assert_eq!(
+        sc.default_selection(0),
+        Some(dev(&sc, "a#d1")),
+        "the offline studio screens are skipped"
+    );
+    // the ghosts are drawn with dashed outlines
+    let before = dashed_strokes(&desk(&online, "Office").scene);
+    let after = dashed_strokes(&office.scene);
+    assert!(after > before + 20, "dashed strokes {before} -> {after}");
+    assert_clean(&sc);
+    // and on the shelf
+    let shelf = |sc: &Scenes| dashed_strokes(sc.scene(true, 0));
+    assert!(shelf(&sc) > shelf(&online));
+}
+
+#[test]
+fn a_ghost_is_low_contrast_and_unshaded() {
+    let devs = vec![desktop("a", "Office", 0)];
+    let on = build_scene_from_devices(&devs);
+    let off = build_scene_from_devices(&[offline(devs[0].clone(), None)]);
+    let roles = |sc: &Scenes| {
+        let items = &sc.desks[0].scene.items;
+        (
+            items
+                .iter()
+                .filter_map(|p| p.stroke)
+                .filter(|s| s.role == Role::Ink)
+                .count(),
+            items
+                .iter()
+                .filter_map(|p| p.fill)
+                .filter(|(r, _)| matches!(r, Role::FaceL | Role::FaceR | Role::Green | Role::Blue))
+                .count(),
+        )
+    };
+    let (ink_on, shaded_on) = roles(&on);
+    assert!(ink_on > 0 && shaded_on > 0);
+    assert_eq!(
+        roles(&off),
+        (0, 0),
+        "no ink outlines, no shading, no coloured LED"
+    );
+    let d = &off.devices[0];
+    assert_eq!(detail_text(d), format!("离线{DETAIL_SEP}"));
+    assert_eq!(last_seen_phrase(d), "");
 }

@@ -1,7 +1,7 @@
 //! Hub HTTP onboarding client. Credentials are never forwarded across redirects.
 
 use crate::{transport, ClientError};
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use skylatch_proto::layout::WorkspaceLayout;
 use skylatch_proto::onboarding::{
@@ -61,34 +61,39 @@ fn post(hub_url: &str, route: &str) -> Result<RequestBuilder, ClientError> {
     Ok(client()?.post(endpoint(hub_url, route)?))
 }
 
+async fn dispatch(request: RequestBuilder) -> Result<Response, ClientError> {
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            ClientError::Timeout("hub HTTP request")
+        } else {
+            ClientError::Unexpected("could not reach hub HTTP endpoint")
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = match status.as_u16() {
+            400 | 422 => "invalid request",
+            401 => "invalid or expired credentials",
+            404 => "endpoint or device not found",
+            409 => "device already enrolled; revoke its token first",
+            429 => "too many attempts; try again shortly",
+            _ => "request failed",
+        };
+        return Err(ClientError::Hub {
+            code: status.as_u16().to_string(),
+            message: message.into(),
+        });
+    }
+    Ok(response)
+}
+
 async fn send<T: DeserializeOwned + Send + 'static>(
     request: RequestBuilder,
 ) -> Result<T, ClientError> {
     http_runtime()?
         .spawn(async move {
-            let response = request.send().await.map_err(|error| {
-                if error.is_timeout() {
-                    ClientError::Timeout("hub HTTP request")
-                } else {
-                    ClientError::Unexpected("could not reach hub HTTP endpoint")
-                }
-            })?;
-            let status = response.status();
-            if !status.is_success() {
-                let message = match status.as_u16() {
-                    400 | 422 => "invalid request",
-                    401 => "invalid or expired credentials",
-                    404 => "endpoint or device not found",
-                    409 => "device already enrolled; revoke its token first",
-                    429 => "too many attempts; try again shortly",
-                    _ => "request failed",
-                };
-                return Err(ClientError::Hub {
-                    code: status.as_u16().to_string(),
-                    message: message.into(),
-                });
-            }
-            response
+            dispatch(request)
+                .await?
                 .json()
                 .await
                 .map_err(|_| ClientError::Unexpected("invalid hub HTTP response"))
@@ -160,4 +165,18 @@ pub async fn put_layout(
         .bearer_auth(token)
         .json(layout);
     send(request).await
+}
+
+/// Forget an offline device and its saved record. The hub answers `409` while it is online.
+pub async fn delete_device(hub_url: &str, token: &str, device_id: &str) -> Result<(), ClientError> {
+    let mut url =
+        reqwest::Url::parse(&endpoint(hub_url, "devices")?).map_err(|_| ClientError::InvalidUrl)?;
+    url.path_segments_mut()
+        .map_err(|_| ClientError::InvalidUrl)?
+        .push(device_id);
+    let request = client()?.delete(url).bearer_auth(token);
+    http_runtime()?
+        .spawn(async move { dispatch(request).await.map(drop) })
+        .await
+        .map_err(|_| ClientError::Unexpected("hub HTTP request task aborted"))?
 }

@@ -23,7 +23,7 @@ pub use skylatch_proto::{
 };
 pub use transport::list_devices;
 
-pub use http::{create_pairing_code, enroll, get_layout, login, put_layout};
+pub use http::{create_pairing_code, delete_device, enroll, get_layout, login, put_layout};
 pub use skylatch_proto::layout::{
     DevicePlacement, Facing, FurnitureItem, FurnitureKind, RoomLayout, WorkspaceLayout,
 };

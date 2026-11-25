@@ -366,6 +366,7 @@ fn place_seat(
         );
         nav.push(d);
     }
+    let mark = b.prims.len();
     if devs[first].mini {
         keyboard(b, cell.gs, 128.0);
         mac_mini(b, cell.gs + 192.0, 122.0);
@@ -377,6 +378,9 @@ fn place_seat(
         };
         keyboard(b, ku, 128.0);
         mouse(b, ku + 160.0, 134.0);
+    }
+    if seat.iter().all(|&d| is_offline(devs[d].link)) {
+        b.ghost_since(mark);
     }
 }
 
