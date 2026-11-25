@@ -225,6 +225,10 @@ async fn handle_host(state: AppState, mut socket: WebSocket) {
                                 state.registry.set_endpoints(&account, &device_id, conn_id, endpoints);
                                 state.auth.remember_online(&state.registry, &account, &device_id);
                             }
+                            Ok(HostToHub::Monitors { monitor_list, .. }) => {
+                                state.registry.set_monitors(&account, &device_id, conn_id, monitor_list);
+                                state.auth.remember_online(&state.registry, &account, &device_id);
+                            }
                             Ok(HostToHub::DirectAccess { key }) => {
                                 if is_token(&key) {
                                     state.registry.set_direct_key(&account, &device_id, conn_id, key);

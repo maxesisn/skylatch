@@ -5,6 +5,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use skylatch_hub::{router, AppState, HubConfig, HubMode};
 use skylatch_proto::control::*;
+use skylatch_proto::nsl1::MonitorInfo;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -370,4 +371,63 @@ async fn signaling_only_hints_but_never_relays() {
         .await
         .unwrap();
     assert_eq!(ticket.status(), StatusCode::OK);
+}
+
+fn display(id: &str, x: i32, y: i32, width: u16, height: u16, primary: bool) -> MonitorInfo {
+    MonitorInfo {
+        id: id.into(),
+        name: id.into(),
+        x,
+        y,
+        width,
+        height,
+        primary,
+        active: true,
+    }
+}
+
+#[tokio::test]
+async fn monitor_updates_are_listed_immediately_and_survive_restart() {
+    let scratch = Scratch::new();
+    let hub = Hub::start(Some(&scratch.0), HubMode::Relay).await;
+    let mut host = hub.host("box", "Box", false).await;
+    assert_eq!(hub.wait_online("box", true).await["monitors"], 1);
+
+    let list = vec![
+        display("main", 0, 0, 2560, 1440, true),
+        display("side", -1080, -240, 1080, 1920, false),
+    ];
+    send(
+        &mut host,
+        &HostToHub::Monitors {
+            monitors: 1,
+            monitor_list: list.clone(),
+        },
+    )
+    .await;
+    send(&mut host, &HostToHub::Heartbeat { seq: 1 }).await;
+    assert!(matches!(
+        recv::<HubToHost>(&mut host).await,
+        HubToHost::HeartbeatAck { seq: 1 }
+    ));
+    let live = &hub.devices("").await[0];
+    assert_eq!(live["monitors"], 2);
+    assert_eq!(live["monitor_list"], serde_json::to_value(&list).unwrap());
+
+    let mut client = hub.client().await;
+    send(&mut client, &ClientToHub::ListDevices).await;
+    let HubToClient::Devices { devices } = recv(&mut client).await else {
+        panic!("expected devices");
+    };
+    assert_eq!(devices[0].monitor_list, list);
+
+    drop(hub);
+    drop(host);
+    let hub = Hub::start(Some(&scratch.0), HubMode::Relay).await;
+    let restored = hub.wait_online("box", false).await;
+    assert_eq!(restored["monitors"], 2);
+    assert_eq!(
+        restored["monitor_list"],
+        serde_json::to_value(&list).unwrap()
+    );
 }

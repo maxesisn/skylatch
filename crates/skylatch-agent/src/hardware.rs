@@ -124,13 +124,12 @@ fn compose_firmware_model(vendor: &str, product: &str, family: &str) -> Option<S
         .then(|| format!("{vendor} {product}"))
 }
 
-/// Collects a startup snapshot. Call on a blocking worker when running in an async runtime.
-pub fn detect_hardware_profile() -> HardwareProfile {
+/// Display geometry only; cheap enough to poll. Never empty (see the placeholder below).
+pub fn detect_monitors() -> Vec<MonitorInfo> {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    let (form_factor, mut monitor_list) = (platform::form_factor(), platform::monitors());
+    let mut monitor_list = platform::monitors();
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    let (form_factor, mut monitor_list) =
-        (classify_form_factor(HardwareHints::default()), Vec::new());
+    let mut monitor_list = Vec::new();
     if monitor_list.is_empty() {
         // Keep the legacy single-display placeholder without inventing physical bounds.
         monitor_list.push(MonitorInfo {
@@ -144,13 +143,22 @@ pub fn detect_hardware_profile() -> HardwareProfile {
             active: false,
         });
     }
+    monitor_list
+}
+
+/// Collects a startup snapshot. Call on a blocking worker when running in an async runtime.
+pub fn detect_hardware_profile() -> HardwareProfile {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let form_factor = platform::form_factor();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let form_factor = classify_form_factor(HardwareHints::default());
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let hardware_model = platform::hardware_model();
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let hardware_model = None;
     HardwareProfile {
         form_factor,
-        monitor_list,
+        monitor_list: detect_monitors(),
         hardware_model,
     }
 }

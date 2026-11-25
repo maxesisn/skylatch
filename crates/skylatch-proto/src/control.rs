@@ -91,6 +91,11 @@ pub enum HostToHub {
     DirectEndpoints {
         endpoints: Vec<DirectEndpoint>,
     },
+    /// Replaces the advertised display topology.
+    Monitors {
+        monitors: u32,
+        monitor_list: Vec<MonitorInfo>,
+    },
     /// Enables hub-issued tickets for this connection's authenticated direct listener.
     DirectAccess {
         key: String,
@@ -299,6 +304,13 @@ mod tests {
                 endpoints: device().direct_endpoints,
             },
             r#"{"type":"direct_endpoints","endpoints":[{"kind":"lan","host":"192.0.2.20","port":7001}]}"#,
+        );
+        rt(
+            HostToHub::Monitors {
+                monitors: 1,
+                monitor_list: device().monitor_list,
+            },
+            r#"{"type":"monitors","monitors":1,"monitor_list":[{"id":"display-1","name":"Example display","x":-1440,"y":0,"width":1440,"height":2560,"primary":false,"active":true}]}"#,
         );
         rt(
             HostToHub::SessionReady {
