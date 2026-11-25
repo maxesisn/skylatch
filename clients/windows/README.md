@@ -70,9 +70,15 @@ script needs the exit code or the output in order.
 - **HUD**: a thin cobalt (capturing) or grey (not capturing) latch strip sits at the top centre of the
   window. Move the pointer to it, or click it, to expand a pill with the device name, resolution,
   frame rate and latency, and buttons for monitor selection (shown when the host has several
-  monitors), system keys, Ctrl↔Cmd, fullscreen and disconnect. It collapses 1.8 s after the pointer
+  monitors), system keys, Ctrl↔Cmd, fullscreen, stats and disconnect. It collapses 1.8 s after the pointer
   leaves. Clicks on the HUD are never forwarded to the remote device. A brief toast confirms capture,
   fullscreen and swap changes.
+- **Ctrl+Shift+O** (or the HUD's stats button) steps a small translucent performance readout through a
+  three-row card, a one-line strip and hidden. It shows the last second's frame rate, resolution, decode
+  mode and time, wait from arrival to present, received H.264 bitrate, audio buffer delay or state, and
+  direct or relay when the path was forced (`--direct` / `--no-direct`; the core does not report which path
+  a hub session picked). Drag it with the left button anywhere inside the window; it stays inside when the
+  window is resized, and clicks on it never reach the remote device.
 - When a session ends, a card over the last frame shows the reason with **Reconnect now** (also Enter)
   and **Close window**. Reconnecting reuses the same window. The HUD text follows the Windows display
   language (Chinese or English).

@@ -125,7 +125,7 @@ Config parseArgs(int argc, wchar_t** argv) {
 
 constexpr UINT msgDevices = WM_APP + 1, msgConnected = WM_APP + 2, msgCursor = WM_APP + 3, msgEnded = WM_APP + 4;
 constexpr UINT msgClipboard = WM_APP + 5, msgFirstFrame = WM_APP + 6, msgMonitors = WM_APP + 7, msgResumed = WM_APP + 8;
-constexpr UINT_PTR statusTimer = 1, hudTimer = 2, escTimer = 3;
+constexpr UINT_PTR statusTimer = 1, hudTimer = 2, escTimer = 3, perfTimer = 4;
 constexpr auto doubleTapWindow = std::chrono::milliseconds(400);
 constexpr UINT escHoldMs = 1200;
 constexpr uint8_t hidEscape = 41, hidLCtrl = 224, hidLGui = 227, hidRCtrl = 228, hidRGui = 231;
@@ -139,6 +139,40 @@ struct Stats {
     const char* mode = "unknown";
     Clock::time_point firstPresent{};
 };
+// Per-frame and per-audio-packet measurements of the last second, for the performance readout.
+class PerfWindow {
+    struct Sample { Clock::time_point at; double value; };
+    std::deque<Sample> received, decoded, presented, audio;
+    void prune(Clock::time_point now) {
+        for (auto* q : {&received, &decoded, &presented, &audio})
+            while (!q->empty() && now - q->front().at >= std::chrono::seconds(1)) q->pop_front();
+    }
+    static std::optional<double> mean(const std::deque<Sample>& q) {
+        if (q.empty()) return std::nullopt;
+        double sum = 0;
+        for (const auto& s : q) sum += s.value;
+        return sum / double(q.size());
+    }
+public:
+    void receivedBytes(size_t bytes, Clock::time_point at) { received.push_back({at, double(bytes)}); prune(at); }
+    // waitUs (arrival to present) counts only for frames that reached the screen.
+    void decodedFrame(uint64_t decodeUs, uint64_t waitUs, bool shown, Clock::time_point at) {
+        decoded.push_back({at, double(decodeUs) / 1000.0});
+        if (shown) presented.push_back({at, double(waitUs) / 1000.0});
+        prune(at);
+    }
+    void audioBuffered(double ms, Clock::time_point at) { audio.push_back({at, ms}); prune(at); }
+    void reset() { received.clear(); decoded.clear(); presented.clear(); audio.clear(); }
+    void fill(PerfReadout& r, Clock::time_point now) {
+        prune(now);
+        double bytes = 0;
+        for (const auto& s : received) bytes += s.value;
+        r.fps = double(presented.size());
+        r.mbps = bytes * 8 / 1e6;
+        r.decodeMs = mean(decoded); r.waitMs = mean(presented); r.audioMs = mean(audio);
+    }
+};
+
 struct QueuedFrame { FrameInfo info; bool key; Bytes annexB; };
 struct Cursor { unsigned width, height, xhot, yhot; Bytes rgba; };
 struct EndStatus { bool ended{}, clean{}; char message[1024]{}; };
@@ -163,6 +197,7 @@ class Client {
     std::deque<QueuedFrame> videoQ;
     size_t queuedBytes{};
     Stats stats;
+    PerfWindow perf; // Protected by statsLock.
     EndStatus endStatus;
     std::optional<Cursor> cursorIncoming;
     std::optional<std::string> clipboardIncoming;
@@ -177,7 +212,7 @@ class Client {
     Clock::time_point connectedAt{}, prevTitle{};
     HCURSOR customCursor{};
     bool hiddenCursor{}, composing{}, fullscreen{}, captureKeys{}, windowedCapture{}, systemTab{}, localG{};
-    bool audioOn{true}, swapCmdCtrl{}, userDisconnected{}, rctrlArmed{}, mouseTracking{}, overHud{};
+    bool audioOn{true}, swapCmdCtrl{}, userDisconnected{}, rctrlArmed{}, mouseTracking{}, overHud{}, overPerf{}, localO{};
     Clock::time_point rctrlAt{};
     HudAction hudPress{HudAction::None};
     unsigned hudSwallow{}; // Mouse buttons (1 left, 2 right, 4 middle) pressed on the HUD; their releases stay local.
@@ -233,6 +268,10 @@ class Client {
                 width <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION && height <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION,
                 "invalid H.264 frame dimensions or length");
             {
+                std::lock_guard lock(self.statsLock);
+                self.perf.receivedBytes(len, arrival);
+            }
+            {
                 std::lock_guard lock(self.videoLock);
                 require(self.videoQ.size() < 256 && len <= maxQueuedBytes - self.queuedBytes, "video decoder queue stalled");
                 self.videoQ.push_back({{generation, sequence, width, height, arrival}, key, Bytes(data, data + len)});
@@ -260,7 +299,11 @@ class Client {
     }
     static void onAudioPcm(void* ctx, uint64_t, uint32_t sampleRate, uint8_t channels, const int16_t* pcm,
         size_t frames) noexcept {
-        if (const auto& player = static_cast<Client*>(ctx)->audio) player->push(pcm, frames, sampleRate, channels);
+        auto& self = *static_cast<Client*>(ctx);
+        if (!self.audio || !self.audio->push(pcm, frames, sampleRate, channels)) return;
+        const double ms = self.audio->bufferedMs();
+        std::lock_guard lock(self.statsLock);
+        self.perf.audioBuffered(ms, Clock::now());
     }
     static void onDisconnected(void* ctx, const char* error) noexcept {
         static_cast<Client*>(ctx)->report(error ? error : "Remote session closed", error == nullptr);
@@ -464,6 +507,7 @@ class Client {
                         std::lock_guard lock(statsLock);
                         stats.width = f.width; stats.height = f.height; stats.mode = mode;
                         ++stats.decoded; stats.decodeUs += us;
+                        perf.decodedFrame(us, wait, result.presented, now);
                         if (result.presented) {
                             if (!stats.presented) stats.firstPresent = now;
                             ++stats.presented; stats.waitUs += wait;
@@ -534,7 +578,7 @@ class Client {
     }
 
     void applyCursor() {
-        SetCursor(overHud ? LoadCursorW(nullptr, IDC_ARROW) : hiddenCursor ? nullptr :
+        SetCursor(overHud ? LoadCursorW(nullptr, overPerf ? IDC_SIZEALL : IDC_ARROW) : hiddenCursor ? nullptr :
             customCursor ? customCursor : LoadCursorW(nullptr, IDC_ARROW));
     }
 
@@ -585,6 +629,30 @@ class Client {
         hud->setAudio(next);
         toast(next ? hudText().audioOn : hudText().audioOff);
     }
+    // Steps the performance readout through hidden, card and strip; it refreshes twice a second while shown.
+    void cyclePerf() {
+        if (!hud) return;
+        if (hud->cyclePerf() == PerfMode::Hidden) KillTimer(wnd, perfTimer);
+        else { refreshPerf(); SetTimer(wnd, perfTimer, 500, nullptr); }
+        hudTick(true);
+    }
+    void refreshPerf() {
+        if (!hud || disconnected) return;
+        PerfReadout r;
+        Stats s;
+        {
+            std::lock_guard lock(statsLock);
+            s = stats;
+            perf.fill(r, Clock::now());
+        }
+        const std::string_view mode = s.mode;
+        r.width = s.width; r.height = s.height;
+        r.decoder = mode == "HW (DXGI surfaces)" ? L"DXGI" : mode == "HW" ? L"DXVA" : mode == "SW" ? L"SW" : L"";
+        // The core does not report which path a hub session settled on, so only a forced path is shown.
+        r.path = config.hub.empty() ? PerfPath::Direct : config.noDirect ? PerfPath::Relay : PerfPath::Unknown;
+        r.audio = !audio ? PerfAudio::Off : audioOn ? PerfAudio::On : PerfAudio::Muted;
+        hud->setPerf(r);
+    }
     void userDisconnect() {
         if (disconnected || config.smoke) return;
         userDisconnected = true;
@@ -599,7 +667,7 @@ class Client {
             stopping = false;
         }
         { std::lock_guard lock(endLock); endStatus = {}; }
-        { std::lock_guard lock(statsLock); stats = {}; prevStats = {}; }
+        { std::lock_guard lock(statsLock); stats = {}; prevStats = {}; perf.reset(); }
         { std::lock_guard lock(cursorLock); cursorIncoming.reset(); }
         { std::lock_guard lock(clipboardLock); clipboardIncoming.reset(); }
         userDisconnected = false;
@@ -619,6 +687,7 @@ class Client {
         case HudAction::Capture: toggleKeyCapture(); break;
         case HudAction::Swap: toggleSwap(); break;
         case HudAction::Fullscreen: toggleFullscreen(); break;
+        case HudAction::Perf: cyclePerf(); break;
         case HudAction::Disconnect: userDisconnect(); break;
         case HudAction::Reconnect: reconnect(); break;
         case HudAction::Close: PostMessageW(wnd, WM_CLOSE, 0, 0); break;
@@ -634,8 +703,9 @@ class Client {
             mouseTracking = TrackMouseEvent(&track) != FALSE;
         }
         const bool changed = hud->moved(p, Clock::now());
-        const bool over = hud->hit(p) != HudAction::None;
-        if (over != overHud) { overHud = over; if (over) SetCursor(LoadCursorW(nullptr, IDC_ARROW)); else applyCursor(); }
+        const auto action = hud->hit(p);
+        const bool over = action != HudAction::None, perfOver = action == HudAction::PerfPanel || hudPress == HudAction::PerfPanel;
+        if (over != overHud || perfOver != overPerf) { overHud = over; overPerf = perfOver; applyCursor(); }
         if (changed) hudTick(true);
         return over || hudPress != HudAction::None;
     }
@@ -651,6 +721,7 @@ class Client {
             if (bit == 1) {
                 hudPress = action;
                 hud->setPressed(action);
+                if (action == HudAction::PerfPanel) hud->beginPerfDrag(p);
                 SetFocus(wnd); SetCapture(wnd);
                 hudTick(true);
             }
@@ -763,6 +834,12 @@ class Client {
         if (vk == 'G' && ((GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) < 0) || localG)) {
             if (down && !repeat) { localG = true; toggleKeyCapture(); }
             if (!down) localG = false;
+            return;
+        }
+        // Ctrl+Shift+O cycles the performance readout; the O never reaches the host.
+        if (vk == 'O' && ((GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 && GetKeyState(VK_MENU) >= 0) || localO)) {
+            if (down && !repeat) { localO = true; cyclePerf(); }
+            if (!down) localO = false;
             return;
         }
         if (composing || vk == VK_PROCESSKEY) return;
@@ -902,7 +979,7 @@ class Client {
                 const double waitMs = frames ? double(s.waitUs - prevStats.waitUs) / (1000.0 * double(frames)) : 0.0;
                 wchar_t label[16]{}, stat[48]{};
                 if (s.height >= 2160) swprintf_s(label, L"4K"); else swprintf_s(label, L"%up", s.height);
-                swprintf_s(stat, L"%ls %.0f · %.1fms", label, fps, waitMs);
+                swprintf_s(stat, L"%ls\u2003%.0f FPS\u2003%.1fms", label, fps, waitMs);
                 hud->setStat(stat);
             }
             prevStats = s; prevTitle = now;
@@ -978,6 +1055,7 @@ class Client {
             if (w == statusTimer && !disconnected) tick();
             else if (w == hudTimer) hudTick();
             else if (w == escTimer) escHeld();
+            else if (w == perfTimer && !disconnected) { refreshPerf(); repaint(); }
             return 0;
         case WM_SETCURSOR: if (LOWORD(l) == HTCLIENT) { applyCursor(); return TRUE; } break;
         case WM_ERASEBKGND: return TRUE;
@@ -1000,14 +1078,22 @@ class Client {
         }
         case WM_SETFOCUS: applyHook(); return 0;
         case WM_KILLFOCUS:
-            releaseAll(); removeHook(); composing = false; highSurrogate = 0; localG = false;
+            releaseAll(); removeHook(); composing = false; highSurrogate = 0; localG = localO = false;
             KillTimer(wnd, escTimer); rctrlArmed = false;
             return 0;
-        case WM_CAPTURECHANGED: if (buttons) releaseAll(); return 0;
+        case WM_CAPTURECHANGED:
+            if (buttons) releaseAll();
+            if (hud && hudPress == HudAction::PerfPanel && reinterpret_cast<HWND>(l) != wnd) {
+                // Capture taken away mid-drag (e.g. a system dialog): drop the drag.
+                hudPress = HudAction::None; hudSwallow &= ~1u;
+                hud->setPressed(HudAction::None);
+                hudTick(true);
+            }
+            return 0;
         case WM_MOUSELEAVE:
             mouseTracking = false;
             if (hud && hudPress == HudAction::None) {
-                overHud = false;
+                overHud = overPerf = false;
                 hud->left(Clock::now());
                 hudTick(true);
             }

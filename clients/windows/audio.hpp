@@ -92,9 +92,9 @@ public:
         priming = true;
     }
 
-    // Thread-safe. Other sample rates and channel counts are ignored.
-    void push(const int16_t* pcm, size_t frames, uint32_t sampleRate, uint8_t pcmChannels) noexcept {
-        if (!pcm || sampleRate != rate || pcmChannels != channels) return;
+    // Thread-safe. Other sample rates and channel counts are ignored (false).
+    bool push(const int16_t* pcm, size_t frames, uint32_t sampleRate, uint8_t pcmChannels) noexcept {
+        if (!pcm || sampleRate != rate || pcmChannels != channels) return false;
         size_t samples = frames * channels;
         if (samples > ring.size()) {
             pcm += samples - ring.size();
@@ -112,6 +112,13 @@ public:
             tail = tail + 1 == ring.size() ? 0 : tail + 1;
         }
         count += samples;
+        return true;
+    }
+
+    // Milliseconds of audio queued ahead of the speaker.
+    double bufferedMs() noexcept {
+        std::lock_guard guard(lock);
+        return double(count / channels) * 1000.0 / rate;
     }
 };
 }

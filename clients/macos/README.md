@@ -26,7 +26,7 @@ Package layout:
 | Target | Purpose |
 | --- | --- |
 | `CSkylatchCore` | System-library module over the core's C header |
-| `SkylatchLogic` | Pure logic with unit tests: Annex B parsing, key map, input math, CLI parsing |
+| `SkylatchLogic` | Pure logic with unit tests: Annex B parsing, key map, input math, CLI parsing, performance HUD |
 | `skylatch-macos-client` | The AppKit / VideoToolbox / Metal executable |
 
 `swift test` covers `SkylatchLogic` only and does not need the Rust library or a GPU.
@@ -66,9 +66,15 @@ networks. Avoid putting real tokens in scripts or shell history.
 - **Latch strip and HUD pill.** A thin strip at the top edge is cobalt while system keys are captured and
   grey otherwise. Moving the pointer into the top 16 pt (or clicking the strip) expands a pill with the
   device name, live resolution, FPS and latency stats, a monitor switcher (when the host reports several displays),
-  and toggles for system keys, Cmd↔Ctrl and fullscreen, plus a red disconnect button. It collapses 1.8 s
+  and toggles for system keys, Cmd↔Ctrl, fullscreen and stats, plus a red disconnect button. It collapses 1.8 s
   after the pointer leaves, and toggles show a short toast. Clicks and movement over the HUD never reach
   the host.
+- **Performance readout.** **Cmd+Shift+O** (or the HUD's stats button) steps a small translucent readout
+  through a three-row card, a one-line strip and hidden. It shows the last second's frame rate,
+  resolution, decode mode and time, wait from arrival to present, received H.264 bitrate, audio buffer
+  delay or state, and direct or relay when the path was forced (`--direct` / `--no-direct`; the core does
+  not report which path a hub session picked). Drag it anywhere inside the window; it stays inside when the
+  window is resized, and clicks on it never reach the host.
 - **Disconnect card.** When the session ends after the window is open, a card over the last picture gives
   the reason with **Reconnect now** (same window, also Return) and **Close window**.
 - **System keys.** Fullscreen captures them automatically and leaving fullscreen restores the windowed

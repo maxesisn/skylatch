@@ -58,6 +58,7 @@ final class Session: @unchecked Sendable {
     private var client: OpaquePointer?
     private var smoothWheel = SmoothWheelSupport()
     private var stats = SessionStats()
+    private var perf = PerfWindow()
     private var end: SessionEnd?
     private var thread: Thread?
     /// Created before connecting and stopped after the core client is destroyed, so audio
@@ -81,6 +82,14 @@ final class Session: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return stats
+    }
+
+    /// Totals since connect and the averages over the last second.
+    func perfSnapshot() -> (stats: SessionStats, rates: PerfRates) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (stats, perf.rates(at: now))
     }
 
     var endStatus: SessionEnd? {
@@ -207,6 +216,9 @@ final class Session: @unchecked Sendable {
             return
         }
         let bytes = Array(UnsafeBufferPointer(start: data, count: length))
+        stateLock.lock()
+        perf.received(bytes: length, at: arrival)
+        stateLock.unlock()
         queueLock.lock()
         if queue.count >= 256 || length > Self.maxQueuedBytes - queuedBytes {
             queueLock.unlock()
@@ -255,7 +267,12 @@ final class Session: @unchecked Sendable {
         if audio != nil {
             callbacks.on_audio_pcm = { ctx, _, sampleRate, channels, pcm, frames in
                 guard let pcm else { return }
-                Session.session(ctx).audio?.push(pcm, frames: frames, channels: Int(channels), sampleRate: sampleRate)
+                let me = Session.session(ctx)
+                guard let audio = me.audio, audio.push(pcm, frames: frames, channels: Int(channels), sampleRate: sampleRate) else { return }
+                let buffered = audio.bufferedMs
+                me.stateLock.lock()
+                me.perf.audioBuffered(ms: buffered, at: DispatchTime.now().uptimeNanoseconds)
+                me.stateLock.unlock()
             }
         }
         callbacks.on_disconnected = { ctx, error in
@@ -351,6 +368,7 @@ final class Session: @unchecked Sendable {
                 stats.mode = decoder.usesHardware ? "VideoToolbox" : "VideoToolbox-software"
                 stats.decoded += 1
                 stats.decodeUs += result.decodeUs
+                perf.decoded(decodeUs: result.decodeUs, waitUs: wait, presented: presented, at: now)
                 let first = stats.decoded == 1
                 if presented {
                     if stats.presented == 0 { stats.firstPresent = now }

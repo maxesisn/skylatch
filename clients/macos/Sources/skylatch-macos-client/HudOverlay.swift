@@ -5,24 +5,26 @@ import SkylatchLogic
 /// Strings of the in-window viewer UI. Chinese for Chinese UI languages, English otherwise.
 struct HudText {
     let monitor: String  // format with the 1-based display number
-    let capture, swap, fullscreen, disconnect: String
+    let capture, swap, fullscreen, stats, disconnect: String
     let audio, audioMuted, audioOn, audioOff: String
     let captureOn, captureOff, captureNeedsAccess: String
     let fullscreenOn, fullscreenOff, swapOn, swapOff: String
     let lostTitle, reconnectingTitle: String  // format with the device name
     let reconnect, reconnecting, close, userDisconnected: String
+    let perf: PerfHudLabels
 
     static let zh = HudText(
-        monitor: "屏 %d", capture: "系统键", swap: "Cmd↔Ctrl", fullscreen: "全屏", disconnect: "断开",
+        monitor: "屏 %d", capture: "系统键", swap: "Cmd↔Ctrl", fullscreen: "全屏", stats: "数据", disconnect: "断开",
         audio: "音频", audioMuted: "已静音", audioOn: "已开启远端音频", audioOff: "已静音远端音频",
         captureOn: "已捕获系统键，双按右 Ctrl 释放", captureOff: "已释放系统键，双按右 Ctrl 捕获",
         captureNeedsAccess: "捕获系统键需要在“系统设置 › 隐私与安全性 › 辅助功能”中允许本应用",
         fullscreenOn: "全屏已捕获系统键，长按 Esc 退出", fullscreenOff: "已退出全屏",
         swapOn: "Cmd ↔ Ctrl 互换已开启", swapOff: "Cmd ↔ Ctrl 互换已关闭",
         lostTitle: "与 %@ 的连接已中断", reconnectingTitle: "正在重新连接 %@…",
-        reconnect: "立即重连", reconnecting: "重连中…", close: "关闭窗口", userDisconnected: "你已主动断开连接")
+        reconnect: "立即重连", reconnecting: "重连中…", close: "关闭窗口", userDisconnected: "你已主动断开连接",
+        perf: .zh)
     static let en = HudText(
-        monitor: "Screen %d", capture: "System keys", swap: "Cmd↔Ctrl", fullscreen: "Fullscreen", disconnect: "Disconnect",
+        monitor: "Screen %d", capture: "System keys", swap: "Cmd↔Ctrl", fullscreen: "Fullscreen", stats: "Stats", disconnect: "Disconnect",
         audio: "Audio", audioMuted: "Muted", audioOn: "Remote audio on", audioOff: "Remote audio muted",
         captureOn: "System keys captured. Double-tap Right Ctrl to release",
         captureOff: "System keys released. Double-tap Right Ctrl to capture",
@@ -30,7 +32,8 @@ struct HudText {
         fullscreenOn: "Fullscreen with system keys captured. Hold Esc to exit", fullscreenOff: "Exited fullscreen",
         swapOn: "Cmd ↔ Ctrl swap on", swapOff: "Cmd ↔ Ctrl swap off",
         lostTitle: "Connection to %@ was lost", reconnectingTitle: "Reconnecting to %@…",
-        reconnect: "Reconnect now", reconnecting: "Reconnecting…", close: "Close window", userDisconnected: "You disconnected")
+        reconnect: "Reconnect now", reconnecting: "Reconnecting…", close: "Close window", userDisconnected: "You disconnected",
+        perf: .en)
 
     static let current: HudText = {
         let language = Locale.preferredLanguages.first ?? "en"
@@ -43,7 +46,7 @@ struct HudText {
 /// is consumed here; only the rest of the window reaches the video view (and so the remote host).
 final class HudOverlay: NSView {
     enum Action: Int {
-        case none, surface, monitor, audio, capture, swap, fullscreen, disconnect, reconnect, close
+        case none, surface, monitor, audio, capture, swap, fullscreen, perf, disconnect, reconnect, close
     }
 
     enum Card { case none, lost, reconnecting }
@@ -60,7 +63,7 @@ final class HudOverlay: NSView {
         var reconnect = NSRect.zero, close = NSRect.zero
     }
 
-    private static let pillHeight: CGFloat = 40, pillTop: CGFloat = 8, speakerSize: CGFloat = 14
+    private static let pillHeight: CGFloat = 40, pillTop: CGFloat = 8, speakerSize: CGFloat = 14, chartSize: CGFloat = 14
     private static let toastSeconds = 1.2, collapseSeconds = 1.8, expandSeconds = 0.18
     private static let cobalt = NSColor(hex: 0x2563EB)
 
@@ -72,7 +75,7 @@ final class HudOverlay: NSView {
     private var device = "", stat = ""
     private var monitorActive = 0, monitorCount = 0
     private var captureOn = false, swapOn = false, fullscreenOn = false
-    private var audioAvailable = false, audioOn = true
+    private var audioAvailable = false, audioOn = true, perfOn = false
     private var card = Card.none
     private var reason = ""
     private var expandTarget = false, inside = false
@@ -142,6 +145,11 @@ final class HudOverlay: NSView {
         refresh()
     }
 
+    func setPerfOn(_ on: Bool) {
+        perfOn = on
+        refresh()
+    }
+
     func toast(_ message: String) {
         toastText = message
         toastAt = ProcessInfo.processInfo.systemUptime
@@ -199,6 +207,7 @@ final class HudOverlay: NSView {
         case .capture: return text.capture
         case .swap: return text.swap
         case .fullscreen: return text.fullscreen
+        case .perf: return text.stats
         default: return text.disconnect
         }
     }
@@ -221,9 +230,10 @@ final class HudOverlay: NSView {
         var actions: [Action] = []
         if monitorCount > 1 { actions.append(.monitor) }
         if audioAvailable { actions.append(.audio) }
-        actions += [.capture, .swap, .fullscreen, .disconnect]
+        actions += [.capture, .swap, .fullscreen, .perf, .disconnect]
         func buttonWidth(_ a: Action) -> CGFloat {
             if a == .audio { return max(measure(text.audio, Self.buttonFont), measure(text.audioMuted, Self.buttonFont)) + 22 + Self.speakerSize + 4 }
+            if a == .perf { return measure(text.stats, Self.buttonFont) + 22 + Self.chartSize + 4 }
             return measure(buttonLabel(a), Self.buttonFont) + 22
         }
         let buttonsWidth = actions.reduce(CGFloat(0)) { $0 + buttonWidth($1) } + btnGap * CGFloat(actions.count - 1)
@@ -538,6 +548,10 @@ final class HudOverlay: NSView {
                 drawAudioButton(r, hot: hot, down: down, alpha: a)
                 continue
             }
+            if action == .perf {
+                drawPerfButton(r, hot: hot, down: down, alpha: a)
+                continue
+            }
             let on = (action == .capture && captureOn) || (action == .swap && swapOn) || (action == .fullscreen && fullscreenOn)
             if on {
                 let fill = down ? 0x1D4ED8 : hot ? 0x3B73F0 : 0x2563EB
@@ -565,6 +579,35 @@ final class HudOverlay: NSView {
         drawSpeaker(NSRect(x: left, y: r.midY - size / 2, width: size, height: size), muted: !audioOn, color: color)
         draw(label, in: NSRect(x: left + size + 4, y: r.minY, width: labelWidth, height: r.height), font: Self.buttonFont,
              color: color, align: .left)
+    }
+
+    private func drawPerfButton(_ r: NSRect, hot: Bool, down: Bool, alpha a: CGFloat) {
+        rounded(r, 8, fill: NSColor.white.withAlphaComponent(((down ? 0.24 : hot ? 0.16 : 0.07) + (perfOn ? 0.06 : 0)) * a))
+        if perfOn { outline(r, 8, color: NSColor.white.withAlphaComponent(0.22 * a)) }
+        let color = NSColor(hex: 0xF4F2EC).withAlphaComponent(a)
+        let size = Self.chartSize, labelWidth = measure(text.stats, Self.buttonFont), content = size + 4 + labelWidth
+        let left = r.midX - content / 2
+        drawChart(NSRect(x: left, y: r.midY - size / 2, width: size, height: size), color: color)
+        draw(text.stats, in: NSRect(x: left + size + 4, y: r.minY, width: labelWidth, height: r.height), font: Self.buttonFont,
+             color: color, align: .left)
+    }
+
+    /// Line-chart glyph: a baseline and a rising polyline.
+    private func drawChart(_ r: NSRect, color: NSColor) {
+        let x = r.minX, y = r.minY
+        let path = NSBezierPath()
+        path.lineWidth = 1.4
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.move(to: NSPoint(x: x + 0.5, y: y + 1.5))
+        path.line(to: NSPoint(x: x + 0.5, y: y + 13))
+        path.line(to: NSPoint(x: x + 13.5, y: y + 13))
+        path.move(to: NSPoint(x: x + 3, y: y + 10))
+        path.line(to: NSPoint(x: x + 6, y: y + 6))
+        path.line(to: NSPoint(x: x + 8.5, y: y + 8.5))
+        path.line(to: NSPoint(x: x + 13, y: y + 3))
+        color.setStroke()
+        path.stroke()
     }
 
     private func drawSpeaker(_ r: NSRect, muted: Bool, color: NSColor) {
@@ -638,6 +681,157 @@ final class HudOverlay: NSView {
         if hotC { rounded(l.close, 10, fill: NSColor.white.withAlphaComponent(downC ? 0.2 : 0.1)) }
         outline(l.close, 10, color: NSColor.white.withAlphaComponent(0.4))
         draw(text.close, in: l.close, font: Self.cardButtonFont, color: .white)
+    }
+}
+
+/// Small translucent performance readout over the video, as a three-row card or a one-line strip. It can be
+/// dragged anywhere inside the video view; pointer events on it stay local.
+final class PerfHudView: NSView {
+    private static let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    private static let cardWidth: CGFloat = 214, rowHeight: CGFloat = 17, padX: CGFloat = 9, padY: CGFloat = 6
+    private static let stripHeight: CGFloat = 25, dot: CGFloat = 6, dotGap: CGFloat = 6, radius: CGFloat = 7
+    private static let ink = NSColor(white: 0.93, alpha: 0.88)
+
+    private let labels = HudText.current.perf
+    private(set) var mode = PerfHudMode.hidden
+    private var readout = PerfReadout()
+    /// Where the user put the HUD; the frame is this point clamped into the current bounds.
+    private var origin = NSPoint(x: PerfHudPlacement.defaultOrigin.x, y: PerfHudPlacement.defaultOrigin.y)
+    private var drag: PerfHudDrag?
+    private var hovering = false
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    func setMode(_ next: PerfHudMode) {
+        mode = next
+        isHidden = next == .hidden
+        if isHidden { hovering = false; drag = nil }
+        relayout()
+    }
+
+    func update(_ next: PerfReadout) {
+        guard next != readout else { return }
+        readout = next
+        relayout()
+    }
+
+    /// Sizes the HUD for its mode and text, and keeps it inside the superview.
+    func relayout() {
+        guard let superview, mode != .hidden else { return }
+        let size: NSSize
+        if mode == .card {
+            size = NSSize(width: Self.cardWidth, height: Self.padY * 2 + Self.rowHeight * 3)
+        } else {
+            let text = PerfHudFormat.strip(readout, labels: labels) as NSString
+            let width = ceil(text.size(withAttributes: [.font: Self.font]).width)
+            size = NSSize(width: Self.padX * 2 + Self.dot + Self.dotGap + width, height: Self.stripHeight)
+        }
+        let p = PerfHudPlacement.clamp(x: origin.x, y: origin.y, width: size.width, height: size.height,
+                                       boundsWidth: superview.bounds.width, boundsHeight: superview.bounds.height)
+        let next = NSRect(x: p.x.rounded(), y: p.y.rounded(), width: size.width, height: size.height)
+        if next != frame {
+            frame = next
+            window?.invalidateCursorRects(for: self)
+        }
+        needsDisplay = true
+    }
+
+    /// Hover tracking from the video view (`p` in superview coordinates). True when the HUD owns the point.
+    func pointerMoved(to p: NSPoint, blocked: Bool) -> Bool {
+        let over = !isHidden && !blocked && frame.contains(p)
+        if over != hovering {
+            hovering = over
+            needsDisplay = true
+        }
+        return over
+    }
+
+    func pointerLeft() {
+        guard hovering, drag == nil else { return }
+        hovering = false
+        needsDisplay = true
+    }
+
+    private func pointer(_ event: NSEvent) -> NSPoint { superview?.convert(event.locationInWindow, from: nil) ?? .zero }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = pointer(event)
+        drag = PerfHudDrag(pointerX: p.x, pointerY: p.y, originX: frame.minX, originY: frame.minY)
+        hovering = true
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let drag, let superview else { return }
+        let p = pointer(event)
+        let next = drag.origin(pointerX: p.x, pointerY: p.y, width: frame.width, height: frame.height,
+                               boundsWidth: superview.bounds.width, boundsHeight: superview.bounds.height)
+        origin = NSPoint(x: next.x, y: next.y)
+        relayout()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        drag = nil
+        hovering = frame.contains(pointer(event))
+        needsDisplay = true
+    }
+
+    override func rightMouseDown(with event: NSEvent) {}
+    override func rightMouseUp(with event: NSEvent) {}
+    override func rightMouseDragged(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
+    override func otherMouseUp(with event: NSEvent) {}
+    override func otherMouseDragged(with event: NSEvent) {}
+    override func scrollWheel(with event: NSEvent) {}
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let alpha: CGFloat = hovering || drag != nil ? 0.74 : 0.56
+        NSColor(white: 0.07, alpha: alpha).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: Self.radius, yRadius: Self.radius).fill()
+        let edge = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: Self.radius - 0.5,
+                                yRadius: Self.radius - 0.5)
+        edge.lineWidth = 1
+        NSColor(white: 1, alpha: 0.11).setStroke()
+        edge.stroke()
+
+        let rowHeight = mode == .card ? Self.rowHeight : bounds.height
+        let top = mode == .card ? Self.padY : 0
+        let dotColor = readout.isSlow ? NSColor(hex: 0xF2C14E) : NSColor(hex: 0x6BCB8B)
+        dotColor.withAlphaComponent(0.9).setFill()
+        NSBezierPath(ovalIn: NSRect(x: Self.padX, y: top + (rowHeight - Self.dot) / 2, width: Self.dot, height: Self.dot)).fill()
+        let textLeft = Self.padX + Self.dot + Self.dotGap
+        if mode == .strip {
+            drawText(PerfHudFormat.strip(readout, labels: labels), x: textLeft, rowTop: 0, rowHeight: rowHeight)
+            return
+        }
+        for (i, row) in PerfHudFormat.card(readout, labels: labels).enumerated() {
+            let y = top + CGFloat(i) * rowHeight
+            drawText(row.left, x: textLeft, rowTop: y, rowHeight: rowHeight)
+            drawText(row.right, x: bounds.width - Self.padX, rowTop: y, rowHeight: rowHeight, trailing: true)
+        }
+    }
+
+    private func drawText(_ s: String, x: CGFloat, rowTop: CGFloat, rowHeight: CGFloat, trailing: Bool = false) {
+        guard !s.isEmpty else { return }
+        let attributes: [NSAttributedString.Key: Any] = [.font: Self.font, .foregroundColor: Self.ink]
+        let text = s as NSString
+        let width = trailing ? ceil(text.size(withAttributes: attributes).width) : 0
+        let lineHeight = ceil(Self.font.ascender - Self.font.descender)
+        text.draw(at: NSPoint(x: x - width, y: rowTop + (rowHeight - lineHeight) / 2), withAttributes: attributes)
     }
 }
 

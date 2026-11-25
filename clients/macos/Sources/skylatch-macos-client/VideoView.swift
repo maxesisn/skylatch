@@ -20,12 +20,16 @@ final class VideoView: NSView, NSTextInputClient {
     var inputEnabled = true
     /// In-window HUD over the video; pointer events it owns are never forwarded to the host.
     var hud: HudOverlay?
+    /// Draggable performance readout; the pointer over it stays local too.
+    var perfHud: PerfHudView?
     /// Cross-OS swap: local Cmd drives the remote Ctrl and local Ctrl drives the remote GUI key.
     var swapCmdCtrl = false
     /// Called when Right Ctrl is double-tapped (toggle system key capture).
     var onToggleCapture: (() -> Void)?
     /// Called when Esc has been held long enough in fullscreen (leave fullscreen).
     var onEscapeHold: (() -> Void)?
+    /// Called on Cmd+Shift+O (step the performance HUD through hidden, card and strip).
+    var onTogglePerf: (() -> Void)?
     /// How long Esc must stay down in fullscreen before it leaves fullscreen.
     static let escapeHoldSeconds = 1.2
 
@@ -86,6 +90,7 @@ final class VideoView: NSView, NSTextInputClient {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         updateDrawableSize()
+        perfHud?.relayout()
     }
 
     override func updateTrackingAreas() {
@@ -182,14 +187,22 @@ final class VideoView: NSView, NSTextInputClient {
     }
 
     private func pointerMoved(_ event: NSEvent) {
-        // The HUD owns the top strip, the pill and the disconnect card; a drag in progress is never hijacked.
-        if buttons == 0, let hud, hud.pointerMoved(to: convert(event.locationInWindow, from: nil)) { return }
+        // The HUD owns the top strip, the pill, the disconnect card and the performance readout; a drag in
+        // progress is never hijacked.
+        if buttons == 0 {
+            let p = convert(event.locationInWindow, from: nil)
+            let overHud = hud?.pointerMoved(to: p) == true
+            if perfHud?.pointerMoved(to: p, blocked: overHud) == true || overHud { return }
+        }
         updatePosition(event)
         if ready { send(InputType.pointerMove) }
     }
 
     override func mouseMoved(with event: NSEvent) { pointerMoved(event) }
-    override func mouseExited(with event: NSEvent) { hud?.pointerLeft() }
+    override func mouseExited(with event: NSEvent) {
+        hud?.pointerLeft()
+        perfHud?.pointerLeft()
+    }
     override func mouseDragged(with event: NSEvent) { pointerMoved(event) }
     override func rightMouseDragged(with event: NSEvent) { pointerMoved(event) }
     override func otherMouseDragged(with event: NSEvent) { pointerMoved(event) }
@@ -248,6 +261,10 @@ final class VideoView: NSView, NSTextInputClient {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
         if flags == [.command, .control] && event.keyCode == UInt16(kVK_ANSI_F) {
             if !event.isARepeat { window?.toggleFullScreen(nil) }
+            return true
+        }
+        if flags == [.command, .shift] && event.keyCode == UInt16(kVK_ANSI_O) {
+            if !event.isARepeat { onTogglePerf?() }
             return true
         }
         // Cmd+Q stays local so the viewer can always be quit. Every other Command shortcut goes to the host.
@@ -335,9 +352,10 @@ final class VideoView: NSView, NSTextInputClient {
         }
         let f = flags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
         guard f.contains(.command) || f.contains(.control) else { return false }
-        // The same two shortcuts that stay local without capture: quit, and fullscreen.
+        // The shortcuts that stay local without capture: quit, fullscreen and the performance HUD.
         if f == .command && keyCode == UInt16(kVK_ANSI_Q) { return false }
         if f == [.command, .control] && keyCode == UInt16(kVK_ANSI_F) { return false }
+        if f == [.command, .shift] && keyCode == UInt16(kVK_ANSI_O) { return false }
         capturedKeys.insert(keyCode)
         rightCtrlTap.cancel()
         remoteKey(hid, down: true)
