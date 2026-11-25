@@ -180,6 +180,45 @@ static void preferenceParsing() {
   require(!relay::parseEncoderPreference("x264") && !relay::parseEncoderPreference(""), "unknown names are rejected");
 }
 
+static std::vector<uint8_t> fromHex(const std::string& hex) {
+  std::vector<uint8_t> bytes;
+  for (size_t i = 0; i < hex.size(); i += 2) bytes.push_back(uint8_t(std::stoi(hex.substr(i, 2), nullptr, 16)));
+  return bytes;
+}
+
+static std::vector<uint8_t> spsOf(const std::vector<uint8_t>& annex_b) {
+  for (size_t i = 0; i + 3 < annex_b.size(); ++i) {
+    if (annex_b[i] != 0 || annex_b[i + 1] != 0 || annex_b[i + 2] != 1 || (annex_b[i + 3] & 31u) != 7) continue;
+    size_t end = i + 3;
+    while (end + 2 < annex_b.size() && !(annex_b[end] == 0 && annex_b[end + 1] == 0 && annex_b[end + 2] <= 1)) ++end;
+    if (end + 2 >= annex_b.size()) end = annex_b.size();
+    return {annex_b.begin() + std::ptrdiff_t(i + 3), annex_b.begin() + std::ptrdiff_t(end)};
+  }
+  return {};
+}
+
+static void zeroReorderPatch() {
+  for (const char* hex : {"27640034ac56803c0043e9a808080810", "27420033ab401e0021f2"}) {
+    const auto original = fromHex(hex);
+    require(!relay::readH264SpsRestriction(original), std::string(hex) + " starts without bitstream_restriction");
+    const auto patched = relay::patchH264SpsZeroReorder(original);
+    const auto restriction = relay::readH264SpsRestriction(patched);
+    require(restriction && restriction->max_num_reorder_frames == 0 && restriction->max_dec_frame_buffering >= 1,
+            std::string(hex) + " must declare zero reordering");
+    require(relay::patchH264SpsZeroReorder(patched) == patched, std::string(hex) + " patching must be idempotent");
+    std::vector<uint8_t> stream = {0, 0, 0, 1};
+    stream.insert(stream.end(), original.begin(), original.end());
+    stream.insert(stream.end(), {0, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88});
+    relay::ensureAnnexBZeroReorder(stream);
+    require(spsOf(stream) == patched, std::string(hex) + " Annex-B SPS must be patched in place");
+    require(stream.size() == 4 + patched.size() + 11, "the other NAL units must survive the Annex-B patch");
+  }
+  const auto truncated = fromHex("27640034ac56");
+  require(relay::patchH264SpsZeroReorder(truncated) == truncated, "a truncated SPS stays as is");
+  const std::vector<uint8_t> not_sps = {0x68, 1, 2, 3, 4, 5};
+  require(relay::patchH264SpsZeroReorder(not_sps) == not_sps, "a PPS stays as is");
+}
+
 static void parameterSetRepetition() {
   std::vector<uint8_t> cache;
   bool keyframe = false;
@@ -321,6 +360,8 @@ static double hardwareSequence(relay::VideoEncoder& encoder) {
     if (force) {
       require(keyframe, what + " must be a keyframe");
       requireIdr(out, what);
+      const auto restriction = relay::readH264SpsRestriction(spsOf(out));
+      require(restriction && restriction->max_num_reorder_frames == 0, what + ": SPS must declare zero reordering");
     } else {
       require(!keyframe, what + " must be a delta frame");
       requireDelta(out, what);
@@ -421,6 +462,7 @@ static void captureReportsEncoder() {
 int main() {
   try {
     preferenceParsing();
+    zeroReorderPatch();
     parameterSetRepetition();
     selection();
     x264Regression();

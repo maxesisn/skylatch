@@ -69,7 +69,9 @@ bool appendAnnexB(CMSampleBufferRef sample, Output& output) {
         return false;
       }
       out.insert(out.end(), std::begin(start_code), std::end(start_code));
-      out.insert(out.end(), set, set + size);
+      const std::vector<uint8_t> nal(set, set + size);
+      const auto patched = patchH264SpsZeroReorder(nal);
+      out.insert(out.end(), patched.begin(), patched.end());
     }
   }
   CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
