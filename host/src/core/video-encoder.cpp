@@ -404,6 +404,19 @@ std::unique_ptr<VideoEncoder> makeHardwareVideoEncoder() {
 #endif
 }
 
+#ifndef RELAY_BACKEND_macos
+Nv12Picture::Nv12Picture(int width, int height) {
+  const int stride = (width + 63) & ~63;
+  memory_.resize(size_t(stride) * size_t(height) * 3 / 2);
+  planes[0] = memory_.data();
+  planes[1] = memory_.data() + size_t(stride) * size_t(height);
+  strides[0] = strides[1] = stride;
+}
+Nv12Picture::~Nv12Picture() = default;
+void Nv12Picture::lock(bool) {}
+void Nv12Picture::unlock(bool) {}
+#endif
+
 SelectingVideoEncoder::SelectingVideoEncoder(EncoderPreference preference, VideoEncoderFactory hardware,
                                              VideoEncoderFactory software)
     : preference_(preference), hardware_factory_(std::move(hardware)), software_factory_(std::move(software)) {}

@@ -61,18 +61,32 @@ struct StartResult {
   NSError* error = nil;
 };
 
-class PixelLock {
+/// A screen image retained from ScreenCaptureKit's pool and locked for CPU reads until it is replaced.
+class HeldImage {
  public:
-  explicit PixelLock(CVPixelBufferRef value) : buffer(value) {
-    if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
-      throw std::runtime_error("Locking the screen capture image failed");
+  HeldImage() = default;
+  HeldImage(const HeldImage&) = delete;
+  HeldImage& operator=(const HeldImage&) = delete;
+  ~HeldImage() { reset(nullptr); }
+  void reset(CVPixelBufferRef next) {
+    if (next) {
+      CVPixelBufferRetain(next);
+      if (CVPixelBufferLockBaseAddress(next, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess ||
+          !CVPixelBufferGetBaseAddress(next)) {
+        CVPixelBufferRelease(next);
+        throw std::runtime_error("Locking the screen capture image failed");
+      }
+    }
+    if (buffer) {
+      CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+      CVPixelBufferRelease(buffer);
+    }
+    buffer = next;
   }
-  ~PixelLock() { unlock(); }
-  void unlock() {
-    if (buffer) { CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly); buffer = nullptr; }
-  }
+  const uint8_t* data() const { return static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(buffer)); }
+  int stride() const { return int(CVPixelBufferGetBytesPerRow(buffer)); }
  private:
-  CVPixelBufferRef buffer;
+  CVPixelBufferRef buffer = nullptr;
 };
 
 class MacCapture;
@@ -108,17 +122,16 @@ struct CursorTracker {
 
 /// Holds the latest screen image, capture failure, and subscribed sources.
 struct CaptureState {
-  explicit CaptureState(Display selected) : display(selected) {
-    requireSurfaceSize(display.width, display.height);
-    image.resize(size_t(display.width) * display.height * 4);
-  }
-  /// The display the image buffer matches; it changes only when the first frame of a resized stream arrives.
+  explicit CaptureState(Display selected) : display(selected) { requireSurfaceSize(display.width, display.height); }
+  ~CaptureState() { if (image) CVPixelBufferRelease(image); }
+  /// The display the image matches; it changes only when the first frame of a resized stream arrives.
   Display display;
   /// The display a restarted stream is being started for, until its first frame arrives.
   std::optional<Display> next;
   std::mutex mutex;
   std::condition_variable arrived;
-  std::vector<uint8_t> image;
+  /// The newest complete screen image, retained from ScreenCaptureKit's pool; null before the first frame.
+  CVPixelBufferRef image = nullptr;
   std::vector<MacCapture*> sources;
   CursorTracker cursor;
   bool haveFrame = false;
@@ -215,7 +228,9 @@ class SharedCapture : public std::enable_shared_from_this<SharedCapture> {
       config.colorSpaceName = kCGColorSpaceSRGB;
       // The pointer is streamed separately as its own shape (see cursor.hpp), so it must not be baked into frames.
       config.showsCursor = NO;
-      config.queueDepth = 3;
+      // Sources read the pool's images in place: the newest image, one held by each source (stream and screenshot)
+      // and the ones ScreenCaptureKit renders into must all fit.
+      config.queueDepth = 5;
       config.minimumFrameInterval = kCMTimeZero;
       output = [[RelayCaptureOutput alloc] init];
       output->state = state;
@@ -309,7 +324,6 @@ class MacCapture final : public CaptureSource {
     }
     width = state->display.width;
     height = state->display.height;
-    front.resize(size_t(width) * height * 4);
   }
   ~MacCapture() override {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -343,20 +357,16 @@ class MacCapture final : public CaptureSource {
       // The display was resized: damage from before it is meaningless, so return the whole new image.
       width = state->display.width;
       height = state->display.height;
-      front.assign(size_t(width) * height * 4, 0);
       wholeFrame = true;
     }
+    if (!state->image) throw std::runtime_error("No screen capture image yet");
+    image.reset(state->image);
     {
       std::lock_guard<std::mutex> own(mutex);
       lastFull = wholeFrame;
       last = lastFull ? std::vector<DamageRect>{} : rects;
     }
-    if (lastFull) std::memcpy(front.data(), state->image.data(), front.size());
-    else for (const auto& rect : rects)
-      for (int y = rect.y; y < rect.y + rect.height; ++y)
-        std::memcpy(front.data() + (size_t(y) * width + rect.x) * 4,
-                    state->image.data() + (size_t(y) * width + rect.x) * 4, size_t(rect.width) * 4);
-    return {front.data(), width * 4, width, height, PixelFormat::BGRA};
+    return {image.data(), image.stride(), width, height, PixelFormat::BGRA};
   }
   bool cursorSupported() const override { return true; }
   /// The pointer shape when it changed since the last call or force is set; the shape is read from the polled
@@ -387,7 +397,8 @@ class MacCapture final : public CaptureSource {
   uint64_t seenCursor = 0;
   Wake ready;
   std::mutex mutex;
-  std::vector<uint8_t> front;
+  /// The image the last view points into.
+  HeldImage image;
   std::vector<DamageRect> pending, last;
   bool pendingFull = true, lastFull = true;
 };
@@ -458,13 +469,12 @@ void CaptureState::frame(CMSampleBufferRef sample) {
   CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
   if (!buffer || CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_32BGRA)
     throw std::runtime_error("Screen capture returned an invalid image");
-  std::unique_lock<std::mutex> lock(mutex);
+  std::lock_guard<std::mutex> lock(mutex);
   if (!failure.empty()) return;
   if (next && CVPixelBufferGetWidth(buffer) == size_t(next->width) && CVPixelBufferGetHeight(buffer) == size_t(next->height)) {
-    // First frame of a restarted stream: the image buffer and the published size switch together.
+    // First frame of a restarted stream: the image and the published size switch together.
     display = *next;
     next.reset();
-    image.assign(size_t(display.width) * display.height * 4, 0);
     haveFrame = false;
   }
   if (CVPixelBufferGetWidth(buffer) != size_t(display.width) || CVPixelBufferGetHeight(buffer) != size_t(display.height)) {
@@ -473,25 +483,15 @@ void CaptureState::frame(CMSampleBufferRef sample) {
     return;
   }
   mismatched = 0;
-  lock.unlock();
+  if (CVPixelBufferGetBytesPerRow(buffer) < size_t(display.width) * 4)
+    throw std::runtime_error("Screen capture returned an invalid image stride");
   std::vector<DamageRect> rects;
-  bool full = !dirtyRects(info[SCStreamFrameInfoDirtyRects], display.width, display.height, rects);
+  bool full = !haveFrame || !dirtyRects(info[SCStreamFrameInfoDirtyRects], display.width, display.height, rects);
   for (const auto& rect : rects)
     if (rect.x == 0 && rect.y == 0 && rect.width == display.width && rect.height == display.height) full = true;
-  PixelLock pixelsLock(buffer);
-  const auto* pixels = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(buffer));
-  const size_t stride = CVPixelBufferGetBytesPerRow(buffer);
-  if (!pixels || stride < size_t(display.width) * 4)
-    throw std::runtime_error("Screen capture returned an invalid image stride");
-  lock.lock();
-  if (!failure.empty()) return;
-  full = full || !haveFrame;
-  if (full) rects = {{0, 0, display.width, display.height}};
-  for (const auto& rect : rects)
-    for (int y = rect.y; y < rect.y + rect.height; ++y)
-      std::memcpy(image.data() + (size_t(y) * display.width + rect.x) * 4,
-                  pixels + size_t(y) * stride + size_t(rect.x) * 4, size_t(rect.width) * 4);
-  pixelsLock.unlock();
+  CVPixelBufferRetain(buffer);
+  if (image) CVPixelBufferRelease(image);
+  image = buffer;
   haveFrame = true;
   arrived.notify_all();
   for (auto* source : sources) source->damaged(rects, full);

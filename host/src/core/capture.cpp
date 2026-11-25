@@ -22,10 +22,16 @@
 #include <thread>
 #include <utility>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
 namespace relay {
 namespace {
 /// Changed macroblocks above which damage conversion is split across worker threads.
 constexpr int parallel_convert_macroblocks = 512;
+/// Macroblock rows a conversion thread takes at a time.
+constexpr int convert_rows_per_take = 2;
 using Clock = std::chrono::steady_clock;
 
 uint64_t ns(Clock::duration d) {
@@ -44,18 +50,24 @@ void require(bool ok, const char* message) {
 void require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);
 }
+/// Frames are latency-critical: on macOS this keeps the capture and conversion threads on performance cores at full
+/// clock, which a thread that mostly waits for the hardware encoder does not get otherwise.
+void preferPerformanceCores() {
+#ifdef __APPLE__
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
 /// Runs one job on every thread at once, the caller included, and returns when all of them finish.
 class Workers {
  public:
   explicit Workers(int count) {
-    for (int i = 1; i < count; ++i) threads.emplace_back([this] { loop(); });
+    for (int i = 1; i < count; ++i) threads.emplace_back([this] { preferPerformanceCores(); loop(); });
   }
   ~Workers() {
     { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
     wake.notify_all();
     for (auto& thread : threads) thread.join();
   }
-  int size() const { return int(threads.size()) + 1; }
   void run(const std::function<void(int)>& job) {
     { std::lock_guard<std::mutex> lock(mutex); task = &job; next = 1; pending = int(threads.size()); ++round; }
     wake.notify_all();
@@ -93,17 +105,14 @@ struct Resources {
   int width, height;
   CaptureSettings settings;
   SelectingVideoEncoder encoder;
-  /// The NV12 picture the encoder reads; damage conversion updates it in place.
-  int stride;
-  std::vector<uint8_t> picture;
-  uint8_t* planes[2];
+  /// The picture the encoder reads; damage conversion updates it in place.
+  Nv12Picture picture;
   std::vector<uint8_t> mb_info;
   int threads;
   std::vector<std::vector<uint8_t>> scratch;
   Workers workers;
   Resources(PixelFormat f, int w, int h, CaptureSettings s, EncoderPreference preference)
-      : format(f), width(w), height(h), settings(s), encoder(preference), stride((w + 63) & ~63),
-        picture(size_t(stride) * size_t(h) * 3 / 2), planes{picture.data(), picture.data() + size_t(stride) * size_t(h)},
+      : format(f), width(w), height(h), settings(s), encoder(preference), picture(w, h),
         mb_info(size_t((w + 15) / 16) * size_t((h + 15) / 16)),
         threads(encoderThreads(h)),
         scratch(size_t(threads), std::vector<uint8_t>(size_t(w) * 24)), workers(threads) {}
@@ -112,11 +121,13 @@ struct Resources {
     require(encoder.configure(width, height, settings.fps, settings.start_bitrate, settings.start_bitrate, error), error);
   }
   void init() { openEncoder(); }
+  /// The picture as encoder input; call it inside an Nv12Picture::Access.
   EncodedInputFrame input() const {
     EncodedInputFrame frame;
     frame.width = width; frame.height = height;
-    frame.planes[0] = planes[0]; frame.planes[1] = planes[1];
-    frame.strides[0] = frame.strides[1] = stride;
+    frame.planes[0] = picture.planes[0]; frame.planes[1] = picture.planes[1];
+    frame.strides[0] = picture.strides[0]; frame.strides[1] = picture.strides[1];
+    frame.native = picture.native();
     return frame;
   }
   bool convertDamage(const FrameView& view, const std::vector<DamageRect>& rects) {
@@ -133,16 +144,18 @@ struct Resources {
         for (int column = int(x0) / 16; column <= (x1 - 1) / 16; ++column)
           if (mb_info[row * columns + column]) { mb_info[row * columns + column] = 0; ++damaged; }
     }
-    const int first = view.y / 16, rows = (view.y + view.height - 1) / 16 - first + 1;
+    const int first = view.y / 16, end = (view.y + view.height - 1) / 16 + 1;
     std::atomic<bool> changed{false}, failed{false};
-    const int parts = damaged >= parallel_convert_macroblocks ? workers.size() : 1;
+    // Threads take macroblock rows as they finish, so slower efficiency cores do not hold the frame back.
+    std::atomic<int> next{first};
     const std::function<void(int)> job = [&](int part) {
       bool different = false;
-      if (!convertRows(view, first + rows * part / parts, first + rows * (part + 1) / parts, scratch[part], different))
-        failed = true;
+      for (int row; (row = next.fetch_add(convert_rows_per_take)) < end;)
+        if (!convertRows(view, row, std::min(row + convert_rows_per_take, end), scratch[part], different))
+          failed = true;
       if (different) changed = true;
     };
-    if (parts > 1) workers.run(job); else job(0);
+    if (damaged >= parallel_convert_macroblocks) workers.run(job); else job(0);
     require(!failed, "RGB conversion failed");
     return changed;
   }
@@ -166,7 +179,8 @@ struct Resources {
           bool different = false;
           for (int plane = 0; plane < 2; ++plane) {
             const int lines = plane ? (y1 - y0) / 2 : y1 - y0;
-            uint8_t* target = planes[plane] + (plane ? y0 / 2 : y0) * stride + left;
+            const int stride = picture.strides[plane];
+            uint8_t* target = picture.planes[plane] + (plane ? y0 / 2 : y0) * stride + left;
             const uint8_t* source = buffer.data() + (plane ? width * 16 : 0) + left - x0;
             for (int line = 0; line < lines; ++line) {
               if (std::memcmp(target, source, right - left) != 0) {
@@ -212,6 +226,7 @@ struct CaptureEncoder::Impl {
   CaptureStats counters;
   void wake() { wake_event.signal(); }
   void run() {
+    preferPerformanceCores();
     try {
       auto source = source_factory();
       require(bool(source), "capture source factory returned null");
@@ -381,14 +396,18 @@ struct CaptureEncoder::Impl {
                       !(force_idr && (view.width != width || view.height != height)) &&
                       view.format == r->format, "invalid capture frame");
               bool changed = true;
-              if (force_idr) {
-                const auto convert = view.format == PixelFormat::BGRA ? bgraToNv12 : argbToNv12;
-                require(convert(view.data, view.stride, r->planes[0], r->stride, r->planes[1], r->stride,
-                                view.width, view.height),
-                        "RGB conversion failed");
-              } else {
-                if (!source->changedRects(rects)) rects = {{view.x, view.y, view.width, view.height}};
-                changed = r->convertDamage(view, rects);
+              {
+                const Nv12Picture::Access writing(r->picture, true);
+                auto& picture = r->picture;
+                if (force_idr) {
+                  const auto convert = view.format == PixelFormat::BGRA ? bgraToNv12 : argbToNv12;
+                  require(convert(view.data, view.stride, picture.planes[0], picture.strides[0], picture.planes[1],
+                                  picture.strides[1], view.width, view.height),
+                          "RGB conversion failed");
+                } else {
+                  if (!source->changedRects(rects)) rects = {{view.x, view.y, view.width, view.height}};
+                  changed = r->convertDamage(view, rects);
+                }
               }
               converted = Clock::now();
               if (!changed) {
@@ -408,14 +427,18 @@ struct CaptureEncoder::Impl {
             }
             const int64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(capture_start.time_since_epoch()).count();
             last_pts = std::max(last_pts + 1, timestamp);
-            EncodedInputFrame input = r->input();
-            input.pts_us = last_pts;
-            input.burst = refinement || force_idr;
-            if (!refinement && !force_idr) input.unchanged_macroblocks = r->mb_info.data();
-            r->encoder.reconfigureBitrate(rate, rate);
             EncodedFrame output;
             std::string encode_error;
-            const bool encoded_ok = r->encoder.encode(input, force_idr, output.annex_b, output.keyframe, encode_error);
+            bool encoded_ok;
+            {
+              const Nv12Picture::Access reading(r->picture, false);
+              EncodedInputFrame input = r->input();
+              input.pts_us = last_pts;
+              input.burst = refinement || force_idr;
+              if (!refinement && !force_idr) input.unchanged_macroblocks = r->mb_info.data();
+              r->encoder.reconfigureBitrate(rate, rate);
+              encoded_ok = r->encoder.encode(input, force_idr, output.annex_b, output.keyframe, encode_error);
+            }
             if (r->encoder.hardwareFailed()) encoder_preference = EncoderPreference::software;
             publish_encoder(*r);
             require(encoded_ok, encode_error);

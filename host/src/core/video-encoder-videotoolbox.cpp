@@ -7,6 +7,8 @@
 #include <VideoToolbox/VideoToolbox.h>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
+#include <string>
 
 namespace relay {
 namespace {
@@ -114,7 +116,78 @@ void onEncoded(void*, void* frame_context, OSStatus status, VTEncodeInfoFlags fl
   if ((flags & kVTEncodeInfo_FrameDropped) || !sample) { output.dropped = true; return; }
   output.produced = appendAnnexB(sample, output);
 }
+
+/// The frame's own CVPixelBuffer when the session can encode it as it is.
+CVPixelBufferRef inPlace(const EncodedInputFrame& frame) {
+  auto pixels = static_cast<CVPixelBufferRef>(const_cast<void*>(frame.native));
+  if (!pixels || frame.format != RawPixelFormat::NV12 || !CVPixelBufferGetIOSurface(pixels) ||
+      CVPixelBufferGetPixelFormatType(pixels) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+      CVPixelBufferGetWidth(pixels) != size_t(frame.width) || CVPixelBufferGetHeight(pixels) != size_t(frame.height))
+    return nullptr;
+  return pixels;
+}
+
+/// A pixel buffer from the session's pool holding a copy of the frame's planes, or null with `error` set.
+CVPixelBufferRef copyIntoPool(VTCompressionSessionRef session, const EncodedInputFrame& frame, std::string& error) {
+  CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(session);
+  CVPixelBufferRef pixels = nullptr;
+  if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixels) != kCVReturnSuccess || !pixels) {
+    error = "VideoToolbox: no pixel buffer from the session pool";
+    return nullptr;
+  }
+  if (CVPixelBufferLockBaseAddress(pixels, 0) != kCVReturnSuccess) {
+    CVPixelBufferRelease(pixels);
+    error = "VideoToolbox: locking the pixel buffer failed";
+    return nullptr;
+  }
+  auto* luma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 0));
+  auto* chroma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 1));
+  const size_t luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0);
+  const size_t chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1);
+  for (int row = 0; row < frame.height; ++row)
+    std::memcpy(luma + row * luma_stride, frame.planes[0] + row * frame.strides[0], size_t(frame.width));
+  for (int row = 0; row < frame.height / 2; ++row) {
+    uint8_t* target = chroma + row * chroma_stride;
+    if (frame.format == RawPixelFormat::NV12) {
+      std::memcpy(target, frame.planes[1] + row * frame.strides[1], size_t(frame.width));
+      continue;
+    }
+    const uint8_t* u = frame.planes[1] + row * frame.strides[1];
+    const uint8_t* v = frame.planes[2] + row * frame.strides[2];
+    for (int column = 0; column < frame.width / 2; ++column) {
+      target[2 * column] = u[column];
+      target[2 * column + 1] = v[column];
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(pixels, 0);
+  return pixels;
+}
 }  // namespace
+
+Nv12Picture::Nv12Picture(int width, int height) {
+  Cf surface(dictionary(nullptr, nullptr, 0));
+  const void* keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
+  const void* values[] = {surface.get()};
+  Cf attributes(dictionary(keys, values, 1));
+  CVPixelBufferRef pixels = nullptr;
+  if (CVPixelBufferCreate(nullptr, size_t(width), size_t(height), kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                          static_cast<CFDictionaryRef>(attributes.get()), &pixels) != kCVReturnSuccess || !pixels)
+    throw std::runtime_error("allocating a " + std::to_string(width) + "x" + std::to_string(height) + " NV12 picture failed");
+  native_ = pixels;
+}
+Nv12Picture::~Nv12Picture() { CVPixelBufferRelease(static_cast<CVPixelBufferRef>(native_)); }
+void Nv12Picture::lock(bool write) {
+  auto pixels = static_cast<CVPixelBufferRef>(native_);
+  if (CVPixelBufferLockBaseAddress(pixels, write ? 0 : kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+    throw std::runtime_error("locking the NV12 picture failed");
+  for (size_t plane = 0; plane < 2; ++plane) {
+    planes[plane] = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, plane));
+    strides[plane] = int(CVPixelBufferGetBytesPerRowOfPlane(pixels, plane));
+  }
+}
+void Nv12Picture::unlock(bool write) {
+  CVPixelBufferUnlockBaseAddress(static_cast<CVPixelBufferRef>(native_), write ? 0 : kCVPixelBufferLock_ReadOnly);
+}
 
 struct VideoToolboxVideoEncoder::State {
   VTCompressionSessionRef session = nullptr;
@@ -172,7 +245,10 @@ bool VideoToolboxVideoEncoder::configure(int width, int height, unsigned fps, ui
   Cf expected_fps(number(int64_t(fps)));
   Cf keyframe_interval(number(int64_t(std::numeric_limits<int32_t>::max())));
   const struct { CFStringRef key; CFTypeRef value; const char* name; } properties[] = {
-      {kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime"},
+      // In real-time mode VideoToolbox slows the encoder down after a few seconds of streaming (on an M4 a 4K frame
+      // goes from about 18 ms to 26-36 ms). Each frame is still encoded on its own and without reordering, so
+      // leaving it off adds no delay.
+      {kVTCompressionPropertyKey_RealTime, kCFBooleanFalse, "RealTime"},
       {kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "AllowFrameReordering"},
       {kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel, "ProfileLevel"},
       {kVTCompressionPropertyKey_ExpectedFrameRate, expected_fps.get(), "ExpectedFrameRate"},
@@ -214,37 +290,10 @@ bool VideoToolboxVideoEncoder::encode(const EncodedInputFrame& frame, bool force
   }
   if ((s.bitrate != s.applied_bitrate || s.max_bitrate != s.applied_max_bitrate))
     if (const OSStatus status = s.applyBitrate()) { error = failure("changing the bitrate", status); return false; }
-  CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(s.session);
-  CVPixelBufferRef pixels = nullptr;
-  if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixels) != kCVReturnSuccess || !pixels) {
-    error = "VideoToolbox: no pixel buffer from the session pool";
-    return false;
-  }
+  CVPixelBufferRef pixels = inPlace(frame);
+  if (pixels) CVPixelBufferRetain(pixels);
+  else if (!(pixels = copyIntoPool(s.session, frame, error))) return false;
   Cf pixel_owner(pixels);
-  if (CVPixelBufferLockBaseAddress(pixels, 0) != kCVReturnSuccess) {
-    error = "VideoToolbox: locking the pixel buffer failed";
-    return false;
-  }
-  auto* luma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 0));
-  auto* chroma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 1));
-  const size_t luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0);
-  const size_t chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1);
-  for (int row = 0; row < frame.height; ++row)
-    std::memcpy(luma + row * luma_stride, frame.planes[0] + row * frame.strides[0], size_t(frame.width));
-  for (int row = 0; row < frame.height / 2; ++row) {
-    uint8_t* target = chroma + row * chroma_stride;
-    if (frame.format == RawPixelFormat::NV12) {
-      std::memcpy(target, frame.planes[1] + row * frame.strides[1], size_t(frame.width));
-      continue;
-    }
-    const uint8_t* u = frame.planes[1] + row * frame.strides[1];
-    const uint8_t* v = frame.planes[2] + row * frame.strides[2];
-    for (int column = 0; column < frame.width / 2; ++column) {
-      target[2 * column] = u[column];
-      target[2 * column + 1] = v[column];
-    }
-  }
-  CVPixelBufferUnlockBaseAddress(pixels, 0);
   const void* option_keys[] = {kVTEncodeFrameOptionKey_ForceKeyFrame};
   const void* option_values[] = {kCFBooleanTrue};
   Cf options(force_keyframe ? dictionary(option_keys, option_values, 1) : nullptr);

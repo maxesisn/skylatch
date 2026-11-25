@@ -20,12 +20,49 @@ inline std::optional<EncoderPreference> parseEncoderPreference(const std::string
 
 enum class RawPixelFormat { NV12, I420 };
 
+/**
+ * Memory for an NV12 (limited-range BT.709) picture that the capture loop converts into and encoders read. On macOS it
+ * is an IOSurface-backed CVPixelBuffer that VideoToolbox encodes in place; elsewhere it is plain memory. The planes
+ * are valid only while an Access is alive.
+ */
+class Nv12Picture {
+ public:
+  Nv12Picture(int width, int height);
+  ~Nv12Picture();
+  Nv12Picture(const Nv12Picture&) = delete;
+  Nv12Picture& operator=(const Nv12Picture&) = delete;
+  /** CPU access to the planes for its lifetime; a writing access makes the new pixels visible to the encoder. */
+  class Access {
+   public:
+    Access(Nv12Picture& picture, bool write) : picture_(picture), write_(write) { picture_.lock(write_); }
+    ~Access() { picture_.unlock(write_); }
+    Access(const Access&) = delete;
+    Access& operator=(const Access&) = delete;
+
+   private:
+    Nv12Picture& picture_;
+    bool write_;
+  };
+  uint8_t* planes[2] = {};
+  int strides[2] = {};
+  /** The platform image that holds the planes (a CVPixelBufferRef on macOS), or null. */
+  const void* native() const { return native_; }
+
+ private:
+  void lock(bool write);
+  void unlock(bool write);
+  std::vector<uint8_t> memory_;
+  void* native_ = nullptr;
+};
+
 /** One 4:2:0 limited-range BT.709 picture: NV12 fills planes 0 and 1, I420 planes 0 to 2. */
 struct EncodedInputFrame {
   RawPixelFormat format = RawPixelFormat::NV12;
   int width = 0, height = 0;
   const uint8_t* planes[3] = {};
   int strides[3] = {};
+  /// Nv12Picture::native() of the picture the planes belong to; an encoder that can read it skips copying the planes.
+  const void* native = nullptr;
   int64_t pts_us = 0;
   /// Raster-order map with one byte per 16x16 macroblock, 1 (X264_MBINFO_CONSTANT) where the block did not change
   /// since the previous frame and 0 elsewhere; encoders that cannot skip blocks ignore it.
