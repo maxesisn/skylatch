@@ -85,6 +85,20 @@ struct Picture {
     frame.strides[0] = width; frame.strides[1] = frame.strides[2] = width / 2;
     return frame;
   }
+  /** Writes the picture into `target` as the capture loop does and returns it as input; read it under an Access. */
+  relay::EncodedInputFrame into(relay::Nv12Picture& target, int64_t pts) const {
+    {
+      const relay::Nv12Picture::Access writing(target, true);
+      for (int row = 0; row < height; ++row)
+        std::memcpy(target.planes[0] + size_t(row) * target.strides[0], y.data() + size_t(row) * width, size_t(width));
+      for (int row = 0; row < height / 2; ++row)
+        std::memcpy(target.planes[1] + size_t(row) * target.strides[1], uv.data() + size_t(row) * width, size_t(width));
+    }
+    relay::EncodedInputFrame frame;
+    frame.width = width; frame.height = height; frame.pts_us = pts;
+    frame.native = target.native();
+    return frame;
+  }
 };
 
 /** libavcodec H.264 decoding one access unit at a time, as the clients do. */
@@ -368,6 +382,21 @@ static double hardwareSequence(relay::VideoEncoder& encoder) {
     }
     worst = std::max(worst, requireMatches(decoder.decode(out, what), picture, what));
     if (index == 3) encoder.reconfigureBitrate(4000000, 4000000);
+  }
+  // The capture loop rewrites one picture in place between frames; every frame must carry the new pixels.
+  relay::Nv12Picture reused(640, 480);
+  for (int index = 8; index < 11; ++index) {
+    const Picture picture(640, 480, index * 4);
+    auto input = picture.into(reused, pts);
+    pts += 33333;
+    const relay::Nv12Picture::Access reading(reused, false);
+    input.planes[0] = reused.planes[0]; input.planes[1] = reused.planes[1];
+    input.strides[0] = reused.strides[0]; input.strides[1] = reused.strides[1];
+    const std::string what = name + " in-place frame " + std::to_string(index);
+    require(encoder.encode(input, false, out, keyframe, error), what + ": " + error);
+    require(!keyframe, what + " must be a delta frame");
+    requireDelta(out, what);
+    worst = std::max(worst, requireMatches(decoder.decode(out, what), picture, what));
   }
   for (const auto& size : {std::pair<int, int>{1280, 720}, std::pair<int, int>{3840, 2160}, std::pair<int, int>{640, 480}}) {
     require(encoder.configure(size.first, size.second, 60, 20000000, 20000000, error), name + ": " + error);
