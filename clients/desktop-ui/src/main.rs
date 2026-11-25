@@ -44,7 +44,7 @@ use live::{HubTarget, LiveHandle};
 use onboard::{Code, HubSubmit, OnbField, Onboarding, Pairing, Tab};
 use scene::*;
 use skylatch_client_core::updater::CheckOptions;
-use theme::{Pal, Rgb};
+use theme::{Pal, Rgb, ui};
 use update::{Capsule, UpdateUiState, Updater};
 
 pub const DOT_STEP: f32 = 22.0;
@@ -306,14 +306,14 @@ fn mtxt(s: impl Into<SharedString>, size: f32, color: Hsla) -> gpui::Div {
 /// A key cap, e.g. `Enter`.
 fn keycap(k: &str, pal: &Pal) -> gpui::Div {
     div()
-        .h(px(18.0))
-        .min_w(px(18.0))
+        .h(px(ui::KBD_H))
+        .min_w(px(ui::KBD_H))
         .px(px(5.0))
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .rounded(px(4.0))
+        .rounded(px(ui::RAD_KBD))
         .border_1()
         .border_color(rgba(pal.hair, 1.0))
         .bg(rgba(pal.surface, 1.0))
@@ -339,18 +339,54 @@ pub(crate) fn hint_row(items: &[(&str, &str)], pal: &Pal) -> gpui::Div {
         .children(items.iter().map(|(k, l)| key_hint(k, l, pal)))
 }
 
-/// A small outlined pill next to a headline (`本机`, `5K`, `DESK 01`).
-fn badge(text: impl Into<SharedString>, color: Hsla, border: Hsla, size: f32) -> gpui::Div {
+/// A small tag on a light wash next to a headline (`本机`, `5K`, `DESK 01`).
+fn badge(text: impl Into<SharedString>, color: Hsla, wash: Hsla) -> gpui::Div {
     div()
-        .h(px(size + 6.0))
-        .px(px(6.0))
+        .h(px(ui::TAG_H))
+        .px(px(7.0))
         .flex()
         .flex_none()
         .items_center()
-        .rounded_full()
+        .rounded(px(ui::RAD_INNER))
+        .bg(wash)
+        .child(txt(text, 10.5, color))
+}
+
+/// The frame of a segmented control: segments on a wash, inside a hairline.
+pub(crate) fn segmented(selector: &'static str, pal: &Pal) -> gpui::Div {
+    div()
+        .debug_selector(move || selector.to_string())
+        .h(px(ui::CTL_H))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(2.0))
+        .p(px(ui::SEG_PAD))
+        .rounded(px(ui::RAD_CTL))
+        .bg(rgba(pal.wash, 1.0))
         .border_1()
-        .border_color(border)
-        .child(txt(text, size, color))
+        .border_color(rgba(pal.hair, 1.0))
+}
+
+/// The hairline between two groups of controls; `drag` keeps it part of the title bar.
+fn divider(pal: &Pal, drag: bool) -> gpui::Div {
+    div()
+        .h_full()
+        .px(px(ui::DIV_GAP))
+        .flex()
+        .flex_none()
+        .items_center()
+        .when(drag, |d| d.window_control_area(WindowControlArea::Drag))
+        .child(rule(pal))
+}
+
+/// The bare hairline of a [`divider`].
+fn rule(pal: &Pal) -> gpui::Div {
+    div()
+        .w(px(1.0))
+        .h(px(ui::DIV_H))
+        .flex_none()
+        .bg(rgba(pal.hair, 1.0))
 }
 
 /// The `本机` chip that marks the machine the launcher runs on.
@@ -362,9 +398,8 @@ fn local_chip(pal: &Pal) -> gpui::Div {
         .flex()
         .flex_none()
         .items_center()
-        .rounded_full()
-        .border_1()
-        .border_color(rgba(pal.accent, 0.6))
+        .rounded(px(ui::RAD_KBD))
+        .bg(rgba(pal.accent, 0.12))
         .child(txt("本机", 9.0, c))
 }
 
@@ -3125,39 +3160,31 @@ impl Proto {
 // ───────────────────────────── view ─────────────────────────────
 
 impl Proto {
-    #[allow(clippy::too_many_arguments)]
+    /// One segment of a [`segmented`] control; the active one is a raised card.
     fn seg_btn(
         &self,
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         active: bool,
-        strong: bool,
         pal: &Pal,
         cx: &mut Context<Self>,
         on: impl Fn(&mut Self) + 'static,
     ) -> gpui::AnyElement {
-        let (bg, fg) = match (active, strong) {
-            (true, true) => (rgba(pal.ink, 1.0), rgba(pal.canvas, 1.0)),
-            (true, false) => (rgba(pal.canvas, 1.0), rgba(pal.ink, 1.0)),
-            _ => (rgba(pal.ink, 0.0), rgba(pal.muted, 1.0)),
-        };
-        let wash = rgba(pal.wash, 1.0);
+        let fg = rgba(if active { pal.ink } else { pal.muted }, 1.0);
+        let lift = rgba(pal.raised, 0.5);
         let ink = rgba(pal.ink, 1.0);
         div()
             .id(id)
-            .h(px(28.0))
-            .px(px(13.0))
+            .h(px(ui::SEG_IN_H))
+            .px(px(12.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(5.0))
-            .bg(bg)
-            .when(active && !strong, |d| {
-                d.border_1().border_color(rgba(pal.hair, 1.0))
-            })
+            .rounded(px(ui::RAD_INNER))
             .cursor_pointer()
+            .when(active, |d| d.bg(rgba(pal.raised, 1.0)).shadow_sm())
             .when(!active, move |d| {
-                d.hover(move |s| s.bg(wash).text_color(ink))
+                d.hover(move |s| s.bg(lift).text_color(ink))
             })
             .child(txt(label, 12.5, fg).font_weight(if active {
                 FontWeight::MEDIUM
@@ -3178,26 +3205,29 @@ impl Proto {
         let on = self.edit;
         let (fg, bg, border) = if on {
             (
-                rgba(pal.on_accent, 1.0),
                 rgba(pal.accent, 1.0),
-                rgba(pal.accent, 1.0),
+                rgba(pal.accent, 0.10),
+                rgba(pal.accent, 0.7),
             )
         } else {
-            (rgba(pal.ink, 1.0), rgba(pal.ink, 0.0), rgba(pal.hair, 1.0))
+            (
+                rgba(pal.ink, 1.0),
+                rgba(pal.surface, 1.0),
+                rgba(pal.hair, 1.0),
+            )
         };
         let wash = rgba(pal.wash, 1.0);
         div()
             .id("edit-toggle")
             .debug_selector(|| "edit-toggle".to_string())
-            .mr(px(10.0))
-            .h(px(26.0))
+            .h(px(ui::CTL_H))
             .pl(px(12.0))
-            .pr(px(7.0))
+            .pr(px(6.0))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(8.0))
-            .rounded_full()
+            .rounded(px(ui::RAD_CTL))
             .border_1()
             .border_color(border)
             .bg(bg)
@@ -3206,15 +3236,15 @@ impl Proto {
             .child(txt("整理工位", 12.5, fg).font_weight(FontWeight::MEDIUM))
             .child(
                 div()
-                    .h(px(16.0))
-                    .min_w(px(16.0))
+                    .h(px(ui::KBD_H))
+                    .min_w(px(ui::KBD_H))
                     .px(px(4.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(4.0))
-                    .bg(fg.opacity(if on { 0.2 } else { 0.08 }))
-                    .child(mtxt("E", 9.5, fg)),
+                    .rounded(px(ui::RAD_KBD))
+                    .bg(fg.opacity(if on { 0.14 } else { 0.07 }))
+                    .child(mtxt("E", 10.0, fg)),
             )
             .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
                 window.focus(&this.focus);
@@ -3237,28 +3267,29 @@ impl Proto {
     ) -> gpui::AnyElement {
         let (fg, bg, border) = if primary {
             (
-                rgba(pal.on_accent, 1.0),
                 rgba(pal.accent, 1.0),
-                rgba(pal.accent, 1.0),
+                rgba(pal.accent, 0.10),
+                rgba(pal.accent, 0.7),
             )
         } else {
             (
                 rgba(pal.ink, 1.0),
-                rgba(pal.canvas, 1.0),
+                rgba(pal.surface, 1.0),
                 rgba(pal.hair, 1.0),
             )
         };
         let wash = rgba(pal.wash, 1.0);
         let accent = rgba(pal.accent, 1.0);
+        let accent_hover = rgba(pal.accent, 0.18);
         div()
             .id(id)
             .debug_selector(|| id.to_string())
-            .h(px(26.0))
-            .px(px(11.0))
+            .h(px(ui::CTL_H))
+            .px(px(12.0))
             .flex()
             .flex_none()
             .items_center()
-            .rounded(px(5.0))
+            .rounded(px(ui::RAD_CTL))
             .border_1()
             .border_color(border)
             .bg(bg)
@@ -3266,7 +3297,7 @@ impl Proto {
             .when(enabled, move |d| {
                 d.cursor_pointer().hover(move |s| {
                     if primary {
-                        s.opacity(0.9)
+                        s.bg(accent_hover)
                     } else {
                         s.bg(wash).border_color(accent)
                     }
@@ -3302,19 +3333,19 @@ impl Proto {
         div()
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(ui::GAP_CTL))
             .child(
                 div()
                     .id("edit-input")
                     .debug_selector(|| "edit-input".to_string())
                     .relative()
-                    .h(px(26.0))
+                    .h(px(ui::CTL_H))
                     .w(px(168.0))
-                    .px(px(9.0))
+                    .px(px(10.0))
                     .flex()
                     .items_center()
                     .overflow_hidden()
-                    .rounded(px(5.0))
+                    .rounded(px(ui::RAD_CTL))
                     .border_1()
                     .border_color(rgba(pal.accent, 1.0))
                     .bg(rgba(pal.canvas, 1.0))
@@ -3354,13 +3385,14 @@ impl Proto {
         let ink = rgba(pal.ink, 1.0);
         let row = || {
             div()
-                .h(px(TOOLBAR_H / 2.0))
+                .h(px(ui::CTL_H))
                 .w_full()
-                .px(px(26.0))
+                .px(px(ui::BAR_PX))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(ui::GAP_CTL))
         };
+        let sep = || rule(pal).mx(px(ui::DIV_GAP - ui::GAP_CTL));
         let adding_room = self
             .edit_input
             .as_ref()
@@ -3382,13 +3414,7 @@ impl Proto {
 
         let first = row()
             .child(txt("整理工位", 13.0, ink).font_weight(FontWeight::SEMIBOLD))
-            .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(16.0))
-                    .mx(px(4.0))
-                    .bg(rgba(pal.hair, 1.0)),
-            )
+            .child(sep())
             .child(self.tool_btn(
                 "edit-add-ldesk",
                 format!("+ {}", furniture_label(FurnitureKind::LDesk)),
@@ -3425,13 +3451,7 @@ impl Proto {
                 cx,
                 |t| t.arrange_remove_empty(),
             ))
-            .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(16.0))
-                    .mx(px(4.0))
-                    .bg(rgba(pal.hair, 1.0)),
-            )
+            .child(sep())
             .child(if adding_room {
                 self.tool_input("房间名称", pal, cx)
             } else {
@@ -3501,13 +3521,7 @@ impl Proto {
                     |t| t.open_input(InputKind::Rename),
                 )
             })
-            .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(16.0))
-                    .mx(px(4.0))
-                    .bg(rgba(pal.hair, 1.0)),
-            )
+            .child(sep())
             .child(txt("移到房间", 11.5, muted))
             .children(others.into_iter().map(|(i, id, name)| {
                 let label = clip(&name, 10);
@@ -3517,15 +3531,15 @@ impl Proto {
                 div()
                     .id(btn_id)
                     .debug_selector(move || probe.clone())
-                    .h(px(26.0))
-                    .px(px(10.0))
+                    .h(px(ui::CTL_H))
+                    .px(px(12.0))
                     .flex()
                     .flex_none()
                     .items_center()
-                    .rounded_full()
+                    .rounded(px(ui::RAD_CTL))
                     .border_1()
                     .border_color(rgba(pal.hair, 1.0))
-                    .bg(rgba(pal.canvas, 1.0))
+                    .bg(rgba(pal.surface, 1.0))
                     .opacity(if sel { 1.0 } else { 0.4 })
                     .when(sel, |d| {
                         d.cursor_pointer()
@@ -3556,9 +3570,11 @@ impl Proto {
             .debug_selector(|| "edit-toolbar".to_string())
             .w_full()
             .h(px(TOOLBAR_H))
+            .py(px(ui::TOOLBAR_PAD))
             .flex_none()
             .flex()
             .flex_col()
+            .gap(px(ui::TOOLBAR_PAD))
             .bg(rgba(pal.bar, 1.0))
             .border_b_1()
             .border_color(rgba(pal.hair, 1.0))
@@ -3655,28 +3671,27 @@ impl Proto {
             .id("update-capsule")
             .debug_selector(|| "update-capsule".to_string())
             .relative()
-            .h(px(26.0))
+            .h(px(ui::CTL_H))
             .px(px(12.0))
-            .mr(px(10.0))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(8.0))
-            .rounded_full()
+            .rounded(px(ui::RAD_CTL))
             .border_1()
             .overflow_hidden();
         let el = match capsule {
             Capsule::Offer(text) | Capsule::Install(text) => base
-                .border_color(accent)
+                .border_color(rgba(pal.accent, 0.7))
                 .bg(rgba(pal.accent, 0.08))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(pal.accent, 0.16)))
                 .child(div().size(px(6.0)).rounded_full().bg(accent))
-                .child(txt(text, 11.5, accent).font_weight(FontWeight::MEDIUM)),
+                .child(txt(text, 12.0, accent).font_weight(FontWeight::MEDIUM)),
             Capsule::Progress { text, frac } => base
                 .border_color(rgba(pal.accent, 0.5))
                 .bg(rgba(pal.accent, 0.05))
-                .child(mtxt(text, 11.0, accent))
+                .child(mtxt(text, 11.5, accent))
                 .child(
                     div()
                         .absolute()
@@ -3694,14 +3709,14 @@ impl Proto {
                         .hover(move |s| s.bg(rgba(pal.accent.mix(pal.ink, 0.18), 1.0)))
                 })
                 .opacity(if busy { 0.7 } else { 1.0 })
-                .child(txt(text, 11.5, on_accent).font_weight(FontWeight::SEMIBOLD)),
+                .child(txt(text, 12.0, on_accent).font_weight(FontWeight::SEMIBOLD)),
             Capsule::Retry => base
-                .border_color(warn)
+                .border_color(rgba(pal.warn, 0.7))
                 .bg(rgba(pal.warn, 0.08))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(pal.warn, 0.16)))
-                .child(txt("更新失败", 11.5, warn).font_weight(FontWeight::MEDIUM))
-                .child(txt("点此重试", 11.0, rgba(pal.warn, 0.75))),
+                .child(txt("更新失败", 12.0, warn).font_weight(FontWeight::MEDIUM))
+                .child(txt("点此重试", 11.5, rgba(pal.warn, 0.75))),
         };
         Some(
             el.on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
@@ -3736,19 +3751,20 @@ impl Proto {
                 div()
                     .id("drawer-check-update")
                     .debug_selector(|| "drawer-check-update".to_string())
-                    .h(px(24.0))
-                    .px(px(10.0))
+                    .h(px(ui::FIELD_H))
+                    .px(px(12.0))
                     .flex()
                     .flex_none()
                     .items_center()
-                    .rounded(px(5.0))
+                    .rounded(px(ui::RAD_FIELD))
                     .border_1()
                     .border_color(rgba(pal.hair, 1.0))
+                    .bg(rgba(pal.surface, 1.0))
                     .opacity(if can { 1.0 } else { 0.5 })
                     .when(can, |d| {
                         d.cursor_pointer().hover(|s| s.bg(rgba(pal.wash, 1.0)))
                     })
-                    .child(txt("检查更新", 11.5, rgba(pal.ink, 1.0)))
+                    .child(txt("检查更新", 12.0, rgba(pal.ink, 1.0)))
                     .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
                         this.check_update(false);
                         cx.notify();
@@ -3764,6 +3780,74 @@ impl Proto {
                     .text_ellipsis(),
                 ),
             )
+            .into_any_element()
+    }
+
+    /// The Hub status of the header (opens the drawer) with its refresh button.
+    fn hub_control(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (dot, hollow, host, status) = self.hub_pill(pal);
+        let live = self.eff.live();
+        let wash = rgba(pal.wash, 1.0);
+        let muted = rgba(pal.muted, 1.0);
+        div()
+            .debug_selector(|| "hub-control".to_string())
+            .h(px(ui::CTL_H))
+            .flex()
+            .flex_none()
+            .items_center()
+            .rounded(px(ui::RAD_CTL))
+            .border_1()
+            .border_color(rgba(pal.hair, 1.0))
+            .bg(rgba(pal.surface, 1.0))
+            .child(
+                div()
+                    .id("hub-pill")
+                    .h_full()
+                    .pl(px(10.0))
+                    .pr(px(if live { 6.0 } else { 11.0 }))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .rounded(px(ui::RAD_CTL - 1.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(wash))
+                    .child(if hollow {
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(dot)
+                    } else {
+                        div().size(px(6.0)).rounded_full().bg(dot)
+                    })
+                    .child(txt("Hub", 12.0, rgba(pal.ink, 1.0)).font_weight(FontWeight::MEDIUM))
+                    .children(host.map(|h| mtxt(h, 11.5, muted)))
+                    .child(txt(status, 11.5, rgba(pal.muted, 0.85)))
+                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                        this.toggle_drawer();
+                        cx.notify();
+                    })),
+            )
+            .when(live, |d| {
+                d.child(
+                    div()
+                        .id("hub-refresh")
+                        .size(px(ui::MINI_H))
+                        .mr(px(ui::SEG_PAD))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(ui::RAD_INNER))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(wash))
+                        .child(txt("↻", 13.0, muted))
+                        .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                            this.refresh();
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -3810,13 +3894,13 @@ impl Proto {
         div()
             .id(id)
             .relative()
-            .h(px(32.0))
+            .h(px(ui::FIELD_H))
             .w_full()
             .px(px(10.0))
             .flex()
             .items_center()
             .overflow_hidden()
-            .rounded(px(5.0))
+            .rounded(px(ui::RAD_FIELD))
             .border_1()
             .border_color(if focused {
                 rgba(pal.accent, 1.0)
@@ -3894,7 +3978,7 @@ impl Proto {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .rounded(px(8.0))
+            .rounded(px(ui::RAD_PANEL))
             .bg(rgba(pal.bar, 1.0))
             .border_1()
             .border_color(hair)
@@ -3909,10 +3993,10 @@ impl Proto {
                         div()
                             .id("drawer-close")
                             .px(px(8.0))
-                            .h(px(22.0))
+                            .h(px(ui::MINI_H))
                             .flex()
                             .items_center()
-                            .rounded(px(4.0))
+                            .rounded(px(ui::RAD_INNER))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgba(pal.wash, 1.0)))
                             .child(mtxt("Esc", 10.0, muted))
@@ -3977,7 +4061,7 @@ impl Proto {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(3.0))
+                            .rounded(px(ui::RAD_KBD))
                             .border_1()
                             .border_color(if checked { accent } else { muted })
                             .bg(if checked {
@@ -4010,11 +4094,11 @@ impl Proto {
                     .child(
                         div()
                             .id("drawer-save")
-                            .h(px(34.0))
+                            .h(px(ui::FIELD_H))
                             .px(px(16.0))
                             .flex()
                             .items_center()
-                            .rounded(px(6.0))
+                            .rounded(px(ui::RAD_FIELD))
                             .bg(accent)
                             .cursor_pointer()
                             .hover(move |s| s.bg(rgba(pal.accent.mix(pal.ink, 0.18), 1.0)))
@@ -4030,13 +4114,14 @@ impl Proto {
                     .child(
                         div()
                             .id("drawer-signout")
-                            .h(px(34.0))
+                            .h(px(ui::FIELD_H))
                             .px(px(14.0))
                             .flex()
                             .items_center()
-                            .rounded(px(6.0))
+                            .rounded(px(ui::RAD_FIELD))
                             .border_1()
                             .border_color(hair)
+                            .bg(rgba(pal.surface, 1.0))
                             .cursor_pointer()
                             .hover(move |s| s.bg(rgba(pal.wash, 1.0)))
                             .child(txt("退出登录", 13.0, ink))
@@ -4098,8 +4183,8 @@ impl Render for Proto {
         };
 
         // ── header ──
-        let (pill_dot, pill_hollow, pill_host, pill_status) = self.hub_pill(&pal);
         let live_mode = self.eff.live();
+        let has_tools = self.updater.capsule().is_some() || self.can_arrange();
         let mark_pal = pal;
         let tabs_active = !self.shelf;
         let header = div()
@@ -4117,14 +4202,10 @@ impl Render for Proto {
                     .debug_selector(|| "header-brand".to_string())
                     .h_full()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(9.0))
-                    .pl(px(if cfg!(target_os = "macos") {
-                        78.0
-                    } else {
-                        18.0
-                    }))
-                    .pr(px(16.0))
+                    .pl(px(ui::BRAND_PL))
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         canvas(|_, _, _| (), move |b, _, w, _| paint_mark(w, b, &mark_pal))
@@ -4133,168 +4214,115 @@ impl Render for Proto {
                     )
                     .child(txt("Skylatch", 15.5, ink).font_weight(FontWeight::SEMIBOLD)),
             )
+            .child(divider(&pal, true))
             .child(
                 div()
-                    .h(px(26.0))
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(hair)
-                    .bg(canvas_c)
-                    .child(
-                        div()
-                            .id("hub-pill")
-                            .h_full()
-                            .pl(px(10.0))
-                            .pr(px(if live_mode { 6.0 } else { 11.0 }))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgba(pal.wash, 1.0)))
-                            .child(if pill_hollow {
-                                div()
-                                    .size(px(6.0))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(pill_dot)
-                            } else {
-                                div().size(px(6.0)).rounded_full().bg(pill_dot)
-                            })
-                            .child(txt("Hub", 11.5, ink).font_weight(FontWeight::MEDIUM))
-                            .children(pill_host.map(|h| mtxt(h, 11.0, muted)))
-                            .child(txt(pill_status, 11.0, rgba(pal.muted, 0.85)))
-                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.toggle_drawer();
-                                cx.notify();
-                            })),
-                    )
-                    .when(live_mode, |d| {
-                        d.child(
-                            div()
-                                .id("hub-refresh")
-                                .h_full()
-                                .w(px(26.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgba(pal.wash, 1.0)))
-                                .child(txt("↻", 13.0, muted))
-                                .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                    this.refresh();
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .children(live_mode.then(|| self.add_device_button(&pal, cx)))
-            .children(
-                live_mode
-                    .then(|| self.host_chip(&pal, f(vp.width) >= 1100.0, cx))
-                    .flatten(),
-            )
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .gap(px(ui::GAP_CTL))
+                    .child(self.hub_control(&pal, cx))
+                    .children(live_mode.then(|| self.add_device_button(&pal, cx)))
+                    .children(
+                        live_mode
+                            .then(|| self.host_chip(&pal, f(vp.width) >= 1100.0, cx))
+                            .flatten(),
+                    ),
             )
             .children((!scenes.devices.is_empty()).then(|| {
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(px(2.0))
-                    .p(px(3.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(hair)
-                    .children(scenes.desks.iter().enumerate().map(|(i, d)| {
-                        self.seg_btn(
-                            ("desk", i),
-                            clip(&d.name, 14),
-                            tabs_active && self.desk == i,
-                            true,
-                            &pal,
-                            cx,
-                            move |t| t.set_desk(i),
-                        )
-                    }))
+                    .child(divider(&pal, true))
+                    .child(segmented("room-seg", &pal).children(
+                        scenes.desks.iter().enumerate().map(|(i, d)| {
+                            self.seg_btn(
+                                ("desk", i),
+                                clip(&d.name, 14),
+                                tabs_active && self.desk == i,
+                                &pal,
+                                cx,
+                                move |t| t.set_desk(i),
+                            )
+                        }),
+                    ))
             }))
             .child(
                 div()
                     .debug_selector(|| "header-drag".to_string())
                     .flex_1()
+                    .min_w(px(ui::DIV_GAP))
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
-            .children(self.update_capsule(&pal, cx))
-            .children(self.can_arrange().then(|| self.arrange_button(&pal, cx)))
+            .children(has_tools.then(|| {
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(ui::GAP_CTL))
+                            .children(self.update_capsule(&pal, cx))
+                            .children(self.can_arrange().then(|| self.arrange_button(&pal, cx))),
+                    )
+                    .child(divider(&pal, true))
+            }))
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(px(2.0))
-                    .p(px(3.0))
-                    .rounded(px(8.0))
-                    .bg(rgba(pal.wash, 1.0))
+                    .gap(px(ui::GAP_CTL))
                     .child(
-                        self.seg_btn("v-desk", "等距桌", !self.shelf, false, &pal, cx, |t| {
-                            if t.shelf {
-                                t.toggle_view()
-                            }
-                        }),
-                    )
-                    .child(self.seg_btn(
-                        "v-shelf",
-                        "陈列架",
-                        self.shelf,
-                        false,
-                        &pal,
-                        cx,
-                        |t| {
-                            if !t.shelf {
-                                t.toggle_view()
-                            }
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .p(px(3.0))
-                    .rounded(px(8.0))
-                    .bg(rgba(pal.wash, 1.0))
-                    .child(
-                        self.seg_btn("t-light", "浅色", !self.dark, false, &pal, cx, |t| {
-                            if t.dark {
-                                t.set_dark(false)
-                            }
-                        }),
+                        segmented("view-seg", &pal)
+                            .child(self.seg_btn(
+                                "v-desk",
+                                "等距桌",
+                                !self.shelf,
+                                &pal,
+                                cx,
+                                |t| {
+                                    if t.shelf {
+                                        t.toggle_view()
+                                    }
+                                },
+                            ))
+                            .child(self.seg_btn(
+                                "v-shelf",
+                                "陈列架",
+                                self.shelf,
+                                &pal,
+                                cx,
+                                |t| {
+                                    if !t.shelf {
+                                        t.toggle_view()
+                                    }
+                                },
+                            )),
                     )
                     .child(
-                        self.seg_btn("t-dark", "深色", self.dark, false, &pal, cx, |t| {
-                            if !t.dark {
-                                t.set_dark(true)
-                            }
-                        }),
+                        segmented("theme-seg", &pal)
+                            .child(self.seg_btn("t-light", "浅色", !self.dark, &pal, cx, |t| {
+                                if t.dark {
+                                    t.set_dark(false)
+                                }
+                            }))
+                            .child(self.seg_btn("t-dark", "深色", self.dark, &pal, cx, |t| {
+                                if !t.dark {
+                                    t.set_dark(true)
+                                }
+                            })),
                     ),
             )
             .child(
                 div()
-                    .w(px(16.0))
+                    .w(px(if cfg!(windows) { ui::DIV_GAP } else { ui::EDGE }))
                     .h_full()
+                    .flex_none()
                     .window_control_area(WindowControlArea::Drag),
             )
             .when(cfg!(windows), |d| {
@@ -4317,7 +4345,7 @@ impl Render for Proto {
         let scene = self.scene();
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
-        // corner tag: the headline, then its pieces (first plain, the rest as small pills)
+        // corner tag: the headline, then its pieces as small tags
         let (tag_title, tag_aside, tag_parts): (String, Option<String>, Vec<String>) = if self.shelf
         {
             let mut ys: Vec<i32> = scene
@@ -4349,22 +4377,20 @@ impl Render for Proto {
         } else {
             (clip(&desk.name, 18), None, desk.sub.clone())
         };
-        let mut tag_row = div().flex().items_center().gap(px(6.0));
-        for (i, part) in tag_parts.into_iter().enumerate() {
-            tag_row = tag_row.child(if i == 0 {
-                mtxt(part, 10.5, muted)
-            } else {
+        let tag_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .children(tag_parts.into_iter().map(|part| {
                 div()
-                    .h(px(16.0))
-                    .px(px(6.0))
+                    .h(px(ui::TAG_H))
+                    .px(px(7.0))
                     .flex()
                     .items_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(hair)
-                    .child(mtxt(part, 9.5, muted))
-            });
-        }
+                    .rounded(px(ui::RAD_INNER))
+                    .bg(rgba(pal.wash, 1.0))
+                    .child(mtxt(part, 10.0, muted))
+            }));
         overlays.push(
             div()
                 .absolute()
@@ -4372,7 +4398,7 @@ impl Render for Proto {
                 .top(px(20.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(4.0))
                 .child(
                     div()
                         .flex()
@@ -4460,12 +4486,12 @@ impl Render for Proto {
                     .absolute()
                     .right(px(26.0))
                     .bottom(px(12.0))
-                    .h(px(26.0))
+                    .h(px(ui::CTL_H))
                     .px(px(10.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .rounded_full()
+                    .rounded(px(ui::RAD_CTL))
                     .border_1()
                     .border_color(hair)
                     .bg(rgba(pal.bar, 0.95))
@@ -4555,7 +4581,7 @@ impl Render for Proto {
                     .gap(px(6.0))
                     .when(side, |d| d.justify_start())
                     .when(!side, |d| d.justify_center())
-                    .rounded(px(3.0))
+                    .rounded(px(ui::RAD_KBD))
                     .bg(rgba(pal.canvas, 0.9))
                     .border_b_1()
                     .border_color(line)
@@ -4651,7 +4677,7 @@ impl Render for Proto {
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .rounded(px(5.0))
+                    .rounded(px(ui::RAD_CTL))
                     .bg(bar)
                     .border_1()
                     .border_dashed()
@@ -4891,14 +4917,13 @@ impl Render for Proto {
         let chip = |id: &'static str, text: String, col: Hsla| {
             div()
                 .id(id)
-                .h(px(20.0))
-                .px(px(9.0))
+                .h(px(ui::TAG_H))
+                .px(px(8.0))
                 .flex()
                 .flex_none()
                 .items_center()
-                .rounded_full()
-                .border_1()
-                .border_color(col)
+                .rounded(px(ui::RAD_INNER))
+                .bg(col.opacity(0.10))
                 .child(txt(text, 11.0, col))
         };
         let hidden_chip = (!self.shelf && desk.hidden > 0).then(|| {
@@ -4951,11 +4976,11 @@ impl Render for Proto {
                     )
                     .children(
                         dev.filter(|d| !d.tag.is_empty())
-                            .map(|d| badge(d.tag.clone(), muted, hair, 10.5)),
+                            .map(|d| badge(d.tag.clone(), muted, rgba(pal.wash, 1.0))),
                     )
                     .children(
                         dev.filter(|d| d.is_local)
-                            .map(|_| badge("本机", accent, rgba(pal.accent, 0.6), 10.5)),
+                            .map(|_| badge("本机", accent, rgba(pal.accent, 0.12))),
                     )
                     .children(
                         dev.and_then(|d| d.hardware_model.clone())
@@ -4966,23 +4991,29 @@ impl Render for Proto {
             )
             .child(sub_row);
 
+        let has_chips = !machine_devs.is_empty();
         let chips = div()
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(ui::GAP_ACTION))
             .children(machine_devs.iter().map(|&i| {
                 let on = Some(i) == self.sel;
                 let c = &scenes.devices[i];
                 div()
                     .id(("chip", i))
-                    .h(px(30.0))
-                    .px(px(13.0))
+                    .h(px(ui::ACTION_H))
+                    .px(px(14.0))
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .rounded(px(6.0))
+                    .rounded(px(ui::RAD_CTL))
                     .border_1()
-                    .border_color(if on { accent } else { hair })
-                    .bg(if on { rgba(pal.accent, 0.10) } else { canvas_c })
+                    .border_color(if on { rgba(pal.accent, 0.7) } else { hair })
+                    .bg(if on {
+                        rgba(pal.accent, 0.10)
+                    } else {
+                        rgba(pal.surface, 1.0)
+                    })
                     .cursor_pointer()
                     .hover(move |s| s.border_color(accent))
                     .gap(px(7.0))
@@ -5020,14 +5051,14 @@ impl Render for Proto {
         let button = div()
             .id("connect")
             .debug_selector(|| "connect".to_string())
-            .h(px(40.0))
-            .pl(px(20.0))
-            .pr(px(if inert { 20.0 } else { 12.0 }))
+            .h(px(ui::ACTION_H))
+            .pl(px(18.0))
+            .pr(px(if inert { 18.0 } else { 9.0 }))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(12.0))
-            .rounded(px(6.0))
+            .rounded(px(ui::RAD_CTL))
             .bg(if inert { rgba(pal.wash, 1.0) } else { accent })
             .opacity(if self.sel.is_some() { 1.0 } else { 0.4 })
             .when(enabled, |d| {
@@ -5042,11 +5073,11 @@ impl Render for Proto {
             })
             .children((!inert).then(|| {
                 div()
-                    .h(px(20.0))
+                    .h(px(ui::KBD_H))
                     .px(px(6.0))
                     .flex()
                     .items_center()
-                    .rounded(px(4.0))
+                    .rounded(px(ui::RAD_KBD))
                     .bg(on_accent.opacity(0.18))
                     .child(mtxt("Enter", 9.5, on_accent))
             }))
@@ -5059,14 +5090,15 @@ impl Render for Proto {
             div()
                 .id("remove-offline")
                 .debug_selector(|| "remove-offline".to_string())
-                .h(px(32.0))
-                .px(px(12.0))
+                .h(px(ui::ACTION_H))
+                .px(px(14.0))
                 .flex()
                 .flex_none()
                 .items_center()
-                .rounded(px(6.0))
+                .rounded(px(ui::RAD_CTL))
                 .border_1()
                 .border_color(hair)
+                .bg(rgba(pal.surface, 1.0))
                 .when(!removing, |d| {
                     d.cursor_pointer()
                         .hover(|s| s.bg(rgba(pal.wash, 1.0)).border_color(rgba(pal.warn, 0.6)))
@@ -5109,18 +5141,20 @@ impl Render for Proto {
             .flex()
             .items_center()
             .gap(px(24.0))
-            .px(px(26.0))
+            .px(px(ui::BAR_PX))
             .bg(bar)
             .border_t_1()
             .border_color(hair)
             .child(info)
-            .child(chips)
             .child(
                 div()
+                    .debug_selector(|| "footer-actions".to_string())
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(px(ui::GAP_ACTION))
+                    .child(chips)
+                    .children(has_chips.then(|| rule(&pal).mx(px(ui::DIV_GAP - ui::GAP_ACTION))))
                     .children(remove_button)
                     .child(button),
             )
@@ -5266,7 +5300,10 @@ fn main() {
             titlebar: Some(TitlebarOptions {
                 title: Some("Skylatch".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(14.0), px(18.0))),
+                traffic_light_position: Some(point(
+                    px(ui::TRAFFIC_LIGHTS.0),
+                    px(ui::TRAFFIC_LIGHTS.1),
+                )),
             }),
             window_min_size: Some(size(px(960.0), px(640.0))),
             ..Default::default()
@@ -7009,6 +7046,54 @@ mod ui_tests {
         cx.simulate_click(point(px(6.0), px(HEADER_H + 6.0)), Modifiers::none());
         assert!(focused(&view, cx));
         drop(other);
+    }
+
+    #[gpui::test]
+    fn header_controls_and_footer_actions_keep_one_height_each(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let fake = Fake::installed();
+        fake.0.lock().unwrap().enrolled = true;
+        let (view, cx) = hosted_view(cx, &hub, &fake, true);
+        let devs = fleet_with_offline(seen::now_unix() - 600);
+        view.update(cx, |v, cx| {
+            v.hub = HubState::Online {
+                count: online_count(&devs),
+            };
+            v.apply_devices(devs);
+            assert!(v.updater.begin_check(true));
+            v.updater
+                .on_msg(update::Msg::Checked(Ok(Some(update_release("0.2.0")))));
+            let tp = v.scenes.find("tp#d1").unwrap();
+            v.select(tp);
+            cx.notify();
+        });
+        draw(cx);
+        let brand = cx.debug_bounds("header-brand").unwrap();
+        assert_eq!(brand.origin.x, px(0.0));
+        let mut right = brand.right();
+        for sel in [
+            "hub-control",
+            "add-device",
+            "host-chip",
+            "room-seg",
+            "update-capsule",
+            "edit-toggle",
+            "view-seg",
+            "theme-seg",
+        ] {
+            let b = cx
+                .debug_bounds(sel)
+                .unwrap_or_else(|| panic!("no `{sel}` in the header"));
+            assert_eq!(b.size.height, px(ui::CTL_H), "{sel}");
+            // centred above the 1 px bottom border
+            assert_eq!(b.center().y, px((HEADER_H - 1.0) / 2.0), "{sel}");
+            assert!(b.origin.x >= right, "{sel} overlaps its left neighbour");
+            right = b.right();
+        }
+        for sel in ["remove-offline", "connect"] {
+            let b = cx.debug_bounds(sel).unwrap();
+            assert_eq!(b.size.height, px(ui::ACTION_H), "{sel}");
+        }
     }
 
     // ───────────── hosting this machine, tray ─────────────

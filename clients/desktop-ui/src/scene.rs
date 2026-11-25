@@ -19,8 +19,7 @@ pub use layout::*;
 
 // ───────────────────────────── layout constants ─────────────────────────────
 
-pub const HEADER_H: f32 = 52.0;
-pub const FOOTER_H: f32 = 88.0;
+pub use crate::theme::ui::{FOOTER_H, HEADER_H, TOOLBAR_H};
 /// (left, top, right, bottom) margins of the drawing inside the stage, in logical px.
 /// The generous top / right margins hold the always-visible labels (constant pixel size).
 /// The top margin grows when a desk needs extra label rows (see `Scenes::assemble`).
@@ -2645,17 +2644,14 @@ impl Default for Scenes {
 /// Window sizes covering the minimum window up to a 5K-class maximised window.
 const HEADROOM_WINDOWS: [(f32, f32); 3] = [(960.0, 640.0), (1280.0, 800.0), (1600.0, 900.0)];
 
-/// Height of the arrange-mode toolbar under the header.
-pub const TOOLBAR_H: f32 = 72.0;
-
 /// Reserved UI chrome inside the stage: corner tag, legend, key hints.
 pub fn chrome_rects(sw: f32, sh: f32) -> Vec<Rect2> {
     vec![
         Rect2 {
             x: 26.0,
             y: 20.0,
-            w: 190.0,
-            h: 36.0,
+            w: 200.0,
+            h: 42.0,
         },
         Rect2 {
             x: sw - 26.0 - 300.0,

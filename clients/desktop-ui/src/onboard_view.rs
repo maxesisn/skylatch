@@ -7,8 +7,8 @@
 use crate::host_mgr::{ChipKind, chip_look};
 use crate::onboard::{self, OnbField, Tab};
 use crate::scene::HEADER_H;
-use crate::theme::Pal;
-use crate::{Proto, Target, clip, hint_row, mtxt, paint_mark, rgba, txt};
+use crate::theme::{Pal, ui};
+use crate::{Proto, Target, clip, hint_row, mtxt, paint_mark, rgba, segmented, txt};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, canvas, div, px,
@@ -25,7 +25,7 @@ fn card_shell(pal: &Pal, width: f32) -> gpui::Div {
         .flex()
         .flex_col()
         .gap(px(11.0))
-        .rounded(px(10.0))
+        .rounded(px(ui::RAD_PANEL))
         .bg(rgba(pal.bar, 1.0))
         .border_1()
         .border_color(rgba(pal.hair, 1.0))
@@ -76,13 +76,13 @@ impl Proto {
             .id(id)
             .debug_selector(|| id.to_string())
             .relative()
-            .h(px(34.0))
+            .h(px(ui::FIELD_H))
             .w_full()
             .px(px(10.0))
             .flex()
             .items_center()
             .overflow_hidden()
-            .rounded(px(5.0))
+            .rounded(px(ui::RAD_FIELD))
             .border_1()
             .border_color(if focused {
                 rgba(pal.accent, 1.0)
@@ -134,13 +134,13 @@ impl Proto {
             .id("pair-room")
             .debug_selector(|| "pair-room".to_string())
             .relative()
-            .h(px(34.0))
+            .h(px(ui::FIELD_H))
             .w_full()
             .px(px(10.0))
             .flex()
             .items_center()
             .overflow_hidden()
-            .rounded(px(5.0))
+            .rounded(px(ui::RAD_FIELD))
             .border_1()
             .border_color(rgba(pal.accent, 1.0))
             .bg(rgba(pal.canvas, 1.0))
@@ -186,13 +186,13 @@ impl Proto {
         div()
             .id(id)
             .debug_selector(|| id.to_string())
-            .h(px(36.0))
+            .h(px(ui::FIELD_H))
             .px(px(18.0))
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(ui::RAD_FIELD))
             .bg(rgba(pal.accent, 1.0))
             .opacity(if enabled { 1.0 } else { 0.45 })
             .when(enabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover)))
@@ -218,15 +218,16 @@ impl Proto {
         div()
             .id(id)
             .debug_selector(|| id.to_string())
-            .h(px(36.0))
+            .h(px(ui::FIELD_H))
             .px(px(16.0))
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(ui::RAD_FIELD))
             .border_1()
             .border_color(rgba(pal.hair, 1.0))
+            .bg(rgba(pal.surface, 1.0))
             .cursor_pointer()
             .hover(move |s| s.bg(wash))
             .child(txt(label, 13.0, rgba(pal.ink, 1.0)))
@@ -247,18 +248,11 @@ impl Proto {
         let o = &self.onb;
         let mark_pal = *pal;
 
-        let tabs = div()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .p(px(3.0))
-            .rounded(px(8.0))
-            .bg(rgba(pal.wash, 1.0))
+        let tabs = segmented("onb-tabs", pal)
             .child(self.seg_btn(
                 "onb-tab-hub",
                 "连接 Hub",
                 o.tab == Tab::Hub,
-                false,
                 pal,
                 cx,
                 |t| t.onb.set_tab(Tab::Hub),
@@ -267,7 +261,6 @@ impl Proto {
                 "onb-tab-direct",
                 "直接连接",
                 o.tab == Tab::Direct,
-                false,
                 pal,
                 cx,
                 |t| t.onb.set_tab(Tab::Direct),
@@ -388,7 +381,7 @@ impl Proto {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(3.5))
+                        .rounded(px(ui::RAD_KBD))
                         .border_1()
                         .border_color(if on { accent } else { rgba(pal.hair, 1.0) })
                         .bg(if on { accent } else { rgba(pal.canvas, 1.0) })
@@ -513,22 +506,24 @@ impl Proto {
 
     /// `+ 添加设备`, always in the header while a hub is configured.
     pub(crate) fn add_device_button(&self, pal: &Pal, cx: &mut Context<Self>) -> AnyElement {
-        let on_accent = rgba(pal.on_accent, 1.0);
-        let hover = rgba(pal.accent.mix(pal.ink, 0.18), 1.0);
+        let wash = rgba(pal.wash, 1.0);
         div()
             .id("add-device")
             .debug_selector(|| "add-device".to_string())
-            .ml(px(8.0))
-            .h(px(26.0))
+            .h(px(ui::CTL_H))
             .px(px(12.0))
             .flex()
             .flex_none()
             .items_center()
-            .rounded_full()
-            .bg(rgba(pal.accent, 1.0))
+            .gap(px(6.0))
+            .rounded(px(ui::RAD_CTL))
+            .border_1()
+            .border_color(rgba(pal.hair, 1.0))
+            .bg(rgba(pal.surface, 1.0))
             .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .child(txt("+ 添加设备", 12.5, on_accent).font_weight(FontWeight::SEMIBOLD))
+            .hover(move |s| s.bg(wash))
+            .child(txt("+", 14.0, rgba(pal.muted, 1.0)))
+            .child(txt("添加设备", 12.5, rgba(pal.ink, 1.0)).font_weight(FontWeight::MEDIUM))
             .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
                 window.focus(&this.focus);
                 this.open_pair_modal();
@@ -553,22 +548,26 @@ impl Proto {
             ChipKind::Problem => (rgba(pal.warn, 1.0), false),
             ChipKind::Off => (rgba(pal.muted, 0.8), true),
         };
+        let (bg, border) = match kind {
+            ChipKind::Shared => (rgba(pal.green, 0.08), rgba(pal.green, 0.30)),
+            ChipKind::Off => (rgba(pal.surface, 0.0), rgba(pal.hair, 1.0)),
+            ChipKind::Starting | ChipKind::Problem => (rgba(pal.surface, 1.0), rgba(pal.hair, 1.0)),
+        };
         let wash = rgba(pal.wash, 1.0);
         Some(
             div()
                 .id("host-chip")
                 .debug_selector(|| "host-chip".to_string())
-                .ml(px(8.0))
-                .h(px(26.0))
-                .px(px(10.0))
+                .h(px(ui::CTL_H))
+                .px(px(11.0))
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap(px(7.0))
-                .rounded_full()
+                .rounded(px(ui::RAD_CTL))
                 .border_1()
-                .border_color(rgba(pal.hair, 1.0))
-                .bg(rgba(pal.canvas, 1.0))
+                .border_color(border)
+                .bg(bg)
                 .cursor_pointer()
                 .hover(move |s| s.bg(wash))
                 .child(if hollow {
@@ -580,7 +579,14 @@ impl Proto {
                 } else {
                     div().size(px(6.0)).rounded_full().bg(dot)
                 })
-                .when(wide, |d| d.child(mtxt(label, 11.0, rgba(pal.muted, 1.0))))
+                .when(wide, |d| {
+                    let fg = if kind == ChipKind::Shared {
+                        rgba(pal.ink, 0.85)
+                    } else {
+                        rgba(pal.muted, 1.0)
+                    };
+                    d.child(txt(label, 12.0, fg))
+                })
                 .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
                     window.focus(&this.focus);
                     this.set_host_enabled(!this.stored.host_enabled);
@@ -633,30 +639,29 @@ impl Proto {
                 .items_center()
                 .gap(px(10.0))
                 .py(px(16.0))
-                .rounded(px(8.0))
+                .rounded(px(ui::RAD_CTL))
                 .border_1()
                 .border_color(rgba(pal.hair, 1.0))
                 .bg(rgba(pal.canvas, 1.0))
                 .child(big)
                 .child(
                     div()
-                        .h(px(22.0))
-                        .px(px(10.0))
+                        .h(px(ui::TAG_H))
+                        .px(px(8.0))
                         .flex()
                         .items_center()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(badge_col)
+                        .rounded(px(ui::RAD_INNER))
+                        .bg(badge_col.opacity(0.10))
                         .child(txt(badge_text, 11.0, badge_col)),
                 )
                 .into_any_element(),
             div()
-                .h(px(34.0))
+                .h(px(ui::FIELD_H))
                 .px(px(10.0))
                 .flex()
                 .items_center()
                 .overflow_hidden()
-                .rounded(px(5.0))
+                .rounded(px(ui::RAD_FIELD))
                 .bg(rgba(pal.wash, 1.0))
                 .child(
                     mtxt(
@@ -744,10 +749,10 @@ impl Proto {
                         div()
                             .id("pair-close")
                             .px(px(8.0))
-                            .h(px(22.0))
+                            .h(px(ui::MINI_H))
                             .flex()
                             .items_center()
-                            .rounded(px(4.0))
+                            .rounded(px(ui::RAD_INNER))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgba(pal.wash, 1.0)))
                             .child(mtxt("Esc", 10.0, muted))
