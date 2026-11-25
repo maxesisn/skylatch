@@ -47,7 +47,7 @@ enum class HudOverlay { None, Lost, Reconnecting };
 
 // The performance readout steps hidden -> card -> strip -> hidden.
 enum class PerfMode { Hidden, Card, Strip };
-enum class PerfPath { Direct, Relay, Unknown }; // Unknown: the core picked the path and does not report it.
+enum class PerfPath { Direct, Relay, Unknown }; // Unknown: no connection yet.
 enum class PerfAudio { Off, Muted, On };
 // One refresh of the readout: averages over the last second of the session.
 struct PerfReadout {

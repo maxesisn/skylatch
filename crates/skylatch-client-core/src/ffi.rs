@@ -1,6 +1,8 @@
 //! C ABI for native viewers. See `include/skylatch_client_core.h` for the public contract.
 
-use crate::{session::Connection, ClientError, Event, MonitorInfo, SendError, SessionClient};
+use crate::{
+    session::Connection, ClientError, Event, MonitorInfo, SendError, SessionClient, TransportMode,
+};
 use skylatch_proto::nsl1::{self, Cursor, Header, Nsl1Error, INPUT_SIZE};
 use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
@@ -41,6 +43,10 @@ pub const SKYLATCH_ERR_UNSUPPORTED: c_int = -13;
 pub const SKYLATCH_INPUT_ACCEPTED: u8 = 0;
 pub const SKYLATCH_INPUT_INVALID: u8 = 1;
 pub const SKYLATCH_INPUT_UNSUPPORTED: u8 = 2;
+
+pub const SKYLATCH_TRANSPORT_UNKNOWN: u8 = 0;
+pub const SKYLATCH_TRANSPORT_DIRECT: u8 = 1;
+pub const SKYLATCH_TRANSPORT_RELAY: u8 = 2;
 
 static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -289,6 +295,7 @@ impl ForeignCallbacks {
 /// Opaque owner of a connected session and its worker thread.
 pub struct SkylatchClient {
     session: SessionClient,
+    mode: TransportMode,
     worker: JoinHandle<()>,
     sl1: Arc<Sl1Dispatch>,
     audio_callback: bool,
@@ -305,7 +312,7 @@ fn start_worker(
     callbacks: ForeignCallbacks,
 ) -> Result<SkylatchClient, String> {
     let audio_callback = callbacks.table.on_audio_pcm.is_some();
-    let (ready, status) = mpsc::sync_channel::<Result<SessionClient, String>>(0);
+    let (ready, status) = mpsc::sync_channel::<Result<(SessionClient, TransportMode), String>>(0);
     let sl1 = Arc::new(Sl1Dispatch::default());
     let worker_sl1 = sl1.clone();
     let worker = thread::Builder::new()
@@ -321,11 +328,12 @@ fn start_worker(
             rt.block_on(async move {
                 match open.await {
                     Ok(connection) => {
+                        let mode = connection.transport_mode();
                         let dispatch = worker_sl1.clone();
                         let (client, pump) = connection.start(audio_callback, move |event| {
                             callbacks.dispatch(event, &dispatch)
                         });
-                        if ready.send(Ok(client)).is_ok() {
+                        if ready.send(Ok((client, mode))).is_ok() {
                             tokio::pin!(pump);
                             loop {
                                 tokio::select! {
@@ -345,9 +353,10 @@ fn start_worker(
         })
         .map_err(|e| e.to_string())?;
     let error = match status.recv() {
-        Ok(Ok(session)) => {
+        Ok(Ok((session, mode))) => {
             return Ok(SkylatchClient {
                 session,
+                mode,
                 worker,
                 sl1,
                 audio_callback,
@@ -673,6 +682,19 @@ pub unsafe extern "C" fn skylatch_set_audio_enabled(
     }
     client.session.set_audio_enabled(enabled != 0);
     SKYLATCH_OK
+}
+
+/// Returns the path the session settled on: a `SKYLATCH_TRANSPORT_*` value, unknown for null.
+///
+/// # Safety
+/// `client` must be null or a live handle not concurrently being destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn skylatch_transport_mode(client: *const SkylatchClient) -> u8 {
+    match unsafe { client.as_ref() }.map(|client| client.mode) {
+        None => SKYLATCH_TRANSPORT_UNKNOWN,
+        Some(TransportMode::Direct) => SKYLATCH_TRANSPORT_DIRECT,
+        Some(TransportMode::Relay) => SKYLATCH_TRANSPORT_RELAY,
+    }
 }
 
 /// Disconnect, wait for the worker to stop, and free the handle.

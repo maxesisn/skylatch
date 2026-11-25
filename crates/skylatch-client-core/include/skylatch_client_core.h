@@ -57,6 +57,10 @@ typedef struct SkylatchSl1Callbacks {
 #define SKYLATCH_INPUT_INVALID 1
 #define SKYLATCH_INPUT_UNSUPPORTED 2
 
+#define SKYLATCH_TRANSPORT_UNKNOWN 0
+#define SKYLATCH_TRANSPORT_DIRECT 1
+#define SKYLATCH_TRANSPORT_RELAY 2
+
 /* Numeric NSL1 wire version. The separate library version string is static. */
 uint32_t skylatch_proto_version(void);
 const char *skylatch_version_string(void);
@@ -101,6 +105,10 @@ SkylatchClient *skylatch_connect_direct(const char *ws_url, const char *token_or
 int32_t skylatch_send_ack(SkylatchClient *client, uint32_t generation,
                           uint32_t sequence, uint32_t viewer_wait_us);
 int32_t skylatch_send_input(SkylatchClient *client, const uint8_t record[16]);
+
+/* Read-only: the path the session settled on after connecting, a
+ * SKYLATCH_TRANSPORT_* value. NULL returns SKYLATCH_TRANSPORT_UNKNOWN. */
+uint8_t skylatch_transport_mode(const SkylatchClient *client);
 
 /* Register, replace, or clear (callbacks == NULL) the separate SL1 callbacks.
  * The table is copied; payloads are borrowed, length-delimited UTF-8, not
