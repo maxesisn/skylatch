@@ -9,7 +9,9 @@
 //! back over a channel that the UI drains. Saving a layout runs on its own short-lived thread
 //! ([`save_layout`]).
 
-use skylatch_client_core::{ClientError, WorkspaceLayout, get_layout, list_devices, put_layout};
+use skylatch_client_core::{
+    ClientError, WorkspaceLayout, delete_device, get_layout, list_devices, put_layout,
+};
 use skylatch_proto::control::DeviceInfo;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -201,6 +203,26 @@ pub fn save_layout(
         put_layout(&url, &token, &layout)
             .await
             .map_err(|e| describe_error(&e))
+    })
+}
+
+/// Forgets an offline device on the hub (`DELETE /api/v1/devices/:id`) in the background. A
+/// record that is already gone counts as removed.
+pub fn remove_device(hub_url: &str, token: &str, device_id: &str) -> Receiver<Result<(), String>> {
+    let (url, token, id) = (
+        hub_url.to_string(),
+        token.to_string(),
+        device_id.to_string(),
+    );
+    run_async(async move {
+        match delete_device(&url, &token, &id).await {
+            Ok(()) => Ok(()),
+            Err(ClientError::Hub { code, .. }) if code == "404" => Ok(()),
+            Err(ClientError::Hub { code, .. }) if code == "409" => {
+                Err("设备已重新上线，无需移除".to_string())
+            }
+            Err(e) => Err(describe_error(&e)),
+        }
     })
 }
 

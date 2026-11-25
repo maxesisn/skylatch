@@ -15,8 +15,10 @@ mod mark;
 mod onboard;
 mod onboard_view;
 mod scene;
+mod seen;
 mod theme;
 mod tray;
+mod update;
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -30,7 +32,7 @@ use gpui::{
     EntityInputHandler, FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, TitlebarOptions, UTF16Selection, Window, WindowBounds,
-    WindowControlArea, WindowOptions, canvas, div, fill, point, px, size,
+    WindowControlArea, WindowOptions, canvas, div, fill, point, px, relative, size,
 };
 use skylatch_proto::control::DeviceInfo;
 use skylatch_proto::layout::{FurnitureKind, WorkspaceLayout};
@@ -41,7 +43,9 @@ use iso::*;
 use live::{HubTarget, LiveHandle};
 use onboard::{Code, HubSubmit, OnbField, Onboarding, Pairing, Tab};
 use scene::*;
+use skylatch_client_core::updater::CheckOptions;
 use theme::{Pal, Rgb};
+use update::{Capsule, UpdateUiState, Updater};
 
 pub const DOT_STEP: f32 = 22.0;
 
@@ -117,8 +121,9 @@ OPTIONS
         --dark         Start in Dark Mode (default: Light)
         --shelf        Start in Shelf view (default: Isometric desk)
 
-With a hub URL and token the window lists the online devices (refreshed every 10 s). The
-same settings can be typed into the in-window Hub drawer (click the Hub pill, or press H).
+With a hub URL and token the window lists the hub's devices (refreshed every 10 s); offline
+ones keep their seat, drawn faintly, until their record is removed. The same settings can be
+typed into the in-window Hub drawer (click the Hub pill, or press H).
 Without them the first-run screen offers to sign in to a hub (password or account token) or
 to connect to one host directly, and shows an empty L-shaped desk until a device appears.
 While signed in, `+ Add device` shows a one-time pairing code for `skylatch-agent join`.
@@ -151,6 +156,8 @@ ENVIRONMENT
     SKYLATCH_HUB, SKYLATCH_TOKEN   hub URL and token (override the saved settings)
     SKYLATCH_CLIENT                path of the native client (default: next to this program,
                                    or clients/<os>/skylatch-client in a source checkout)
+    SKYLATCH_DISABLE_AUTO_UPDATE=1 skip the quiet update check a few seconds after start-up
+                                   (the Hub drawer can still check by hand)
 
 CONFIGURATION
     Saved settings live in a JSON file in the per-user config directory
@@ -639,7 +646,11 @@ fn paint_stage(window: &mut Window, bounds: Bounds<Pixels>, d: &PaintData) {
         let pts: Vec<Point<Pixels>> = sg.bezel.iter().map(|&p| map_items(p)).collect();
         let glass: Vec<Point<Pixels>> = sg.glass.iter().map(|&p| map_items(p)).collect();
         let virt = d.scenes.devices[sg.dev].form == Form::Vm && !sg.blade;
-        let dash = if virt { Some((4.0, 3.5)) } else { None };
+        let dash = if virt || is_offline(d.scenes.devices[sg.dev].link) {
+            Some((4.0, 3.5))
+        } else {
+            None
+        };
         let extra: Vec<Point<Pixels>> = sg.extra.iter().map(|&p| map_items(p)).collect();
         let outline: Vec<Point<Pixels>> = if sg.blade {
             sg.hit.iter().map(|&p| map_items(p)).collect()
@@ -812,6 +823,11 @@ fn paint_mark(window: &mut Window, b: Bounds<Pixels>, pal: &Pal) {
 
 // ───────────────────────────── app state ─────────────────────────────
 
+/// Devices the hub can reach right now (the list also holds offline ones).
+fn online_count(devs: &[DeviceInfo]) -> usize {
+    devs.iter().filter(|d| d.online).count()
+}
+
 /// Where the device list comes from and how the last attempt went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HubState {
@@ -821,6 +837,7 @@ enum HubState {
     Unconfigured,
     Connecting,
     Online {
+        /// devices that are online; offline ones are listed too but not counted
         count: usize,
     },
     Failed(String),
@@ -856,7 +873,7 @@ struct Drawer {
 
 const DRAWER_X: f32 = 150.0;
 const DRAWER_W: f32 = 448.0;
-const DRAWER_H: f32 = 352.0;
+const DRAWER_H: f32 = 398.0;
 const MAX_URL_LEN: usize = 256;
 const MAX_TOKEN_LEN: usize = 512;
 /// How long the copy button shows "已复制".
@@ -991,7 +1008,22 @@ struct Proto {
     /// Composition text of an input method (preedit) and the box it belongs to. It is shown
     /// underlined behind the typed text and only becomes text when the method commits it.
     marked: Option<(Target, String)>,
+    /// Self-update: the header capsule and the drawer's check.
+    updater: Updater,
+    update_options: CheckOptions,
+    /// An offline device record on its way out of the hub.
+    removing: Option<Removal>,
 }
+
+/// `DELETE /api/v1/devices/:id` in flight for the selected offline machine.
+struct Removal {
+    machine_id: String,
+    title: String,
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+}
+
+/// How long [`Proto::pause_agent`] waits for the agent to stop before an update hand-off.
+const AGENT_STOP_WAIT: Duration = Duration::from_secs(8);
 
 /// What the shell around the view has to do after a tray action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1089,6 +1121,9 @@ impl Proto {
             local_id: None,
             agent_json: None,
             marked: None,
+            updater: Updater::default(),
+            update_options: CheckOptions::default(),
+            removing: None,
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -1108,6 +1143,184 @@ impl Proto {
         }
         self.sync_host();
         self.refresh_local_id();
+        if update::auto_check_enabled(&config::process_env) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(update::AUTO_CHECK_DELAY)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.check_update(true);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    // ───────────── self-update ─────────────
+
+    /// Looks for a newer release in the background. A quiet check never shows a failure.
+    fn check_update(&mut self, silent: bool) {
+        if self.updater.begin_check(silent) {
+            update::spawn_check(self.update_options.clone(), self.updater.listen());
+        }
+        self.kick();
+    }
+
+    /// The header capsule: download, restart into the new build, copy the install command, or
+    /// try again.
+    fn update_action(&mut self, cx: &mut Context<Self>) {
+        match self.updater.state.clone() {
+            UpdateUiState::Available(_) => {
+                self.start_download();
+            }
+            UpdateUiState::Failed { .. } => {
+                if !self.start_download() {
+                    self.check_update(false);
+                }
+            }
+            UpdateUiState::ReadyToApply(_) => self.apply_update(),
+            UpdateUiState::ManualInstall { command_hint, .. } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(command_hint.clone()));
+                self.say(format!("已复制安装命令：{command_hint}"), false);
+            }
+            UpdateUiState::Idle | UpdateUiState::Checking | UpdateUiState::Downloading { .. } => {}
+        }
+        self.kick();
+    }
+
+    fn start_download(&mut self) -> bool {
+        let Some(release) = self.updater.begin_download() else {
+            return false;
+        };
+        update::spawn_download(release, self.updater.listen());
+        true
+    }
+
+    /// Stops the local agent, then hands over to the verified package.
+    fn apply_update(&mut self) {
+        let Some(package) = self.updater.begin_apply() else {
+            return;
+        };
+        let host = self.host.clone();
+        update::spawn_apply(
+            package,
+            move || {
+                if let Some(host) = host {
+                    Proto::pause_agent(&host);
+                }
+            },
+            self.updater.listen(),
+        );
+    }
+
+    /// Stops the agent but keeps its supervisor, so a failed hand-off can start it again.
+    fn pause_agent(host: &HostManager) {
+        host.configure(false, None, None);
+        let deadline = Instant::now() + AGENT_STOP_WAIT;
+        while host.status() != HostStatus::Off && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Applies what the update workers reported. A finished hand-off quits the app so the new
+    /// build can take its place.
+    fn pump_update(&mut self, cx: &mut Context<Self>) {
+        let applying = self.updater.applying;
+        let failed = matches!(self.updater.state, UpdateUiState::Failed { .. });
+        if !self.updater.pump() {
+            return;
+        }
+        if self.updater.restart {
+            QUITTING.store(true, Ordering::SeqCst);
+            self.shutdown_host();
+            cx.quit();
+            return;
+        }
+        if applying && !self.updater.applying {
+            self.sync_host();
+        }
+        if let UpdateUiState::Failed { message, .. } = &self.updater.state
+            && !failed
+        {
+            let text = format!("更新失败：{message}");
+            self.say(text, true);
+        }
+        self.kick();
+        cx.notify();
+    }
+
+    // ───────────── offline device records ─────────────
+
+    /// The footer offers to forget the selected machine: it is offline and a hub is signed in.
+    fn offers_removal(&self) -> bool {
+        self.eff.live()
+            && self
+                .sel
+                .is_some_and(|s| is_offline(self.scenes.devices[s].link))
+    }
+
+    /// Asks the hub to forget the selected offline machine.
+    fn remove_offline(&mut self) {
+        let Some(d) = self.sel.map(|s| &self.scenes.devices[s]) else {
+            return;
+        };
+        if !self.offers_removal() || self.removing.is_some() {
+            return;
+        }
+        let (machine_id, title) = (d.machine_id.clone(), d.title.clone());
+        let t = self.live_target();
+        let rx = live::remove_device(&t.url, &t.token, &machine_id);
+        self.removing = Some(Removal {
+            machine_id,
+            title,
+            rx,
+        });
+        self.kick();
+    }
+
+    /// Where the selection goes when `machine` leaves the desk: the nearest other screen of
+    /// the current view, an online one if there is any.
+    fn neighbor_key(&self, machine: &str) -> Option<String> {
+        let nav = self.nav();
+        let devs = &self.scenes.devices;
+        let at = self
+            .sel
+            .and_then(|s| nav.iter().position(|&d| d == s))
+            .unwrap_or(0);
+        let order: Vec<usize> = (1..=nav.len())
+            .flat_map(|k| [at.checked_add(k), at.checked_sub(k)])
+            .flatten()
+            .filter_map(|i| nav.get(i).copied())
+            .filter(|&d| devs[d].machine_id != machine)
+            .collect();
+        order
+            .iter()
+            .find(|&&d| !is_offline(devs[d].link))
+            .or(order.first())
+            .map(|&d| devs[d].key.clone())
+    }
+
+    fn finish_removal(&mut self, removal: Removal, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                let next = self.neighbor_key(&removal.machine_id);
+                self.devices.retain(|d| d.device_id != removal.machine_id);
+                self.rebuild_scenes(false);
+                if let Some(i) = next.and_then(|k| self.scenes.find(&k)) {
+                    self.select(i);
+                }
+                if let HubState::Online { count } = &mut self.hub {
+                    *count = online_count(&self.devices);
+                }
+                if let Some(h) = &self.live {
+                    h.refresh();
+                }
+                self.say(format!("已移除 {} 的离线记录", removal.title), false);
+            }
+            Err(e) => self.say(format!("无法移除 {}：{e}", removal.title), true),
+        }
+        self.kick();
     }
 
     // ───────────── hosting this machine, tray ─────────────
@@ -1437,8 +1650,7 @@ impl Proto {
 
     /// Applies a device list and, when given, the arrangement fetched with it. A fetched
     /// arrangement is ignored while one of ours is still on its way to the hub or being dragged.
-    fn apply_state(&mut self, mut devs: Vec<DeviceInfo>, layout: Option<WorkspaceLayout>) {
-        devs.retain(|d| d.online);
+    fn apply_state(&mut self, devs: Vec<DeviceInfo>, layout: Option<WorkspaceLayout>) {
         let local_changed = self.refresh_local_id();
         let layout_changed = layout.is_some_and(|l| {
             let busy = self.save.inflight.is_some() || self.save.dirty || self.drag.is_some();
@@ -1494,9 +1706,11 @@ impl Proto {
                     let Ok(busy) = this.update(cx, |this, cx| {
                         this.pump_live(cx);
                         this.pump_tasks(cx);
+                        this.pump_update(cx);
                         this.onb.login.is_some()
                             || this.pair.pending.is_some()
                             || this.save.inflight.is_some()
+                            || this.removing.is_some()
                     }) else {
                         break;
                     };
@@ -1521,7 +1735,7 @@ impl Proto {
         for r in results {
             match r.devices {
                 Ok(devs) => {
-                    let count = devs.len();
+                    let count = online_count(&devs);
                     self.apply_state(devs, r.layout);
                     self.hub = HubState::Online { count };
                 }
@@ -1535,6 +1749,7 @@ impl Proto {
     /// An empty hub gets its first pairing code without a click.
     fn maybe_first_code(&mut self) {
         if matches!(self.hub, HubState::Online { count: 0 })
+            && self.devices.is_empty()
             && self.pair.code.is_none()
             && !self.pair.busy
             && self.pair.error.is_none()
@@ -2061,6 +2276,21 @@ impl Proto {
             changed = true;
         }
 
+        let removed = self.removing.as_ref().map(|r| r.rx.try_recv());
+        match removed {
+            Some(Ok(result)) => {
+                let removal = self.removing.take().expect("removal in flight");
+                self.finish_removal(removal, result);
+                changed = true;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                let removal = self.removing.take().expect("removal in flight");
+                self.finish_removal(removal, Err("请求未能完成，请重试".into()));
+                changed = true;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
         // local agent: repaint the chip and tell the user about problems once per change
         let host_now = self.host_status();
         if host_now != self.host_seen {
@@ -2133,6 +2363,11 @@ impl Proto {
             self.kick();
             return;
         }
+        if is_offline(link) {
+            self.say(format!("{title} 当前离线，上线后才能接管"), false);
+            self.kick();
+            return;
+        }
         if self.edit {
             self.say("整理工位中，点「完成」后再接管", false);
             self.kick();
@@ -2151,11 +2386,6 @@ impl Proto {
                 ),
                 Err(e) => self.say(format!("门闩已扣合，{e}"), true),
             }
-        } else if link == Link::Offline {
-            self.say(
-                format!("门闩已扣合，{title} 当前离线，已排队，上线后自动接管"),
-                false,
-            );
         } else {
             self.say(format!("门闩已扣合，正在接管 {title}（演示模式）"), false);
         }
@@ -3415,6 +3645,128 @@ impl Proto {
             .into_any_element()
     }
 
+    /// The one-click update capsule of the header; nothing at all while idle or checking.
+    fn update_capsule(&self, pal: &Pal, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let capsule = self.updater.capsule()?;
+        let accent = rgba(pal.accent, 1.0);
+        let warn = rgba(pal.warn, 1.0);
+        let on_accent = rgba(pal.on_accent, 1.0);
+        let base = div()
+            .id("update-capsule")
+            .debug_selector(|| "update-capsule".to_string())
+            .relative()
+            .h(px(26.0))
+            .px(px(12.0))
+            .mr(px(10.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .rounded_full()
+            .border_1()
+            .overflow_hidden();
+        let el = match capsule {
+            Capsule::Offer(text) | Capsule::Install(text) => base
+                .border_color(accent)
+                .bg(rgba(pal.accent, 0.08))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(pal.accent, 0.16)))
+                .child(div().size(px(6.0)).rounded_full().bg(accent))
+                .child(txt(text, 11.5, accent).font_weight(FontWeight::MEDIUM)),
+            Capsule::Progress { text, frac } => base
+                .border_color(rgba(pal.accent, 0.5))
+                .bg(rgba(pal.accent, 0.05))
+                .child(mtxt(text, 11.0, accent))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom_0()
+                        .h(px(2.0))
+                        .w(relative(frac.unwrap_or(1.0)))
+                        .bg(rgba(pal.accent, if frac.is_some() { 1.0 } else { 0.35 })),
+                ),
+            Capsule::Restart { text, busy } => base
+                .border_color(accent)
+                .bg(accent)
+                .when(!busy, |d| {
+                    d.cursor_pointer()
+                        .hover(move |s| s.bg(rgba(pal.accent.mix(pal.ink, 0.18), 1.0)))
+                })
+                .opacity(if busy { 0.7 } else { 1.0 })
+                .child(txt(text, 11.5, on_accent).font_weight(FontWeight::SEMIBOLD)),
+            Capsule::Retry => base
+                .border_color(warn)
+                .bg(rgba(pal.warn, 0.08))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(pal.warn, 0.16)))
+                .child(txt("更新失败", 11.5, warn).font_weight(FontWeight::MEDIUM))
+                .child(txt("点此重试", 11.0, rgba(pal.warn, 0.75))),
+        };
+        Some(
+            el.on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                this.update_action(cx);
+                cx.notify();
+            }))
+            .into_any_element(),
+        )
+    }
+
+    /// The drawer's last row: this build's version, the manual check and how it went.
+    fn version_row(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = rgba(pal.muted, 1.0);
+        let can = self.updater.can_check();
+        let status = self.updater.status_line();
+        let failed = self.updater.status_is_error();
+        div()
+            .id("drawer-version")
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(rgba(pal.hair, 1.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(txt("版本", 11.0, muted))
+            .child(mtxt(
+                format!("v{}", skylatch_client_core::updater::current_version()),
+                11.5,
+                rgba(pal.ink, 1.0),
+            ))
+            .child(
+                div()
+                    .id("drawer-check-update")
+                    .debug_selector(|| "drawer-check-update".to_string())
+                    .h(px(24.0))
+                    .px(px(10.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgba(pal.hair, 1.0))
+                    .opacity(if can { 1.0 } else { 0.5 })
+                    .when(can, |d| {
+                        d.cursor_pointer().hover(|s| s.bg(rgba(pal.wash, 1.0)))
+                    })
+                    .child(txt("检查更新", 11.5, rgba(pal.ink, 1.0)))
+                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                        this.check_update(false);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                    txt(
+                        clip(&status, 30),
+                        11.0,
+                        if failed { rgba(pal.warn, 1.0) } else { muted },
+                    )
+                    .text_ellipsis(),
+                ),
+            )
+            .into_any_element()
+    }
+
     /// (dot colour, hollow, host, status) of the Hub pill.
     fn hub_pill(&self, pal: &Pal) -> (Hsla, bool, Option<String>, String) {
         let host = Some(config::hub_host(&self.eff.hub_url));
@@ -3699,6 +4051,7 @@ impl Proto {
                 pal,
             ))
             .child(txt("设置保存在本机用户配置目录", 10.5, muted))
+            .child(self.version_row(pal, cx))
             .into_any_element()
     }
 }
@@ -3878,6 +4231,7 @@ impl Render for Proto {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
+            .children(self.update_capsule(&pal, cx))
             .children(self.can_arrange().then(|| self.arrange_button(&pal, cx)))
             .child(
                 div()
@@ -4169,7 +4523,12 @@ impl Render for Proto {
         for lb in &labels {
             let d = &scenes.devices[lb.dev];
             let t = self.hover_t[lb.dev].max(self.sel_t[lb.dev]);
-            let col = rgba(pal.muted.mix(pal.ink, t), 1.0);
+            let offline = is_offline(d.link);
+            let col = if offline {
+                rgba(pal.muted, 0.6 + 0.4 * t)
+            } else {
+                rgba(pal.muted.mix(pal.ink, t), 1.0)
+            };
             let line = rgba(pal.hair.mix(pal.accent, t), 1.0);
             let dot_c = rgba(pal.role(link_role(d.link)), 1.0);
             let dot = if link_hollow(d.link) {
@@ -4222,7 +4581,9 @@ impl Render for Proto {
                     )
                     .into_any_element(),
             );
-            if let (Some((r, text)), true) = (&lb.detail, t > 0.01) {
+            // an offline machine always says so, and since when
+            let detail_a = if offline { t.max(0.75) } else { t };
+            if let (Some((r, text)), true) = (&lb.detail, detail_a > 0.01) {
                 // resolution and route: two runs of text, the gap between them is the separator
                 let mut parts = text.splitn(2, DETAIL_SEP);
                 let (res, route) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
@@ -4237,7 +4598,7 @@ impl Render for Proto {
                         .items_center()
                         .justify_center()
                         .gap(px(6.0))
-                        .opacity(t * item_a)
+                        .opacity(detail_a * item_a)
                         .child(mtxt(res.to_string(), DETAIL_SIZE, muted))
                         .child(mtxt(route.to_string(), DETAIL_SIZE, rgba(pal.muted, 0.75)))
                         .into_any_element(),
@@ -4482,6 +4843,19 @@ impl Render for Proto {
                             .text_ellipsis(),
                     )
             }
+            (None, Some(d)) if is_offline(d.link) => {
+                // the state and since when: the gap and the weights tell them apart
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(18.0))
+                    .child(txt(link_txt.clone(), 12.5, muted).font_weight(FontWeight::MEDIUM))
+                    .children(
+                        Some(last_seen_phrase(d))
+                            .filter(|p| !p.is_empty())
+                            .map(|p| txt(p, 12.0, rgba(pal.muted, 0.8))),
+                    )
+            }
             (None, Some(d)) => {
                 // resolution, route, capture: the gaps and the weights tell them apart
                 div()
@@ -4504,6 +4878,7 @@ impl Render for Proto {
                 muted,
             )),
         };
+        let sel_offline = dev.is_some_and(|d| is_offline(d.link));
         let led = if link_hollow_ {
             div()
                 .size(px(9.0))
@@ -4562,7 +4937,11 @@ impl Render for Proto {
                             dev.map(|d| d.title.clone())
                                 .unwrap_or_else(|| "未选择设备".into()),
                             16.0,
-                            ink,
+                            if sel_offline {
+                                rgba(pal.ink, 0.55)
+                            } else {
+                                ink
+                            },
                         )
                         .font_weight(FontWeight::SEMIBOLD),
                     )
@@ -4635,33 +5014,33 @@ impl Render for Proto {
         let btn_hover = rgba(pal.accent.mix(pal.ink, 0.18), 1.0);
         // the machine the launcher runs on is never taken over from itself
         let is_local = dev.is_some_and(|d| d.is_local);
-        let enabled = self.sel.is_some() && !is_local;
+        // an offline machine cannot be taken over either: a muted, inert button says why
+        let inert = is_local || sel_offline;
+        let enabled = self.sel.is_some() && !inert;
         let button = div()
             .id("connect")
             .debug_selector(|| "connect".to_string())
             .h(px(40.0))
             .pl(px(20.0))
-            .pr(px(if is_local { 20.0 } else { 12.0 }))
+            .pr(px(if inert { 20.0 } else { 12.0 }))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(12.0))
             .rounded(px(6.0))
-            .bg(if is_local {
-                rgba(pal.wash, 1.0)
-            } else {
-                accent
-            })
+            .bg(if inert { rgba(pal.wash, 1.0) } else { accent })
             .opacity(if self.sel.is_some() { 1.0 } else { 0.4 })
             .when(enabled, |d| {
                 d.cursor_pointer().hover(move |s| s.bg(btn_hover))
             })
             .child(if is_local {
                 txt("当前设备", 14.0, muted).font_weight(FontWeight::SEMIBOLD)
+            } else if sel_offline {
+                txt("设备离线", 14.0, rgba(pal.muted, 0.8)).font_weight(FontWeight::SEMIBOLD)
             } else {
                 txt("接管屏幕", 14.0, on_accent).font_weight(FontWeight::SEMIBOLD)
             })
-            .children((!is_local).then(|| {
+            .children((!inert).then(|| {
                 div()
                     .h(px(20.0))
                     .px(px(6.0))
@@ -4675,6 +5054,37 @@ impl Render for Proto {
                 this.connect();
                 cx.notify();
             }));
+        let removing = self.removing.is_some();
+        let remove_button = self.offers_removal().then(|| {
+            div()
+                .id("remove-offline")
+                .debug_selector(|| "remove-offline".to_string())
+                .h(px(32.0))
+                .px(px(12.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(hair)
+                .when(!removing, |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(rgba(pal.wash, 1.0)).border_color(rgba(pal.warn, 0.6)))
+                })
+                .child(txt(
+                    if removing {
+                        "正在移除…"
+                    } else {
+                        "移除离线记录"
+                    },
+                    12.5,
+                    muted,
+                ))
+                .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                    this.remove_offline();
+                    cx.notify();
+                }))
+        });
 
         let progress = self.connect_at.map(|t0| {
             let e = t0.elapsed().as_secs_f32();
@@ -4705,7 +5115,15 @@ impl Render for Proto {
             .border_color(hair)
             .child(info)
             .child(chips)
-            .child(button)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(12.0))
+                    .children(remove_button)
+                    .child(button),
+            )
             .children(progress);
 
         div()
@@ -5176,6 +5594,357 @@ mod ui_tests {
         ]
     }
 
+    /// `fleet()` with the ThinkPad and one VM offline since `seen`.
+    fn fleet_with_offline(seen: u64) -> Vec<DeviceInfo> {
+        let mut devs = fleet();
+        for d in devs.iter_mut() {
+            if d.device_id == "tp" || d.device_id == "vm3" {
+                d.online = false;
+                d.last_seen_unix = Some(seen);
+            }
+        }
+        devs
+    }
+
+    fn text_of(view: &gpui::Entity<Proto>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |v, _| v.banner.as_ref().map(|b| b.text.clone()))
+    }
+
+    #[gpui::test]
+    fn offline_machines_stay_on_the_desk_and_are_counted_apart(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        let seen = seen::now_unix() - 5 * 3600 - 60;
+        let devs = fleet_with_offline(seen);
+        assert_eq!(online_count(&devs), 6);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online {
+                count: online_count(&devs),
+            };
+            v.apply_devices(devs);
+        });
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            let pal = v.pal();
+            assert_eq!(
+                v.hub_pill(&pal).3,
+                "6 台在线",
+                "offline machines are not counted"
+            );
+            assert_eq!(v.devices.len(), 8, "but they are all listed");
+            let tp = v
+                .scenes
+                .find("tp#d1")
+                .expect("the offline laptop is on the desk");
+            assert!(is_offline(v.scenes.devices[tp].link));
+            assert!(v.scenes.find("vm3#d1").is_some());
+        });
+        // same seats as when everything was online
+        let seats = |sc: &Scenes| {
+            sc.desks
+                .iter()
+                .map(|d| {
+                    let keys: Vec<String> =
+                        d.devs.iter().map(|&i| sc.devices[i].key.clone()).collect();
+                    (d.name.clone(), keys)
+                })
+                .collect::<Vec<_>>()
+        };
+        let online = seats(&build_scene_with_layout(&fleet(), None, None));
+        assert_eq!(view.read_with(cx, |v, _| seats(&v.scenes)), online);
+
+        // select the offline laptop: hollow lamp, state and age in the footer, no take-over
+        let tp = key(&view, cx, "tp#d1");
+        show_tab(&view, cx, "Office");
+        let p = view.read_with(cx, |v, _| screen_px(v, tp));
+        cx.simulate_click(p, Modifiers::none());
+        draw(cx);
+        assert_eq!(sel_key(&view, cx), "tp#d1");
+        assert!(has_sel(cx, "remove-offline"));
+        click_sel(cx, "connect");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_mouse_move(p, None, Modifiers::none());
+        cx.simulate_click(p, Modifiers::none());
+        cx.simulate_click(p, Modifiers::none());
+        assert!(
+            view.read_with(cx, |v, _| v.connect_at.is_none()),
+            "never taken over"
+        );
+        let msg = text_of(&view, cx).unwrap_or_default();
+        assert!(msg.contains("离线"), "{msg}");
+        // an online machine has no record to remove
+        assert!(!has_sel_after_selecting(&view, cx, "studio#d1"));
+    }
+
+    /// Selects `key` and says whether the remove-record button is shown for it.
+    fn has_sel_after_selecting(
+        view: &gpui::Entity<Proto>,
+        cx: &mut VisualTestContext,
+        k: &str,
+    ) -> bool {
+        let d = key(view, cx, k);
+        view.update(cx, |v, cx| {
+            v.select(d);
+            cx.notify();
+        });
+        draw(cx);
+        view.read_with(cx, |v, _| v.offers_removal())
+    }
+
+    #[gpui::test]
+    fn removing_an_offline_record_deletes_it_on_the_hub_and_selects_a_neighbour(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        let devs = fleet_with_offline(seen::now_unix() - 120);
+        view.update(cx, |v, _| {
+            v.hub = HubState::Online {
+                count: online_count(&devs),
+            };
+            v.apply_devices(devs);
+        });
+        show_tab(&view, cx, "Office");
+        assert!(has_sel_after_selecting(&view, cx, "vm3#d1"));
+        click_sel(cx, "remove-offline");
+        assert!(view.read_with(cx, |v, _| v.removing.is_some()));
+        // a second click while the request is out does nothing
+        click_sel(cx, "remove-offline");
+        pump_until(&view, cx, "the removal", |v| v.removing.is_none());
+        assert!(
+            hub.log()
+                .iter()
+                .any(|l| l.starts_with("DELETE /api/v1/devices/vm3 ")
+                    && l.ends_with("Bearer account-token")),
+            "{:?}",
+            hub.log()
+        );
+        assert_eq!(
+            hub.log().iter().filter(|l| l.starts_with("DELETE")).count(),
+            1
+        );
+        view.read_with(cx, |v, _| {
+            assert!(v.scenes.find("vm3#d1").is_none(), "gone from the desk");
+            assert!(v.devices.iter().all(|d| d.device_id != "vm3"));
+            let sel = v.sel.expect("a neighbour is selected");
+            let d = &v.scenes.devices[sel];
+            assert!(!is_offline(d.link), "an online neighbour: {}", d.key);
+            assert!(v.nav().contains(&sel));
+            assert_eq!(v.hub, HubState::Online { count: 6 });
+        });
+        assert!(text_of(&view, cx).unwrap_or_default().contains("已移除"));
+
+        // the hub refuses while the machine is online again: nothing is dropped locally
+        view.update(cx, |v, _| {
+            let mut devs = v.devices.clone();
+            for d in devs.iter_mut().filter(|d| d.device_id == "studio") {
+                d.online = false;
+            }
+            v.apply_devices(devs);
+        });
+        assert!(has_sel_after_selecting(&view, cx, "studio#d1"));
+        click_sel(cx, "remove-offline");
+        pump_until(&view, cx, "the refused removal", |v| v.removing.is_none());
+        assert!(view.read_with(cx, |v, _| v.scenes.find("studio#d1").is_some()));
+        let msg = text_of(&view, cx).unwrap_or_default();
+        assert!(msg.contains("重新上线"), "{msg}");
+    }
+
+    #[gpui::test]
+    fn the_remove_button_needs_a_hub(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        assert!(!has_sel_after_selecting(
+            &view,
+            cx,
+            "demo-kylin-vm#display-1"
+        ));
+        view.update(cx, |v, _| v.remove_offline());
+        assert!(view.read_with(cx, |v, _| v.removing.is_none()));
+    }
+
+    fn update_release(version: &str) -> skylatch_client_core::updater::UpdateRelease {
+        use skylatch_client_core::updater::{Asset, InstallKind, UpdateRelease};
+        let asset = |name: &str| Asset {
+            name: name.into(),
+            url: format!("http://127.0.0.1:9/{name}"),
+            size: Some(4096),
+        };
+        UpdateRelease {
+            version: version.into(),
+            kind: InstallKind::LinuxDeb,
+            package: asset("skylatch.deb"),
+            checksums: asset("SHA256SUMS"),
+        }
+    }
+
+    /// The capsule was drawn in this or an earlier frame (gpui keeps the debug bounds of
+    /// elements that disappear, so absence is checked on the state instead).
+    fn capsule_drawn(cx: &mut VisualTestContext) -> bool {
+        draw(cx);
+        cx.debug_bounds("update-capsule").is_some()
+    }
+
+    #[gpui::test]
+    fn the_update_capsule_appears_only_with_news_and_follows_the_download(cx: &mut TestAppContext) {
+        use skylatch_client_core::updater::{DownloadProgress, InstallKind, VerifiedPackage};
+        use update::Msg;
+        let (view, cx) = demo_view(cx, false, false);
+        assert!(!capsule_drawn(cx), "idle: nothing in the header");
+        view.update(cx, |v, cx| {
+            assert!(v.updater.begin_check(true));
+            cx.notify();
+        });
+        assert!(!capsule_drawn(cx), "checking: still nothing");
+
+        view.update(cx, |v, cx| {
+            v.updater
+                .on_msg(Msg::Checked(Ok(Some(update_release("0.2.0")))));
+            cx.notify();
+        });
+        assert!(capsule_drawn(cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.capsule()),
+            Some(Capsule::Offer("更新至 v0.2.0".into()))
+        );
+        // the capsule sits right before the view buttons, without pushing them off
+        let cap = cx.debug_bounds("update-capsule").unwrap();
+        assert!(cap.origin.y >= px(0.0) && cap.bottom() <= px(HEADER_H));
+
+        // a click starts the download (nothing listens there: it fails, then offers a retry)
+        click_sel(cx, "update-capsule");
+        assert!(view.read_with(cx, |v, _| matches!(
+            v.updater.state,
+            UpdateUiState::Downloading { .. }
+        )));
+        view.update(cx, |v, cx| {
+            v.updater.on_msg(Msg::Progress(DownloadProgress {
+                downloaded_bytes: 2048,
+                total_bytes: Some(4096),
+            }));
+            cx.notify();
+        });
+        assert!(capsule_drawn(cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.capsule()),
+            Some(Capsule::Progress {
+                text: "下载中 50%".into(),
+                frac: Some(0.5)
+            })
+        );
+        for _ in 0..200 {
+            view.update(cx, |v, cx| v.pump_update(cx));
+            if view.read_with(cx, |v, _| {
+                matches!(v.updater.state, UpdateUiState::Failed { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.capsule()),
+            Some(Capsule::Retry)
+        );
+        assert!(capsule_drawn(cx));
+        let msg = text_of(&view, cx).unwrap_or_default();
+        assert!(msg.starts_with("更新失败"), "{msg}");
+
+        // a verified package: restart to apply; a .deb is installed by hand with a copied command
+        view.update(cx, |v, cx| {
+            cx.notify();
+            assert!(v.updater.begin_download().is_some());
+            v.updater.on_msg(Msg::Downloaded(Ok(VerifiedPackage {
+                path: "/tmp/skylatch.deb".into(),
+                version: "0.2.0".into(),
+                kind: InstallKind::LinuxDeb,
+                sha256: "0".repeat(64),
+            })));
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.capsule()),
+            Some(Capsule::Restart {
+                text: "重启以应用 v0.2.0".into(),
+                busy: false
+            })
+        );
+        click_sel(cx, "update-capsule");
+        for _ in 0..200 {
+            view.update(cx, |v, cx| v.pump_update(cx));
+            if view.read_with(cx, |v, _| {
+                matches!(v.updater.state, UpdateUiState::ManualInstall { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.capsule()),
+            Some(Capsule::Install("安装 v0.2.0".into()))
+        );
+        click_sel(cx, "update-capsule");
+        let copied = clipboard_text(cx).unwrap_or_default();
+        assert!(copied.starts_with("sudo dpkg -i"), "{copied}");
+        assert!(
+            text_of(&view, cx)
+                .unwrap_or_default()
+                .contains("sudo dpkg -i")
+        );
+    }
+
+    #[gpui::test]
+    fn the_hub_drawer_shows_the_version_and_checks_by_hand(cx: &mut TestAppContext) {
+        use update::Msg;
+        let (view, cx) = demo_view(cx, false, false);
+        cx.simulate_keystrokes("h");
+        draw(cx);
+        assert!(has_sel(cx, "drawer-check-update"));
+        assert_eq!(view.read_with(cx, |v, _| v.updater.status_line()), "");
+        // the whole drawer, version row included, takes clicks instead of the desk
+        let row = cx.debug_bounds("drawer-check-update").unwrap();
+        assert!(view.read_with(cx, |v, _| v.in_drawer(row.center())));
+        view.update(cx, |v, _| {
+            v.update_options.api_url = Some("http://127.0.0.1:9/releases/latest".into())
+        });
+        click_sel(cx, "drawer-check-update");
+        assert!(view.read_with(cx, |v, _| matches!(
+            v.updater.state,
+            UpdateUiState::Checking
+        )));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.status_line()),
+            "正在检查更新…"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.drawer.open),
+            "the drawer stays open"
+        );
+        for _ in 0..200 {
+            view.update(cx, |v, cx| v.pump_update(cx));
+            if view.read_with(cx, |v, _| v.updater.can_check()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // a check by hand that fails says so, in the drawer and in the header
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.status_line()),
+            "更新失败：网络错误"
+        );
+        assert!(capsule_drawn(cx));
+        view.update(cx, |v, cx| {
+            assert!(v.updater.begin_check(false));
+            v.updater.on_msg(Msg::Checked(Ok(None)));
+            cx.notify();
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.updater.status_line()),
+            "已是最新版本"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.updater.capsule().is_none()),
+            "nothing new: the header stays quiet"
+        );
+    }
+
     #[gpui::test]
     fn demo_renders_and_responds(cx: &mut TestAppContext) {
         let (view, cx) = demo_view(cx, false, false);
@@ -5277,6 +6046,7 @@ mod ui_tests {
             v.banner
                 .as_ref()
                 .is_some_and(|b| b.text.contains("离线") && !b.error)
+                && v.connect_at.is_none()
         }));
 
         // refresh in demo mode explains itself
@@ -5302,6 +6072,11 @@ mod ui_tests {
         cx.simulate_keystrokes("t");
         assert!(view.read_with(cx, |v, _| v.dark));
         draw(cx);
+        // the offline blade is still selected: move on to a machine that can be taken over
+        cx.simulate_keystrokes("tab");
+        assert!(view.read_with(cx, |v, _| {
+            v.sel.is_some_and(|s| !is_offline(v.scenes.devices[s].link))
+        }));
         cx.simulate_keystrokes("enter");
         assert!(view.read_with(cx, |v, _| v.banner.is_some() && v.connect_at.is_some()));
         draw(cx);
@@ -5782,6 +6557,14 @@ mod ui_tests {
                             r#"{"version":1,"rooms":[],"placements":[]}"#.to_string()
                         });
                         ("200 OK", body)
+                    }
+                } else if first.starts_with("DELETE /api/v1/devices/") {
+                    if !auth.ends_with("Bearer account-token") {
+                        ("401 Unauthorized", String::new())
+                    } else if first.starts_with("DELETE /api/v1/devices/studio ") {
+                        ("409 Conflict", String::new())
+                    } else {
+                        ("204 No Content", String::new())
                     }
                 } else {
                     ("404 Not Found", String::new())

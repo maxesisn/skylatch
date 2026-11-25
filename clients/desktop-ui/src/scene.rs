@@ -327,6 +327,8 @@ pub struct Machine {
     pub hardware_model: Option<String>,
     /// this machine is the one the launcher runs on
     pub is_local: bool,
+    /// Unix seconds the hub last heard from it (offline machines)
+    pub last_seen: Option<u64>,
 }
 
 impl Machine {
@@ -366,6 +368,7 @@ pub struct Device {
     pub mini: bool,
     pub hardware_model: Option<String>,
     pub is_local: bool,
+    pub last_seen: Option<u64>,
 }
 
 impl Device {
@@ -411,8 +414,26 @@ pub fn link_hollow(l: Link) -> bool {
     matches!(l, Link::Standby(_) | Link::Offline)
 }
 
+/// A sleeping laptop is drawn with its lid closed; an offline one keeps its shape as a ghost.
 fn is_down(l: Link) -> bool {
-    link_hollow(l)
+    matches!(l, Link::Standby(_))
+}
+
+/// The hub has no connection to it: drawn as a ghost, cannot be taken over.
+pub fn is_offline(l: Link) -> bool {
+    l == Link::Offline
+}
+
+/// `上次在线 12 分钟前`, empty when the hub never said.
+pub fn last_seen_phrase(d: &Device) -> String {
+    d.last_seen
+        .map(|t| {
+            format!(
+                "上次在线 {}",
+                crate::seen::last_seen_text(t, crate::seen::now_unix())
+            )
+        })
+        .unwrap_or_default()
 }
 
 // ───────────────────── aspect-true screen dimensions + size tiers ─────────────────────
@@ -631,6 +652,7 @@ fn make_devices(m: &Machine, out: &mut Vec<Device>) -> Vec<usize> {
             mini: m.kind == DeviceFormFactor::Mini,
             hardware_model: m.hardware_model.clone(),
             is_local: m.is_local,
+            last_seen: m.last_seen,
         });
     }
     idx
@@ -710,7 +732,9 @@ pub fn machines_from_devices(
                 room,
                 slot: d.slot,
                 screens,
-                link: if prefer_direct && !d.direct_endpoints.is_empty() {
+                link: if !d.online {
+                    Link::Offline
+                } else if prefer_direct && !d.direct_endpoints.is_empty() {
                     Link::Direct(None)
                 } else {
                     Link::Relay(None)
@@ -723,6 +747,7 @@ pub fn machines_from_devices(
                     .filter(|m| !m.is_empty())
                     .map(String::from),
                 is_local: local_id.is_some_and(|id| id == d.device_id),
+                last_seen: d.last_seen_unix,
             }
         })
         .collect()
@@ -766,6 +791,7 @@ pub fn demo_machines() -> Vec<Machine> {
                 capture: capture.into(),
                 hardware_model: None,
                 is_local: false,
+                last_seen: None,
             }
         };
     use DeviceFormFactor::*;
@@ -949,6 +975,27 @@ impl Frame {
 impl Builder {
     fn new() -> Self {
         Builder { prims: Vec::new() }
+    }
+
+    /// Turns everything drawn since `mark` into the ghost of an offline machine: low-contrast
+    /// dashed outlines over flat, unshaded faces.
+    fn ghost_since(&mut self, mark: usize) {
+        for p in &mut self.prims[mark..] {
+            if let Some(s) = &mut p.stroke {
+                s.role = Role::Muted;
+                s.a *= 0.6;
+                if s.w >= 0.9 && s.dash.is_none() {
+                    s.dash = Some((3.0, 2.6));
+                }
+            }
+            if let Some((role, _)) = &mut p.fill {
+                *role = match *role {
+                    Role::FaceL | Role::FaceR | Role::Glass => Role::Surface,
+                    Role::Ink | Role::Green | Role::Blue => Role::Dim,
+                    r => r,
+                };
+            }
+        }
     }
 
     fn poly2(&mut self, pts: Vec<P2>, fill: Fill, stroke: Option<Stroke>) {
@@ -1439,6 +1486,7 @@ struct MonSpec {
 }
 
 fn monitor(b: &mut Builder, sc: &mut Vec<ScreenGeom>, devs: &[Device], fr: &Frame, m: MonSpec) {
+    let mark = b.prims.len();
     let dm = devs[m.dev].dims();
     let (w, h) = (dm.outer_w(), dm.outer_h());
     let b_back = m.plane - m.thick;
@@ -1478,10 +1526,14 @@ fn monitor(b: &mut Builder, sc: &mut Vec<ScreenGeom>, devs: &[Device], fr: &Fram
     let at = |s: f32, t: f32| project(g.at(s, t));
     wire(b, &at, m.content);
     b.led_in(&q, w - 11.0, BEZEL.2 * 0.5, 1.7, m.led, 1.0);
+    if is_offline(devs[m.dev].link) {
+        b.ghost_since(mark);
+    }
     sc.push(screen_geom(m.dev, bezel, glass));
 }
 
 fn thinkpad(b: &mut Builder, sc: &mut Vec<ScreenGeom>, devs: &[Device], fr: &Frame, dev: usize) {
+    let mark = b.prims.len();
     let dm = devs[dev].dims();
     let (w, ll) = (dm.outer_w(), dm.outer_h());
     let (d, bh) = (ll * 1.06, 6.0);
@@ -1566,6 +1618,9 @@ fn thinkpad(b: &mut Builder, sc: &mut Vec<ScreenGeom>, devs: &[Device], fr: &Fra
     let at = |s: f32, t: f32| project(g.at(s, t));
     wire(b, &at, Content::Laptop);
     b.led_in(&lid, w / 2.0, 4.5, 1.6, link_role(devs[dev].link), 1.0);
+    if is_offline(devs[dev].link) {
+        b.ghost_since(mark);
+    }
     sc.push(screen_geom(dev, bezel, glass));
 }
 
@@ -1613,6 +1668,7 @@ fn macbook_closed(
     fr: &Frame,
     dev: usize,
 ) {
+    let mark = b.prims.len();
     let dm = devs[dev].dims();
     let (w, d, h) = (dm.outer_w(), dm.outer_h(), 5.0);
     b.cub(fr, 0.0, w, 0.0, d, 0.0, h);
@@ -1634,6 +1690,9 @@ fn macbook_closed(
     let hit = silhouette(u0, u1, v0, v1, 0.0, h);
     let mut sg = screen_geom(dev, lid, glass);
     sg.hit = hit_with_min(hit);
+    if is_offline(devs[dev].link) {
+        b.ghost_since(mark);
+    }
     sc.push(sg);
 }
 
@@ -1711,6 +1770,7 @@ fn blade(
     h0: f32,
     h1: f32,
 ) {
+    let mark = b.prims.len();
     let k = r.k;
     let (w, d) = r.extent();
     let (u0, u1, v0, v1) = (r.u0, r.u0 + w, r.v0, r.v0 + d);
@@ -1779,6 +1839,9 @@ fn blade(
     .iter()
     .map(|&p| project(p))
     .collect();
+    if is_offline(devs[dev].link) {
+        b.ghost_since(mark);
+    }
     sc.push(ScreenGeom {
         dev,
         bezel: front_poly.clone(),
@@ -2037,6 +2100,7 @@ fn build_room(devs: &[Device], plan: &RoomPlan) -> (Scene, Vec<usize>) {
             );
             nav.push(d);
         }
+        let mark = b.prims.len();
         if g.mini {
             keyboard(&mut b, l.gs, 128.0);
             mac_mini(&mut b, l.gs + 192.0, 122.0);
@@ -2048,6 +2112,9 @@ fn build_room(devs: &[Device], plan: &RoomPlan) -> (Scene, Vec<usize>) {
             };
             keyboard(&mut b, ku, 128.0);
             mouse(&mut b, ku + 160.0, 134.0);
+        }
+        if g.devs.iter().all(|&d| is_offline(devs[d].link)) {
+            b.ghost_since(mark);
         }
     }
     add_screen_labels(&mut s, &lifts);
@@ -2204,6 +2271,7 @@ fn monitor_2d(
     ybar: f32,
     neck: f32,
 ) {
+    let mark = b.prims.len();
     let dm = d.dims();
     let (w, h) = (dm.outer_w() * SHELF_K, dm.outer_h() * SHELF_K);
     // foot, neck, bezel (front elevation)
@@ -2240,6 +2308,9 @@ fn monitor_2d(
         link_role(d.link),
         1.0,
     );
+    if is_offline(d.link) {
+        b.ghost_since(mark);
+    }
     sc.push(screen_geom(dev, bz, gl));
 }
 
@@ -2251,6 +2322,7 @@ fn laptop_open_2d(
     cx: f32,
     ybar: f32,
 ) {
+    let mark = b.prims.len();
     let dm = d.dims();
     let (lw, lh) = (dm.outer_w() * SHELF_K, dm.outer_h() * SHELF_K);
     let bw = lw * 1.18;
@@ -2285,6 +2357,9 @@ fn laptop_open_2d(
     let at = move |s: f32, t: f32| P2::new(gx0 + (gx1 - gx0) * s, gy1 - (gy1 - gy0) * t);
     wire(b, &at, Content::Laptop);
     b.led2(P2::new(cx, ybar - 7.0 - 4.5), 1.5, link_role(d.link), 1.0);
+    if is_offline(d.link) {
+        b.ghost_since(mark);
+    }
     sc.push(screen_geom(dev, bz, gl));
 }
 
@@ -2296,6 +2371,7 @@ fn laptop_closed_2d(
     cx: f32,
     ybar: f32,
 ) {
+    let mark = b.prims.len();
     let dm = d.dims();
     let (w, h) = (dm.outer_w() * SHELF_K, 9.0);
     let slab = rect_pts(cx - w / 2.0, ybar - h, cx + w / 2.0, ybar);
@@ -2322,6 +2398,9 @@ fn laptop_closed_2d(
         Role::Dim,
         0.55,
     );
+    if is_offline(d.link) {
+        b.ghost_since(mark);
+    }
     // thin silhouette: the minimum-hit rule gives it a generous target above the slab
     sc.push(screen_geom(
         dev,
@@ -2350,6 +2429,7 @@ fn mini_2d(b: &mut Builder, x0: f32, ybar: f32, role: Role) {
 }
 
 fn vm_2d(b: &mut Builder, sc: &mut Vec<ScreenGeom>, d: &Device, dev: usize, cx: f32, ybar: f32) {
+    let mark = b.prims.len();
     let dm = d.dims();
     let (w, h, bot) = (dm.outer_w() * 0.95, dm.outer_h() * 0.95, 44.0);
     let dash = |s: Stroke| dashed(s, 4.0, 3.5);
@@ -2380,6 +2460,9 @@ fn vm_2d(b: &mut Builder, sc: &mut Vec<ScreenGeom>, d: &Device, dev: usize, cx: 
     let (gx0, gy0, gx1, gy1) = (gl[0].x, gl[0].y, gl[1].x, gl[2].y);
     let at = move |s: f32, t: f32| P2::new(gx0 + (gx1 - gx0) * s, gy1 - (gy1 - gy0) * t);
     wire(b, &at, d.content);
+    if is_offline(d.link) {
+        b.ghost_since(mark);
+    }
     sc.push(screen_geom(dev, bz, gl));
 }
 
@@ -2465,12 +2548,16 @@ fn build_shelf(devs: &[Device], list: &[usize]) -> (Scene, Rect2) {
                     };
                     monitor_2d(&mut b, &mut s.screens, dev, c.dev, cx, ybar, neck);
                     if c.mini_after {
+                        let mark = b.prims.len();
                         mini_2d(
                             &mut b,
                             cx + dev.dims().outer_w() * SHELF_K * 0.5 + 22.0,
                             ybar,
                             Role::Blue,
                         );
+                        if is_offline(dev.link) {
+                            b.ghost_since(mark);
+                        }
                     }
                 }
             }
@@ -2916,12 +3003,17 @@ impl Scenes {
         self.devices.iter().position(|d| d.key == key)
     }
 
-    /// What to select when a tab opens: the first screen, preferring a monitor to a laptop or blade.
+    /// What to select when a tab opens: the first screen that can be taken over, preferring a
+    /// monitor to a laptop or blade; an offline one only when nothing else is there.
     pub fn default_selection(&self, desk: usize) -> Option<usize> {
         let nav = self.nav(false, desk);
+        let monitor = |&d: &usize| self.devices[d].form == Form::Monitor;
+        let online = |&d: &usize| !is_offline(self.devices[d].link);
         nav.iter()
             .copied()
-            .find(|&d| self.devices[d].form == Form::Monitor)
+            .find(|d| monitor(d) && online(d))
+            .or_else(|| nav.iter().copied().find(online))
+            .or_else(|| nav.iter().copied().find(monitor))
             .or_else(|| nav.first().copied())
     }
 }
@@ -2952,6 +3044,13 @@ pub fn text_w(s: &str, size: f32, mono: bool) -> f32 {
 pub const DETAIL_SEP: char = '\u{2003}';
 
 pub fn detail_text(d: &Device) -> String {
+    if is_offline(d.link) {
+        let ago = d
+            .last_seen
+            .map(|t| crate::seen::last_seen_text(t, crate::seen::now_unix()))
+            .unwrap_or_default();
+        return format!("{}{DETAIL_SEP}{ago}", link_text(d.link));
+    }
     format!(
         "{}{DETAIL_SEP}{}",
         d.res.split(" @").next().unwrap_or(&d.res),
