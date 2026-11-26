@@ -1919,26 +1919,20 @@ impl Proto {
         self.kick();
     }
 
-    /// The header's sidebar switch: opens on the tab it was last left on (the mesh tab at first).
-    fn toggle_sidebar(&mut self) {
+    /// The header's network button: opens on the server tab while the Hub is down or unset, else
+    /// on the tab it was last left on (the mesh tab at first).
+    fn toggle_net_panel(&mut self) {
         if self.drawer.open {
             self.close_drawer();
-        } else if !self.eff.unconfigured() {
-            self.open_drawer();
-            self.set_drawer_tab(self.mesh.last_tab.unwrap_or(mesh_ui::DrawerTab::Mesh));
+            return;
         }
-    }
-
-    /// The Hub pill: opens the 服务器与账号 tab, and closes the drawer when it is showing already.
-    fn toggle_server_tab(&mut self) {
-        if self.drawer.open && self.mesh.tab == mesh_ui::DrawerTab::Server {
-            self.close_drawer();
-        } else if !self.eff.unconfigured() {
-            if !self.drawer.open {
-                self.open_drawer();
-            }
-            self.set_drawer_tab(mesh_ui::DrawerTab::Server);
-        }
+        self.open_drawer();
+        let tab = if matches!(self.hub, HubState::Failed(_) | HubState::Unconfigured) {
+            mesh_ui::DrawerTab::Server
+        } else {
+            self.mesh.last_tab.unwrap_or(mesh_ui::DrawerTab::Mesh)
+        };
+        self.set_drawer_tab(tab);
     }
 
     fn toggle_drawer(&mut self) {
@@ -4032,93 +4026,18 @@ impl Proto {
             .into_any_element()
     }
 
-    /// The Hub status of the header (opens the drawer) with its refresh button.
-    fn hub_control(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let (dot, hollow, host, status) = self.hub_pill(pal);
-        let live = self.eff.live();
-        let wash = rgba(pal.wash, 1.0);
-        let muted = rgba(pal.muted, 1.0);
-        div()
-            .debug_selector(|| "hub-control".to_string())
-            .h(px(ui::CTL_H))
-            .flex()
-            .flex_none()
-            .items_center()
-            .rounded(px(ui::RAD_CTL))
-            .border_1()
-            .border_color(rgba(pal.hair, 1.0))
-            .bg(rgba(pal.surface, 1.0))
-            .child(
-                div()
-                    .id("hub-pill")
-                    .debug_selector(|| "hub-pill".to_string())
-                    .h_full()
-                    .pl(px(10.0))
-                    .pr(px(if live { 6.0 } else { 11.0 }))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .rounded(px(ui::RAD_CTL - 1.0))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(wash))
-                    .child(if hollow {
-                        div()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(dot)
-                    } else {
-                        div().size(px(6.0)).rounded_full().bg(dot)
-                    })
-                    .child(txt("Hub", 12.0, rgba(pal.ink, 1.0)).font_weight(FontWeight::MEDIUM))
-                    .children(host.map(|h| mtxt(h, 11.5, muted)))
-                    .child(txt(status, 11.5, rgba(pal.muted, 0.85)))
-                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        this.toggle_server_tab();
-                        cx.notify();
-                    })),
-            )
-            .when(live, |d| {
-                d.child(
-                    div()
-                        .id("hub-refresh")
-                        .size(px(ui::MINI_H))
-                        .mr(px(ui::SEG_PAD))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(ui::RAD_INNER))
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(wash))
-                        .child(txt("↻", 13.0, muted))
-                        .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                            this.refresh();
-                            cx.notify();
-                        })),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// (dot colour, hollow, host, status) of the Hub pill.
-    fn hub_pill(&self, pal: &Pal) -> (Hsla, bool, Option<String>, String) {
-        let host = Some(config::hub_host(&self.eff.hub_url));
+    /// The state dot of the 连接与组网 button: Hub first, then the virtual network. The bool is
+    /// hollow, the second one an alert.
+    fn net_status(&self, pal: &Pal) -> (Hsla, bool, bool) {
         match &self.hub {
-            HubState::Demo => (rgba(pal.muted, 0.8), true, None, "本地演示".to_string()),
-            HubState::Unconfigured => (rgba(pal.muted, 0.8), true, None, "未连接".to_string()),
-            HubState::Connecting => (rgba(pal.blue, 1.0), true, host, "连接中…".to_string()),
-            HubState::Online { count } => {
-                (rgba(pal.green, 1.0), false, host, format!("{count} 台在线"))
-            }
-            HubState::Failed(msg) => {
-                let short = if msg.contains("Token") {
-                    "未授权"
-                } else {
-                    "无法连接"
-                };
-                (rgba(pal.warn, 1.0), false, host, short.to_string())
-            }
+            HubState::Demo | HubState::Unconfigured => (rgba(pal.muted, 0.8), true, false),
+            HubState::Connecting => (rgba(pal.blue, 1.0), true, false),
+            HubState::Failed(_) => (rgba(pal.warn, 1.0), false, true),
+            HubState::Online { .. } => match self.mesh.dot() {
+                mesh_ui::TabDot::External => (rgba(pal.blue, 1.0), false, false),
+                mesh_ui::TabDot::Warning => (rgba(pal.warn, 1.0), false, false),
+                _ => (rgba(pal.green, 1.0), false, false),
+            },
         }
     }
 }
@@ -4198,34 +4117,25 @@ impl Render for Proto {
                     )
                     .child(txt("Skylatch", 15.5, ink).font_weight(FontWeight::SEMIBOLD)),
             )
-            .child(divider(&pal, true))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(ui::GAP_CTL))
-                    .child(self.hub_control(&pal, cx))
-                    .children(live_mode.then(|| self.add_device_button(&pal, cx))),
-            )
+            .children((!scenes.devices.is_empty() || live_mode).then(|| divider(&pal, true)))
             .children((!scenes.devices.is_empty()).then(|| {
+                segmented("room-seg", &pal).children(scenes.desks.iter().enumerate().map(
+                    |(i, d)| {
+                        self.seg_btn(
+                            ("desk", i),
+                            clip(&d.name, 14),
+                            tabs_active && self.desk == i,
+                            &pal,
+                            cx,
+                            move |t| t.set_desk(i),
+                        )
+                    },
+                ))
+            }))
+            .children(live_mode.then(|| {
                 div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .child(divider(&pal, true))
-                    .child(segmented("room-seg", &pal).children(
-                        scenes.desks.iter().enumerate().map(|(i, d)| {
-                            self.seg_btn(
-                                ("desk", i),
-                                clip(&d.name, 14),
-                                tabs_active && self.desk == i,
-                                &pal,
-                                cx,
-                                move |t| t.set_desk(i),
-                            )
-                        }),
-                    ))
+                    .ml(px(ui::GAP_CTL))
+                    .child(self.add_device_button(&pal, cx))
             }))
             .child(
                 div()
@@ -4293,19 +4203,23 @@ impl Render for Proto {
                         cx,
                         |t| t.set_dark(!t.dark),
                     ))
-                    .children((!self.eff.unconfigured()).then(|| {
+                    .child({
                         let open = self.drawer.open;
-                        let (c, hollow) = hub_view::tab_dot_color(self.mesh.dot(), &pal);
+                        let (c, hollow, alert) = self.net_status(&pal);
                         self.icon_btn(
                             "drawer-toggle",
-                            Icon::Sidebar { open },
-                            if open { Look::Selected } else { Look::Rest },
+                            Icon::Network,
+                            match (open, alert) {
+                                (true, _) => Look::Selected,
+                                (false, true) => Look::Alert,
+                                _ => Look::Rest,
+                            },
                             Some((c, hollow)),
                             &pal,
                             cx,
-                            |t| t.toggle_sidebar(),
+                            |t| t.toggle_net_panel(),
                         )
-                    })),
+                    }),
             )
             .child(
                 div()
@@ -5684,10 +5598,9 @@ mod ui_tests {
         });
         draw(cx);
         view.read_with(cx, |v, _| {
-            let pal = v.pal();
             assert_eq!(
-                v.hub_pill(&pal).3,
-                "6 台在线",
+                v.hub,
+                HubState::Online { count: 6 },
                 "offline machines are not counted"
             );
             assert_eq!(v.devices.len(), 8, "but they are all listed");
@@ -5981,31 +5894,81 @@ mod ui_tests {
         draw(cx);
         view.read_with(cx, |v, _| assert!(!v.drawer.open && v.stage.0 == full));
 
-        // the Hub pill opens the server tab and a second press closes it
-        click_sel(cx, "hub-pill");
-        assert!(view.read_with(cx, |v, _| v.drawer.open
-            && v.mesh.tab == mesh_ui::DrawerTab::Server));
-        click_sel(cx, "hub-pill");
+        // it comes back on the tab the drawer was left on
+        click_sel(cx, "drawer-toggle");
+        click_sel(cx, "tab-server");
+        click_sel(cx, "drawer-toggle");
         assert!(!view.read_with(cx, |v, _| v.drawer.open));
-        // the sidebar switch comes back on the tab the drawer was left on
         click_sel(cx, "drawer-toggle");
         assert_eq!(
             view.read_with(cx, |v, _| v.mesh.tab),
             mesh_ui::DrawerTab::Server
         );
-        click_sel(cx, "tab-mesh");
-        click_sel(cx, "hub-pill");
-        assert_eq!(
-            view.read_with(cx, |v, _| v.mesh.tab),
-            mesh_ui::DrawerTab::Server
-        );
-        click_sel(cx, "drawer-toggle");
+        click_sel(cx, "drawer-close");
         assert!(!view.read_with(cx, |v, _| v.drawer.open));
+        assert!(!has_sel(cx, "hub-control") && !has_sel(cx, "hub-pill"));
 
         click_sel(cx, "theme-toggle");
         assert!(view.read_with(cx, |v, _| v.dark));
         click_sel(cx, "theme-toggle");
         assert!(!view.read_with(cx, |v, _| v.dark));
+    }
+
+    #[gpui::test]
+    fn the_network_button_carries_the_hub_state_and_the_drawer_refreshes(cx: &mut TestAppContext) {
+        let hub = fake_hub();
+        let (view, cx) = live_view(cx, &hub);
+        let state = |cx: &mut VisualTestContext, view: &gpui::Entity<Proto>| {
+            view.read_with(cx, |v, _| {
+                let pal = v.pal();
+                let (c, hollow, alert) = v.net_status(&pal);
+                (c == rgba(pal.warn, 1.0), hollow, alert)
+            })
+        };
+        view.update(cx, |v, _| v.hub = HubState::Online { count: 2 });
+        draw(cx);
+        assert_eq!(state(cx, &view), (false, false, false), "online: calm dot");
+
+        view.update(cx, |v, _| v.hub = HubState::Failed("连接被拒绝".into()));
+        draw(cx);
+        assert_eq!(state(cx, &view), (true, false, true), "down: amber alert");
+        click_sel(cx, "drawer-toggle");
+        view.read_with(cx, |v, _| {
+            assert!(v.drawer.open && v.mesh.tab == mesh_ui::DrawerTab::Server);
+        });
+
+        view.update(cx, |v, _| v.hub = HubState::Online { count: 2 });
+        click_sel(cx, "hub-refresh");
+        assert!(view.read_with(cx, |v, _| {
+            v.banner.as_ref().is_some_and(|b| b.text.contains("刷新"))
+        }));
+        click_sel(cx, "drawer-close");
+        view.update(cx, |v, _| v.banner = None);
+        cx.simulate_keystrokes("r");
+        assert!(view.read_with(cx, |v, _| {
+            v.banner.as_ref().is_some_and(|b| b.text.contains("刷新"))
+        }));
+        cx.simulate_keystrokes("h");
+        assert!(view.read_with(cx, |v, _| v.drawer.open));
+    }
+
+    #[gpui::test]
+    fn without_a_hub_the_network_button_still_opens_the_server_tab(cx: &mut TestAppContext) {
+        let (view, cx) = onboarding_view(cx, None);
+        draw(cx);
+        assert!(has_sel(cx, "drawer-toggle"));
+        assert!(!has_sel(cx, "hub-refresh"));
+        view.read_with(cx, |v, _| {
+            let (_, hollow, alert) = v.net_status(&v.pal());
+            assert!(hollow && !alert);
+        });
+        click_sel(cx, "drawer-toggle");
+        view.read_with(cx, |v, _| {
+            assert!(v.drawer.open && v.mesh.tab == mesh_ui::DrawerTab::Server);
+        });
+        assert!(!has_sel(cx, "hub-refresh"), "nothing to refresh yet");
+        click_sel(cx, "drawer-toggle");
+        assert!(!view.read_with(cx, |v, _| v.drawer.open));
     }
 
     #[gpui::test]
@@ -7171,9 +7134,8 @@ mod ui_tests {
         assert_eq!(brand.origin.x, px(0.0));
         let mut right = brand.right();
         for sel in [
-            "hub-control",
-            "add-device",
             "room-seg",
+            "add-device",
             "update-capsule",
             "edit-toggle",
             "view-seg",

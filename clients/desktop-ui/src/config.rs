@@ -326,22 +326,6 @@ pub fn hub_url_valid(url: &str) -> bool {
         .is_some_and(|rest| !rest.trim_matches('/').is_empty())
 }
 
-/// Short `host[:port]` form for the header pill.
-pub fn hub_host(url: &str) -> String {
-    let rest = url
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://")
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let host = rest.split('/').next().unwrap_or("");
-    if host.chars().count() > 26 {
-        let head: String = host.chars().take(25).collect();
-        format!("{head}…")
-    } else {
-        host.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,16 +600,6 @@ mod tests {
         assert!(hub_url_valid("wss://hub.example.com"));
         assert!(
             !hub_url_valid("wss://") && !hub_url_valid("") && !hub_url_valid("hub.example.com")
-        );
-        assert_eq!(
-            hub_host("wss://hub.example.com:8443/path"),
-            "hub.example.com:8443"
-        );
-        assert!(
-            hub_host(&format!("wss://{}", "a".repeat(60)))
-                .chars()
-                .count()
-                <= 26
         );
     }
 }

@@ -816,19 +816,47 @@ impl Proto {
                             )
                             .child(
                                 div()
-                                    .id("drawer-close")
-                                    .px(px(8.0))
-                                    .h(px(ui::MINI_H))
                                     .flex()
                                     .items_center()
-                                    .rounded(px(ui::RAD_INNER))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(pal.wash, 1.0)))
-                                    .child(mtxt("Esc", 10.0, muted))
-                                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                        this.close_drawer();
-                                        cx.notify();
-                                    })),
+                                    .gap(px(2.0))
+                                    .children(self.eff.live().then(|| {
+                                        div()
+                                            .id("hub-refresh")
+                                            .debug_selector(|| "hub-refresh".to_string())
+                                            .size(px(ui::MINI_H))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(ui::RAD_INNER))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(pal.wash, 1.0)))
+                                            .child(txt("↻", 13.0, muted))
+                                            .on_click(cx.listener(
+                                                |this, _e: &ClickEvent, _w, cx| {
+                                                    this.refresh();
+                                                    cx.notify();
+                                                },
+                                            ))
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("drawer-close")
+                                            .debug_selector(|| "drawer-close".to_string())
+                                            .px(px(8.0))
+                                            .h(px(ui::MINI_H))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(ui::RAD_INNER))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgba(pal.wash, 1.0)))
+                                            .child(mtxt("Esc", 10.0, muted))
+                                            .on_click(cx.listener(
+                                                |this, _e: &ClickEvent, _w, cx| {
+                                                    this.close_drawer();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
                             ),
                     )
                     .child(
