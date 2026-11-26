@@ -67,18 +67,22 @@ pub enum HubSubmit {
         url: String,
         username: String,
         password: String,
+        /// Create the account first (hubs that allow signup).
+        signup: bool,
     },
     /// Use an existing account token as is.
     Token { url: String, token: String },
 }
 
-/// Result of a background sign-in: the session token on success.
-pub type LoginOutcome = Result<String, String>;
+/// Result of a background sign-in: the session token and the account's vault on success.
+pub type LoginOutcome = Result<crate::mesh_ops::SignedIn, String>;
 
 pub struct Onboarding {
     pub tab: Tab,
     /// Hub tab: paste an account token instead of signing in with a password.
     pub token_mode: bool,
+    /// Hub tab: create a new account with the name and password.
+    pub signup: bool,
     pub field: OnbField,
     pub hub_url: String,
     pub username: String,
@@ -101,6 +105,7 @@ impl Onboarding {
         Onboarding {
             tab: Tab::Hub,
             token_mode: false,
+            signup: false,
             field: OnbField::HubUrl,
             hub_url: String::new(),
             username: String::new(),
@@ -241,10 +246,14 @@ impl Onboarding {
         if self.password.is_empty() {
             return Err("请填写密码".into());
         }
+        if self.signup && self.password.chars().count() < 8 {
+            return Err("注册密码至少 8 位".into());
+        }
         Ok(HubSubmit::Login {
             url,
             username,
             password: self.password.clone(),
+            signup: self.signup,
         })
     }
 
@@ -328,6 +337,11 @@ pub struct Pairing {
     pub shown: (u64, bool),
     /// Room the joining machine should land in, as typed in the modal (blank: none).
     pub room: String,
+    /// The mesh profile the new machine joins along with the code (none: no mesh).
+    pub mesh: Option<String>,
+    /// The invite secret's display form, for the request of that generation. It completes
+    /// the pairing code into the join code and never reaches the hub.
+    pub invite: Option<(u64, String)>,
 }
 
 impl Pairing {
@@ -342,7 +356,29 @@ impl Pairing {
             pending: None,
             shown: (u64::MAX, false),
             room: String::new(),
+            mesh: None,
+            invite: None,
         }
+    }
+
+    /// The code to type on the new machine: the pairing code, plus the invite secret when the
+    /// code carries a mesh invite.
+    pub fn join_code(&self) -> Option<String> {
+        let code = self.code.as_ref().filter(|c| !c.expired())?;
+        Some(match &self.invite {
+            Some((generation, secret)) if *generation == self.generation => {
+                format!("{}-{secret}", code.code)
+            }
+            _ => code.code.clone(),
+        })
+    }
+
+    /// The invite part of the join code shown now, if any.
+    pub fn invite_suffix(&self) -> Option<&str> {
+        self.invite
+            .as_ref()
+            .filter(|(g, _)| *g == self.generation && self.code.is_some())
+            .map(|(_, s)| s.as_str())
     }
 
     /// Forgets everything (sign-out, hub change).
@@ -399,6 +435,7 @@ mod tests {
             url,
             username,
             password,
+            signup: false,
         } = o.hub_submit().unwrap()
         else {
             panic!("login expected")
@@ -416,6 +453,14 @@ mod tests {
         let mut bad = filled();
         bad.password.clear();
         assert!(bad.hub_submit().err().unwrap().contains("密码"));
+        let mut new = filled();
+        new.signup = true;
+        assert!(new.hub_submit().err().unwrap().contains("8 位"));
+        new.password = "long enough".into();
+        assert!(matches!(
+            new.hub_submit(),
+            Ok(HubSubmit::Login { signup: true, .. })
+        ));
     }
 
     #[test]

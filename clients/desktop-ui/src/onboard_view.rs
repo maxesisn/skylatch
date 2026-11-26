@@ -342,6 +342,26 @@ impl Proto {
             }
         }
 
+        let signup_toggle = (o.tab == Tab::Hub && !o.token_mode).then(|| {
+            div()
+                .id("onb-signup-toggle")
+                .debug_selector(|| "onb-signup-toggle".to_string())
+                .cursor_pointer()
+                .child(txt(
+                    if o.signup {
+                        "登录已有账号"
+                    } else {
+                        "注册新账号"
+                    },
+                    11.5,
+                    accent,
+                ))
+                .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                    this.onb.signup = !this.onb.signup;
+                    this.onb.error = None;
+                    cx.notify();
+                }))
+        });
         let toggle = (o.tab == Tab::Hub).then(|| {
             div()
                 .id("onb-token-toggle")
@@ -424,6 +444,7 @@ impl Proto {
 
         let (status, status_col) = match (&o.error, o.busy) {
             (Some(e), _) => (clip(e, 56), rgba(pal.warn, 1.0)),
+            (None, true) if o.signup => ("正在注册…".to_string(), rgba(pal.blue, 1.0)),
             (None, true) => ("正在登录…".to_string(), rgba(pal.blue, 1.0)),
             (None, false) => (
                 match o.tab {
@@ -436,7 +457,8 @@ impl Proto {
         };
 
         let (submit_label, submit_id) = match (o.tab, o.token_mode, o.busy) {
-            (Tab::Hub, false, true) => ("登录中…", "onb-submit"),
+            (Tab::Hub, false, true) => ("请稍候…", "onb-submit"),
+            (Tab::Hub, false, false) if o.signup => ("注册并登录", "onb-submit"),
             (Tab::Hub, false, false) => ("登录", "onb-submit"),
             (Tab::Hub, true, _) => ("连接 Hub", "onb-submit"),
             (Tab::Direct, _, _) => ("直接连接", "onb-submit"),
@@ -471,7 +493,14 @@ impl Proto {
                         .items_center()
                         .justify_between()
                         .child(tabs)
-                        .children(toggle),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(14.0))
+                                .children(signup_toggle)
+                                .children(toggle),
+                        ),
                 )
                 .children(form)
                 .children(host_row)
@@ -622,14 +651,22 @@ impl Proto {
             (None, false, Some(e)) => (clip(e, 52), warn),
             (None, false, None) => ("点击「换一码」获取配对码".to_string(), muted),
         };
-        let command = match live_code {
-            Some(c) => onboard::join_command(
+        let command = match p.join_code() {
+            Some(code) => onboard::join_command(
                 &crate::config::normalize_hub_url(&self.eff.hub_url),
-                &c.code,
+                &code,
                 Some(&self.pair.room),
             ),
             None => "skylatch-agent join <hub> --code <code>".to_string(),
         };
+        let suffix = p.invite_suffix().map(str::to_string);
+        let mesh_name = p.mesh.as_ref().and_then(|id| {
+            self.mesh
+                .vault
+                .session()
+                .and_then(|s| s.vault.profile(id))
+                .map(|pr| pr.name.clone())
+        });
         let copied = p.copied_at.is_some();
 
         vec![
@@ -644,6 +681,31 @@ impl Proto {
                 .border_color(rgba(pal.hair, 1.0))
                 .bg(rgba(pal.canvas, 1.0))
                 .child(big)
+                .children(suffix.map(|sfx| {
+                    div()
+                        .debug_selector(|| "pair-invite".to_string())
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(3.0))
+                        .child(mtxt(
+                            format!("{}-{sfx}", p.code.as_ref().map_or("", |c| c.code.as_str())),
+                            15.0,
+                            if live_code.is_some() {
+                                rgba(pal.accent, 1.0)
+                            } else {
+                                rgba(pal.muted, 0.55)
+                            },
+                        ))
+                        .child(txt(
+                            format!(
+                                "扩展加入码：新设备自动加入「{}」",
+                                mesh_name.clone().unwrap_or_default()
+                            ),
+                            11.0,
+                            muted,
+                        ))
+                }))
                 .child(
                     div()
                         .h(px(ui::TAG_H))
@@ -656,8 +718,10 @@ impl Proto {
                 )
                 .into_any_element(),
             div()
-                .h(px(ui::FIELD_H))
+                .debug_selector(|| "pair-command".to_string())
+                .min_h(px(ui::FIELD_H))
                 .px(px(10.0))
+                .py(px(7.0))
                 .flex()
                 .items_center()
                 .overflow_hidden()
@@ -673,8 +737,9 @@ impl Proto {
                             rgba(pal.muted, 0.7)
                         },
                     )
-                    .overflow_hidden()
-                    .text_ellipsis(),
+                    .whitespace_normal()
+                    .flex_1()
+                    .min_w(px(0.0)),
                 )
                 .into_any_element(),
             div()
@@ -724,6 +789,43 @@ impl Proto {
                     rgba(pal.muted, 1.0),
                 ))
                 .children(body),
+        )
+    }
+
+    /// 新设备自动加入组网: offered once the account's mesh configuration is unlocked.
+    fn pair_mesh_row(&self, pal: &Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let vault = &self.mesh.vault.session()?.vault;
+        if vault.profiles.is_empty() {
+            return None;
+        }
+        let mut seg = segmented("pair-mesh-seg", pal).child(self.seg_btn(
+            "pair-mesh-none",
+            "不附带",
+            self.pair.mesh.is_none(),
+            pal,
+            cx,
+            |t| t.set_pair_mesh(None),
+        ));
+        for (i, p) in vault.profiles.iter().enumerate() {
+            let id = p.id.clone();
+            seg = seg.child(self.seg_btn(
+                ("pair-mesh", i),
+                clip(&p.name, 8),
+                self.pair.mesh.as_deref() == Some(p.id.as_str()),
+                pal,
+                cx,
+                move |t| t.set_pair_mesh(Some(id.clone())),
+            ));
+        }
+        Some(
+            div()
+                .debug_selector(|| "pair-mesh".to_string())
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(self.small_label("新设备自动加入组网", pal))
+                .child(seg)
+                .into_any_element(),
         )
     }
 
@@ -780,7 +882,15 @@ impl Proto {
                             .child(self.pair_room_input(pal, cx)),
                     ),
             )
+            .children(self.pair_mesh_row(pal, cx))
             .children(body)
+            .children(self.pair.invite_suffix().is_some().then(|| {
+                crate::hub_view::para(
+                    "短码后缀只在新设备本地解密组网密钥，Hub 看不到它，也就拿不到组网凭据",
+                    11.0,
+                    muted,
+                )
+            }))
             .child(hint_row(
                 &[
                     ("Enter", "复制命令"),
