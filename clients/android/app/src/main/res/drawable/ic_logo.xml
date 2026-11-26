@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="64dp"
+    android:height="64dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+    <path
+        android:fillColor="#1B1D22"
+        android:strokeColor="#2E323B"
+        android:strokeWidth="2"
+        android:pathData="M18,4H46A14,14 0 0 1 60,18V46A14,14 0 0 1 46,60H18A14,14 0 0 1 4,46V18A14,14 0 0 1 18,4Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#F4F2EC"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M44,22V18A4,4 0 0 0 40,14H18A4,4 0 0 0 14,18V46A4,4 0 0 0 18,50H40A4,4 0 0 0 44,46V42" />
+    <path
+        android:fillColor="#3B82F6"
+        android:pathData="M27.5,27H47.5A2.5,2.5 0 0 1 50,29.5V34.5A2.5,2.5 0 0 1 47.5,37H27.5A2.5,2.5 0 0 1 25,34.5V29.5A2.5,2.5 0 0 1 27.5,27Z" />
+    <path
+        android:fillColor="#F4F2EC"
+        android:pathData="M24.5,21H27A2.5,2.5 0 0 1 29.5,23.5V40.5A2.5,2.5 0 0 1 27,43H24.5A2.5,2.5 0 0 1 22,40.5V23.5A2.5,2.5 0 0 1 24.5,21Z" />
+</vector>

@@ -203,8 +203,58 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SKYLATCH_BUILD_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/android/jni -> target
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build the release JNI library
+        run: clients/android/build-jni.sh --abi arm64-v8a --release
+      - name: Stage the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SKYLATCH_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -n $KEYSTORE_BASE64 ]]; then
+            base64 -d <<< "$KEYSTORE_BASE64" > "$RUNNER_TEMP/skylatch-release.jks"
+            echo "SKYLATCH_ANDROID_KEYSTORE=$RUNNER_TEMP/skylatch-release.jks" >> "$GITHUB_ENV"
+          else
+            echo 'No release keystore configured; the APK is signed with the debug key.'
+          fi
+      - name: Build the release APK
+        working-directory: clients/android
+        env:
+          SKYLATCH_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SKYLATCH_ANDROID_KEYSTORE_PASSWORD }}
+          SKYLATCH_ANDROID_KEY_ALIAS: ${{ secrets.SKYLATCH_ANDROID_KEY_ALIAS }}
+          SKYLATCH_ANDROID_KEY_PASSWORD: ${{ secrets.SKYLATCH_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          IFS=. read -r major minor patch <<< "${VERSION%%-*}"
+          code=$((major * 10000 + minor * 100 + patch))
+          ./gradlew assembleRelease -PskylatchVersionName="$VERSION" -PskylatchVersionCode="$code"
+          mkdir -p ../../dist
+          cp app/build/outputs/apk/release/app-release.apk "../../dist/Skylatch-$VERSION-android-arm64.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: dist/*
+          if-no-files-found: error
+
   publish:
-    needs: [version, windows, macos, linux]
+    needs: [version, windows, macos, linux, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -232,7 +282,7 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         working-directory: release-assets
-        run: sha256sum -- *.exe *.zip *.dmg *.deb *.tar.gz > SHA256SUMS
+        run: sha256sum -- *.exe *.zip *.dmg *.deb *.tar.gz *.apk > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
