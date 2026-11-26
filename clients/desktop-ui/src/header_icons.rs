@@ -16,19 +16,21 @@ const STROKE: f32 = 1.5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Icon {
-    Sidebar { open: bool },
+    Network,
     Moon,
     Sun,
     Share,
 }
 
-/// How a button is dressed: resting, switched off (dim), selected (accent) or on (green).
+/// How a button is dressed: resting, switched off (dim), selected (accent), on (green) or
+/// alerting (amber outline).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Look {
     Rest,
     Dim,
     Selected,
     On,
+    Alert,
 }
 
 fn arc(c: Pt, r: f32, from: f32, to: f32) -> Vec<Pt> {
@@ -74,16 +76,23 @@ fn paint_icon(window: &mut Window, b: Bounds<Pixels>, icon: Icon, col: Hsla) {
         paint_poly(window, &pts, None, Some((col, STROKE * k, None)), closed);
     };
     match icon {
-        Icon::Sidebar { open } => {
-            if open {
-                let cell: Vec<_> = [(10.75, 3.25), (13.75, 3.25), (13.75, 12.75), (10.75, 12.75)]
-                    .into_iter()
-                    .map(at)
-                    .collect();
-                paint_poly(window, &cell, Some(col.opacity(0.4)), None, true);
+        Icon::Network => {
+            const R: f32 = 2.0;
+            let nodes: [Pt; 3] = [(3.75, 4.5), (12.25, 4.5), (8.0, 12.0)];
+            for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                let (p, q) = (nodes[a], nodes[b]);
+                let len = ((q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)).sqrt();
+                let (ux, uy) = ((q.0 - p.0) / len, (q.1 - p.1) / len);
+                line(
+                    window,
+                    vec![(p.0 + ux * R, p.1 + uy * R), (q.0 - ux * R, q.1 - uy * R)],
+                    false,
+                );
             }
-            line(window, rrect_outline((1.75, 2.75, 14.25, 13.25, 2.5)), true);
-            line(window, vec![(10.25, 2.75), (10.25, 13.25)], false);
+            for c in nodes {
+                let dot: Vec<_> = arc(c, R, 0.0, 360.0).into_iter().map(at).collect();
+                paint_poly(window, &dot, Some(col), None, true);
+            }
         }
         Icon::Moon => line(window, crescent((8.0, 8.0), 5.75, (11.5, 5.0), 4.75), true),
         Icon::Sun => {
@@ -149,6 +158,11 @@ impl Proto {
                 rgba(pal.green, 1.0),
                 rgba(pal.green, 0.08),
                 rgba(pal.green, 0.30),
+            ),
+            Look::Alert => (
+                rgba(pal.ink, 1.0),
+                rgba(pal.warn, 0.08),
+                rgba(pal.warn, 0.6),
             ),
         };
         let wash = rgba(pal.wash, 1.0);

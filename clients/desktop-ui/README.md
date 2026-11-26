@@ -60,7 +60,7 @@ parent console, and output redirected to a file or a pipe works as usual.
 
 ## Connect to a hub
 
-Either open the app and click the **Hub pill** in the header (or press `H`) to type the hub URL and
+Either open the app and click the **network button** at the right end of the header (or press `H`) to type the hub URL and
 token, press **Save & Connect**, or start it with flags / environment variables:
 
 ```sh
