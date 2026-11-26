@@ -216,7 +216,7 @@ impl Proto {
                 Target::Mesh(MeshField::Import),
                 &d.text,
                 "[network_identity]\nnetwork_name = \"...\"\nnetwork_secret = \"...\"",
-                200.0,
+                192.0,
                 pal,
                 cx,
                 |t| t.mesh.field = Some(MeshField::Import),
@@ -255,7 +255,7 @@ impl Proto {
                         cx,
                         |t, _| t.close_modal(),
                     ))
-                    .child(crate::hint_row(&[("Ctrl+V", "粘贴"), ("Enter", "换行")], pal)),
+                    .child(crate::hint_row(&[(crate::PASTE_KEY, "粘贴"), ("Enter", "换行")], pal)),
             )
             .into_any_element()
     }

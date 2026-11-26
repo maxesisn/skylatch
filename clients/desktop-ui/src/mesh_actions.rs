@@ -40,6 +40,7 @@ impl Proto {
 
     pub(crate) fn close_drawer(&mut self) {
         self.marked = None;
+        self.mesh.last_tab = Some(self.mesh.tab);
         self.drawer.open = false;
         self.mesh.field = None;
         self.kick();

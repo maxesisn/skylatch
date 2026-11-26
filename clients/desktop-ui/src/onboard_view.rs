@@ -4,6 +4,7 @@
 //! device" card, the `+ 添加设备` header button and the pairing modal. State and validation
 //! live in [`crate::onboard`]; the actions are methods of [`Proto`] in `main.rs`.
 
+use crate::header_icons::{Icon, Look};
 use crate::host_mgr::{ChipKind, chip_look};
 use crate::onboard::{self, OnbField, Tab};
 use crate::scene::HEADER_H;
@@ -312,7 +313,7 @@ impl Proto {
                     "onb-token",
                     OnbField::Token,
                     mask(&o.token),
-                    "粘贴账户 Token（Ctrl+V）",
+                    crate::ONB_TOKEN_PLACEHOLDER,
                     pal,
                     cx,
                 ));
@@ -524,7 +525,11 @@ impl Proto {
                             cx,
                         ))
                         .child(hint_row(
-                            &[("Tab", "切换字段"), ("Enter", "提交"), ("Ctrl+V", "粘贴")],
+                            &[
+                                ("Tab", "切换字段"),
+                                ("Enter", "提交"),
+                                (crate::PASTE_KEY, "粘贴"),
+                            ],
                             pal,
                         )),
                 ),
@@ -561,67 +566,20 @@ impl Proto {
             .into_any_element()
     }
 
-    /// Header chip showing whether this machine can be taken over; a click switches it. Narrow
-    /// windows keep only the dot.
-    pub(crate) fn host_chip(
-        &self,
-        pal: &Pal,
-        wide: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    /// Header icon showing whether this machine can be taken over; a click switches it.
+    pub(crate) fn host_chip(&self, pal: &Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
         let host = self.host.as_ref()?;
-        let (kind, label) = chip_look(self.stored.host_enabled, &host.status());
-        let (dot, hollow) = match kind {
-            ChipKind::Shared => (rgba(pal.green, 1.0), false),
-            ChipKind::Starting => (rgba(pal.blue, 1.0), true),
-            ChipKind::Problem => (rgba(pal.warn, 1.0), false),
-            ChipKind::Off => (rgba(pal.muted, 0.8), true),
+        let (kind, _) = chip_look(self.stored.host_enabled, &host.status());
+        let (look, dot) = match kind {
+            ChipKind::Shared => (Look::On, Some((rgba(pal.green, 1.0), false))),
+            ChipKind::Starting => (Look::Rest, Some((rgba(pal.blue, 1.0), true))),
+            ChipKind::Problem => (Look::Rest, Some((rgba(pal.warn, 1.0), false))),
+            ChipKind::Off => (Look::Dim, None),
         };
-        let (bg, border) = match kind {
-            ChipKind::Shared => (rgba(pal.green, 0.08), rgba(pal.green, 0.30)),
-            ChipKind::Off => (rgba(pal.surface, 0.0), rgba(pal.hair, 1.0)),
-            ChipKind::Starting | ChipKind::Problem => (rgba(pal.surface, 1.0), rgba(pal.hair, 1.0)),
-        };
-        let wash = rgba(pal.wash, 1.0);
         Some(
-            div()
-                .id("host-chip")
-                .debug_selector(|| "host-chip".to_string())
-                .h(px(ui::CTL_H))
-                .px(px(11.0))
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(7.0))
-                .rounded(px(ui::RAD_CTL))
-                .border_1()
-                .border_color(border)
-                .bg(bg)
-                .cursor_pointer()
-                .hover(move |s| s.bg(wash))
-                .child(if hollow {
-                    div()
-                        .size(px(6.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(dot)
-                } else {
-                    div().size(px(6.0)).rounded_full().bg(dot)
-                })
-                .when(wide, |d| {
-                    let fg = if kind == ChipKind::Shared {
-                        rgba(pal.ink, 0.85)
-                    } else {
-                        rgba(pal.muted, 1.0)
-                    };
-                    d.child(txt(label, 12.0, fg))
-                })
-                .on_click(cx.listener(|this, _e: &ClickEvent, window, cx| {
-                    window.focus(&this.focus);
-                    this.set_host_enabled(!this.stored.host_enabled);
-                    cx.notify();
-                }))
-                .into_any_element(),
+            self.icon_btn("host-chip", Icon::Share, look, dot, pal, cx, |t| {
+                t.set_host_enabled(!t.stored.host_enabled)
+            }),
         )
     }
 
@@ -894,8 +852,8 @@ impl Proto {
             .child(hint_row(
                 &[
                     ("Enter", "复制命令"),
-                    ("Ctrl+R", "换一码"),
-                    ("Ctrl+V", "粘贴"),
+                    (crate::CODE_KEY, "换一码"),
+                    (crate::PASTE_KEY, "粘贴"),
                     ("Esc", "关闭"),
                 ],
                 pal,
