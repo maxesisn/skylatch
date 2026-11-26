@@ -41,6 +41,7 @@ xcuserdata/
 /clients/windows/*.pdb
 /clients/macos/skylatch-client
 /clients/linux/skylatch-client
+/clients/android/app/src/main/jniLibs/
 
 # Secrets and local config
 .env
