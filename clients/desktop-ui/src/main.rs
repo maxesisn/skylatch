@@ -8,9 +8,12 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod config;
+mod header_icons;
 mod host_mgr;
 mod hub_ui;
 mod hub_view;
+use header_icons::{Icon, Look};
+use hub_view::DRAWER_W;
 mod iso;
 mod live;
 mod mark;
@@ -62,6 +65,28 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 // Clipboard and editing commands. Paste is the one place that reads the clipboard: the key
 // binding, the macOS Edit menu and a held-down input method all end up here.
 gpui::actions!(skylatch_ui, [Paste, Copy, SelectAll]);
+
+/// How the paste and new-code shortcuts are written on this platform.
+const PASTE_KEY: &str = if cfg!(target_os = "macos") {
+    "⌘V"
+} else {
+    "Ctrl+V"
+};
+const CODE_KEY: &str = if cfg!(target_os = "macos") {
+    "⌘R"
+} else {
+    "Ctrl+R"
+};
+const TOKEN_PLACEHOLDER: &str = if cfg!(target_os = "macos") {
+    "账户 Token（粘贴：⌘V）"
+} else {
+    "账户 Token（粘贴：Ctrl+V）"
+};
+const ONB_TOKEN_PLACEHOLDER: &str = if cfg!(target_os = "macos") {
+    "粘贴账户 Token（⌘V）"
+} else {
+    "粘贴账户 Token（Ctrl+V）"
+};
 
 /// Key bindings of the editing commands (Cmd on macOS, Ctrl elsewhere).
 fn bind_keys(cx: &mut App) {
@@ -1894,6 +1919,28 @@ impl Proto {
         self.kick();
     }
 
+    /// The header's sidebar switch: opens on the tab it was last left on (the mesh tab at first).
+    fn toggle_sidebar(&mut self) {
+        if self.drawer.open {
+            self.close_drawer();
+        } else if !self.eff.unconfigured() {
+            self.open_drawer();
+            self.set_drawer_tab(self.mesh.last_tab.unwrap_or(mesh_ui::DrawerTab::Mesh));
+        }
+    }
+
+    /// The Hub pill: opens the 服务器与账号 tab, and closes the drawer when it is showing already.
+    fn toggle_server_tab(&mut self) {
+        if self.drawer.open && self.mesh.tab == mesh_ui::DrawerTab::Server {
+            self.close_drawer();
+        } else if !self.eff.unconfigured() {
+            if !self.drawer.open {
+                self.open_drawer();
+            }
+            self.set_drawer_tab(mesh_ui::DrawerTab::Server);
+        }
+    }
+
     fn toggle_drawer(&mut self) {
         if self.eff.unconfigured() {
             // the onboarding card is the settings screen until a hub is configured
@@ -3136,11 +3183,7 @@ impl Proto {
 
     fn in_drawer(&self, pos: Point<Pixels>) -> bool {
         let r = self.drawer_rect();
-        self.drawer.open
-            && f(pos.x) >= r.x
-            && f(pos.x) <= r.x + r.w
-            && f(pos.y) >= r.y
-            && f(pos.y) <= r.y + r.h
+        self.drawer.open && f(pos.x) >= r.x && f(pos.y) >= r.y
     }
 
     /// Every key press lands here. A key that is used stops there; keys nobody uses (letters
@@ -4008,6 +4051,7 @@ impl Proto {
             .child(
                 div()
                     .id("hub-pill")
+                    .debug_selector(|| "hub-pill".to_string())
                     .h_full()
                     .pl(px(10.0))
                     .pr(px(if live { 6.0 } else { 11.0 }))
@@ -4030,7 +4074,7 @@ impl Proto {
                     .children(host.map(|h| mtxt(h, 11.5, muted)))
                     .child(txt(status, 11.5, rgba(pal.muted, 0.85)))
                     .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        this.toggle_drawer();
+                        this.toggle_server_tab();
                         cx.notify();
                     })),
             )
@@ -4092,7 +4136,8 @@ impl Render for Proto {
         let vp = window.viewport_size();
         self.vp = (f(vp.width), f(vp.height));
         let toolbar_h = if self.edit { TOOLBAR_H } else { 0.0 };
-        let (sw, sh) = stage_size(f(vp.width), f(vp.height) - toolbar_h);
+        let dock_w = if self.drawer_docked() { DRAWER_W } else { 0.0 };
+        let (sw, sh) = stage_size(f(vp.width) - dock_w, f(vp.height) - toolbar_h);
         self.stage = (sw, sh);
         self.fit_base = self.scenes.fit(self.shelf, self.desk, sw, sh);
         self.apply_camera();
@@ -4161,12 +4206,7 @@ impl Render for Proto {
                     .items_center()
                     .gap(px(ui::GAP_CTL))
                     .child(self.hub_control(&pal, cx))
-                    .children(live_mode.then(|| self.add_device_button(&pal, cx)))
-                    .children(
-                        live_mode
-                            .then(|| self.host_chip(&pal, f(vp.width) >= 1100.0, cx))
-                            .flatten(),
-                    ),
+                    .children(live_mode.then(|| self.add_device_button(&pal, cx))),
             )
             .children((!scenes.devices.is_empty()).then(|| {
                 div()
@@ -4243,19 +4283,29 @@ impl Render for Proto {
                                 },
                             )),
                     )
-                    .child(
-                        segmented("theme-seg", &pal)
-                            .child(self.seg_btn("t-light", "浅色", !self.dark, &pal, cx, |t| {
-                                if t.dark {
-                                    t.set_dark(false)
-                                }
-                            }))
-                            .child(self.seg_btn("t-dark", "深色", self.dark, &pal, cx, |t| {
-                                if !t.dark {
-                                    t.set_dark(true)
-                                }
-                            })),
-                    ),
+                    .children(live_mode.then(|| self.host_chip(&pal, cx)).flatten())
+                    .child(self.icon_btn(
+                        "theme-toggle",
+                        if self.dark { Icon::Sun } else { Icon::Moon },
+                        Look::Rest,
+                        None,
+                        &pal,
+                        cx,
+                        |t| t.set_dark(!t.dark),
+                    ))
+                    .children((!self.eff.unconfigured()).then(|| {
+                        let open = self.drawer.open;
+                        let (c, hollow) = hub_view::tab_dot_color(self.mesh.dot(), &pal);
+                        self.icon_btn(
+                            "drawer-toggle",
+                            Icon::Sidebar { open },
+                            if open { Look::Selected } else { Look::Rest },
+                            Some((c, hollow)),
+                            &pal,
+                            cx,
+                            |t| t.toggle_sidebar(),
+                        )
+                    })),
             )
             .child(
                 div()
@@ -5099,6 +5149,13 @@ impl Render for Proto {
             )
             .children(progress);
 
+        let docked = self.drawer_docked();
+        let drawer = self.drawer.open.then(|| self.drawer_view(&pal, cx));
+        let (side_drawer, overlay_drawer) = if docked {
+            (drawer, None)
+        } else {
+            (None, drawer)
+        };
         div()
             .id("root")
             .relative()
@@ -5122,9 +5179,25 @@ impl Render for Proto {
             .on_action(cx.listener(|_, _: &SelectAll, _w, cx| cx.stop_propagation()))
             .child(header)
             .children(self.edit.then(|| self.edit_toolbar(&pal, cx)))
-            .child(stage)
-            .child(footer)
-            .children(self.drawer.open.then(|| self.drawer_view(&pal, cx)))
+            .child(
+                div()
+                    .id("workspace")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(stage)
+                            .child(footer),
+                    )
+                    .children(side_drawer),
+            )
+            .children(overlay_drawer)
             .children(self.pair.open.then(|| self.pair_modal(&pal, cx)))
             .children(self.mesh_modal(&pal, cx))
     }
@@ -5874,6 +5947,65 @@ mod ui_tests {
                 .unwrap_or_default()
                 .contains("sudo dpkg -i")
         );
+    }
+
+    #[gpui::test]
+    fn the_sidebar_docks_beside_the_desk_and_the_header_icons_drive_it(cx: &mut TestAppContext) {
+        let (view, cx) = demo_view(cx, false, false);
+        draw(cx);
+        let full = view.read_with(cx, |v, _| v.stage.0);
+        click_sel(cx, "drawer-toggle");
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert!(v.drawer.open && v.mesh.tab == mesh_ui::DrawerTab::Mesh);
+            assert!(v.drawer_docked(), "{} px wide", v.vp.0);
+            assert_eq!(v.stage.0, full - DRAWER_W, "the desk keeps the rest");
+            let r = v.drawer_rect();
+            assert_eq!((r.x, r.y, r.w), (v.vp.0 - DRAWER_W, HEADER_H, DRAWER_W));
+            assert_eq!(
+                r.h,
+                v.vp.1 - HEADER_H,
+                "full height, down to the window's edge"
+            );
+            assert!(v.in_drawer(point(px(v.vp.0 - 4.0), px(v.vp.1 - 4.0))));
+            assert!(!v.in_drawer(point(px(v.vp.0 - DRAWER_W - 4.0), px(HEADER_H + 40.0))));
+            assert!(!v.in_drawer(point(px(v.vp.0 - 4.0), px(HEADER_H - 4.0))));
+        });
+        let panel = cx.debug_bounds("hub-drawer").unwrap();
+        let footer = cx.debug_bounds("footer-actions").unwrap();
+        assert!(
+            footer.right() <= panel.origin.x,
+            "the footer is not covered"
+        );
+        click_sel(cx, "drawer-toggle");
+        draw(cx);
+        view.read_with(cx, |v, _| assert!(!v.drawer.open && v.stage.0 == full));
+
+        // the Hub pill opens the server tab and a second press closes it
+        click_sel(cx, "hub-pill");
+        assert!(view.read_with(cx, |v, _| v.drawer.open
+            && v.mesh.tab == mesh_ui::DrawerTab::Server));
+        click_sel(cx, "hub-pill");
+        assert!(!view.read_with(cx, |v, _| v.drawer.open));
+        // the sidebar switch comes back on the tab the drawer was left on
+        click_sel(cx, "drawer-toggle");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.mesh.tab),
+            mesh_ui::DrawerTab::Server
+        );
+        click_sel(cx, "tab-mesh");
+        click_sel(cx, "hub-pill");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.mesh.tab),
+            mesh_ui::DrawerTab::Server
+        );
+        click_sel(cx, "drawer-toggle");
+        assert!(!view.read_with(cx, |v, _| v.drawer.open));
+
+        click_sel(cx, "theme-toggle");
+        assert!(view.read_with(cx, |v, _| v.dark));
+        click_sel(cx, "theme-toggle");
+        assert!(!view.read_with(cx, |v, _| v.dark));
     }
 
     #[gpui::test]
@@ -7041,12 +7173,13 @@ mod ui_tests {
         for sel in [
             "hub-control",
             "add-device",
-            "host-chip",
             "room-seg",
             "update-capsule",
             "edit-toggle",
             "view-seg",
-            "theme-seg",
+            "host-chip",
+            "theme-toggle",
+            "drawer-toggle",
         ] {
             let b = cx
                 .debug_bounds(sel)

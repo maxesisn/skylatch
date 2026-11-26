@@ -108,7 +108,11 @@ fn strip(title: &str, detail: &str, color: Hsla, pal: &Pal) -> AnyElement {
         .border_color(color.opacity(0.35))
         .bg(color.opacity(0.07))
         .child(txt(title.to_string(), 12.0, color).font_weight(FontWeight::MEDIUM))
-        .child(para(detail.to_string(), 11.0, rgba(pal.muted, 1.0)))
+        .child(para(
+            detail.trim_end_matches('。').to_string(),
+            11.0,
+            rgba(pal.muted, 1.0),
+        ))
         .into_any_element()
 }
 
@@ -689,7 +693,7 @@ impl Proto {
             Target::Mesh(MeshField::Peers),
             if focused { &item.peers_text } else { "" },
             "可留空",
-            58.0,
+            64.0,
             pal,
             cx,
             move |t| t.focus_profile(&focus_id, MeshField::Peers),

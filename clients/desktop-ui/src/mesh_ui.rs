@@ -687,6 +687,8 @@ pub enum MeshField {
 /// Everything the 虚拟组网 tab shows and edits.
 pub struct MeshUi {
     pub tab: DrawerTab,
+    /// The tab the drawer was closed on.
+    pub last_tab: Option<DrawerTab>,
     pub field: Option<MeshField>,
     pub probe: Option<Probe>,
     pub probe_at: Option<Instant>,
@@ -721,6 +723,7 @@ impl MeshUi {
     pub fn new() -> MeshUi {
         MeshUi {
             tab: DrawerTab::Server,
+            last_tab: None,
             field: None,
             probe: None,
             probe_at: None,

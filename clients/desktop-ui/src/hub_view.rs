@@ -11,12 +11,14 @@ use crate::{Field, HubState, Proto, Target, clip, config, hint_row, mtxt, rgba, 
 use gpui::prelude::*;
 use gpui::{AnyElement, ClickEvent, Context, ElementId, FontWeight, Hsla, SharedString, div, px};
 
-pub(crate) const DRAWER_X: f32 = 150.0;
-pub(crate) const DRAWER_W: f32 = 456.0;
-/// Space kept free below the drawer.
-pub(crate) const DRAWER_MARGIN: f32 = 12.0;
+pub(crate) const DRAWER_W: f32 = 480.0;
+/// From this window width on the drawer takes its own column and the desk shrinks to the rest;
+/// narrower windows get it as an overlay on the right edge.
+const DOCK_MIN_W: f32 = 1040.0;
 /// Left and right padding inside the drawer.
-const DRAWER_PAD: f32 = 18.0;
+const DRAWER_PAD: f32 = 20.0;
+/// Row height of a multi-line text box; boxes are sized to whole rows plus their padding.
+const TEXT_LINE_H: f32 = 16.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tone {
@@ -92,15 +94,20 @@ pub(crate) fn tab_dot_color(dot: TabDot, pal: &Pal) -> (Hsla, bool) {
 }
 
 impl Proto {
-    /// The drawer's area in window px; it reaches down to the bottom margin of the window.
+    /// The drawer's area in window px: the full height below the header, on the right edge.
     pub(crate) fn drawer_rect(&self) -> crate::iso::Rect2 {
-        let y = crate::scene::HEADER_H + 6.0;
+        let y = crate::scene::HEADER_H;
         crate::iso::Rect2 {
-            x: DRAWER_X,
+            x: self.vp.0 - DRAWER_W,
             y,
             w: DRAWER_W,
-            h: (self.vp.1 - y - DRAWER_MARGIN).max(240.0),
+            h: (self.vp.1 - y).max(240.0),
         }
+    }
+
+    /// Whether the open drawer sits beside the desk instead of over it.
+    pub(crate) fn drawer_docked(&self) -> bool {
+        self.drawer.open && self.vp.0 >= DOCK_MIN_W
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -315,10 +322,23 @@ impl Proto {
         let empty = text.is_empty() && preedit.is_none();
         let mut rows: Vec<AnyElement> = Vec::new();
         if empty {
-            rows.push(para(placeholder, 11.5, rgba(pal.muted, 0.7)).into_any_element());
-            if focused {
-                rows.push(div().w(px(1.5)).h(px(15.0)).bg(caret).into_any_element());
-            }
+            rows.push(
+                div()
+                    .relative()
+                    .child(para(placeholder, 11.5, rgba(pal.muted, 0.7)))
+                    .when(focused, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(1.5))
+                                .h(px(15.0))
+                                .bg(caret),
+                        )
+                    })
+                    .into_any_element(),
+            );
         } else {
             let mut preedit = preedit;
             for (i, line) in lines.iter().enumerate() {
@@ -327,7 +347,7 @@ impl Proto {
                     div()
                         .flex()
                         .items_center()
-                        .min_h(px(16.0))
+                        .h(px(TEXT_LINE_H))
                         .child(mtxt(line.clone(), 11.5, ink))
                         .when(tail, |d| d.children(preedit.take()))
                         .when(tail && focused, |d| {
@@ -348,7 +368,6 @@ impl Proto {
             .w_full()
             .px(px(10.0))
             .py(px(7.0))
-            .overflow_y_scroll()
             .rounded(px(ui::RAD_FIELD))
             .border_1()
             .border_color(if focused {
@@ -358,7 +377,13 @@ impl Proto {
             })
             .bg(rgba(pal.canvas, 1.0))
             .cursor_text()
-            .child(div().flex().flex_col().children(rows))
+            .child(
+                div()
+                    .id((id, 0usize))
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_col().children(rows)),
+            )
             .child(self.ime_anchor(target, cx))
             .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                 this.marked = None;
@@ -615,7 +640,7 @@ impl Proto {
                     "field-token".into(),
                     Target::Drawer(Field::Token),
                     token_text,
-                    "账户 Token（粘贴：Ctrl+V）",
+                    crate::TOKEN_PLACEHOLDER,
                     pal,
                     cx,
                     |t| t.drawer.field = Field::Token,
@@ -740,37 +765,45 @@ impl Proto {
     }
 
     pub(crate) fn drawer_view(&self, pal: &Pal, cx: &mut Context<Self>) -> AnyElement {
-        let r = self.drawer_rect();
         let hair = rgba(pal.hair, 1.0);
         let muted = rgba(pal.muted, 1.0);
         let body: Vec<AnyElement> = match self.mesh.tab {
             DrawerTab::Server => self.server_tab(pal, cx),
             DrawerTab::Mesh => self.mesh_tab(pal, cx),
         };
+        let edge = gpui::BoxShadow {
+            color: gpui::black().opacity(0.16),
+            offset: gpui::point(px(-6.0), px(0.0)),
+            blur_radius: px(22.0),
+            spread_radius: px(0.0),
+        };
         div()
             .id("hub-drawer")
             .debug_selector(|| "hub-drawer".to_string())
-            .absolute()
-            .left(px(r.x))
-            .top(px(r.y))
-            .w(px(r.w))
-            .max_h(px(r.h))
+            .w(px(DRAWER_W))
+            .flex_none()
             .flex()
             .flex_col()
-            .rounded(px(ui::RAD_PANEL))
+            .when(self.drawer_docked(), |d| d.relative().h_full())
+            .when(!self.drawer_docked(), |d| {
+                d.absolute()
+                    .right_0()
+                    .top(px(crate::scene::HEADER_H))
+                    .bottom_0()
+            })
             .bg(rgba(pal.bar, 1.0))
-            .border_1()
+            .border_l_1()
             .border_color(hair)
-            .shadow_md()
+            .shadow(vec![edge])
             .occlude()
             .child(
                 div()
                     .px(px(DRAWER_PAD))
-                    .pt(px(14.0))
-                    .pb(px(10.0))
+                    .pt(px(18.0))
+                    .pb(px(12.0))
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(12.0))
                     .flex_none()
                     .child(
                         div()
@@ -827,10 +860,10 @@ impl Proto {
                     .min_h(px(0.0))
                     .overflow_y_scroll()
                     .px(px(DRAWER_PAD))
-                    .pb(px(16.0))
+                    .pb(px(20.0))
                     .child(
                         div()
-                            .w(px(DRAWER_W - 2.0 * DRAWER_PAD - 2.0))
+                            .w(px(DRAWER_W - 2.0 * DRAWER_PAD - 1.0))
                             .flex()
                             .flex_col()
                             .gap(px(9.0))
