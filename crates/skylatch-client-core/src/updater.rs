@@ -190,11 +190,14 @@ pub enum InstallKind {
     WindowsInstaller,
     WindowsPortable,
     LinuxDeb,
+    AndroidApk,
 }
 
 impl InstallKind {
     pub fn detect() -> Result<Self, UpdateError> {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        if cfg!(all(target_os = "android", target_arch = "aarch64")) {
+            Ok(Self::AndroidApk)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             Ok(Self::MacApp)
         } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
             let exe = std::env::current_exe()?;
@@ -228,6 +231,7 @@ impl InstallKind {
             Self::WindowsInstaller => format!("Skylatch-{version}-windows-x64-setup.exe"),
             Self::WindowsPortable => format!("Skylatch-{version}-windows-x64-portable.zip"),
             Self::LinuxDeb => format!("skylatch-{version}-linux-x86_64.deb"),
+            Self::AndroidApk => format!("Skylatch-{version}-android-arm64.apk"),
         }
     }
 }
@@ -249,6 +253,13 @@ pub struct UpdateRelease {
     pub checksums: Asset,
 }
 
+/// Human-facing release details that are not needed to install it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReleaseNotes {
+    pub url: Option<String>,
+    pub body: Option<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CheckOptions {
     pub allow_prerelease: bool,
@@ -268,6 +279,10 @@ struct ReleaseJson {
     prerelease: bool,
     #[serde(default)]
     assets: Vec<Asset>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -297,7 +312,7 @@ fn pick_release(
     current: &SemVer,
     options: &CheckOptions,
     kind: InstallKind,
-) -> Result<Option<UpdateRelease>, UpdateError> {
+) -> Result<Option<(UpdateRelease, ReleaseNotes)>, UpdateError> {
     let releases = match doc {
         ReleaseDoc::One(one) => vec![*one],
         ReleaseDoc::Many(many) => many,
@@ -313,12 +328,19 @@ fn pick_release(
     };
     let version = release.tag_name.trim_start_matches('v').to_owned();
     let (package, checksums) = select_assets(kind, &version, &release.assets)?;
-    Ok(Some(UpdateRelease {
-        version,
-        kind,
-        package,
-        checksums,
-    }))
+    let notes = ReleaseNotes {
+        url: release.html_url,
+        body: release.body,
+    };
+    Ok(Some((
+        UpdateRelease {
+            version,
+            kind,
+            package,
+            checksums,
+        },
+        notes,
+    )))
 }
 
 fn client() -> Result<&'static Client, UpdateError> {
@@ -367,6 +389,15 @@ async fn get(url: &str, timeout: Option<Duration>) -> Result<reqwest::Response, 
 
 /// `Ok(None)` means the running build is already the newest eligible release.
 pub async fn check_for_update(options: CheckOptions) -> Result<Option<UpdateRelease>, UpdateError> {
+    Ok(check_for_update_with_notes(options)
+        .await?
+        .map(|(release, _)| release))
+}
+
+/// [`check_for_update`] plus the release page and notes.
+pub async fn check_for_update_with_notes(
+    options: CheckOptions,
+) -> Result<Option<(UpdateRelease, ReleaseNotes)>, UpdateError> {
     let current = SemVer::parse(
         options
             .current_version
@@ -553,6 +584,10 @@ pub fn apply_update(
         InstallKind::LinuxDeb => Ok(ApplyOutcome::ManualInstall {
             package_path: package.path.clone(),
             command_hint: format!("sudo dpkg -i '{}'", package.path.display()),
+        }),
+        InstallKind::AndroidApk => Ok(ApplyOutcome::ManualInstall {
+            package_path: package.path.clone(),
+            command_hint: "install the APK with the Android package installer".into(),
         }),
     }
 }

@@ -2,9 +2,9 @@ use axum::{routing::get, Json, Router};
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
 use skylatch_client_core::updater::{
-    app_bundle, apply_update, check_for_update, check_team, download_and_verify, parse_checksums,
-    select_assets, team_identifier, ApplyOptions, ApplyOutcome, Asset, CheckOptions,
-    DownloadProgress, InstallKind, SemVer, UpdateError,
+    app_bundle, apply_update, check_for_update, check_for_update_with_notes, check_team,
+    download_and_verify, parse_checksums, select_assets, team_identifier, ApplyOptions,
+    ApplyOutcome, Asset, CheckOptions, DownloadProgress, InstallKind, SemVer, UpdateError,
 };
 use std::{
     fs,
@@ -114,6 +114,7 @@ fn assets(version: &str) -> Vec<Asset> {
         format!("Skylatch-{version}-windows-x64-setup.exe"),
         format!("Skylatch-{version}-windows-x64-portable.zip"),
         format!("skylatch-{version}-linux-x86_64.deb"),
+        format!("Skylatch-{version}-android-arm64.apk"),
         "SHA256SUMS".into(),
     ]
     .into_iter()
@@ -138,6 +139,7 @@ fn selects_asset_per_install_kind() {
             "Skylatch-0.2.0-windows-x64-portable.zip",
         ),
         (InstallKind::LinuxDeb, "skylatch-0.2.0-linux-x86_64.deb"),
+        (InstallKind::AndroidApk, "Skylatch-0.2.0-android-arm64.apk"),
     ] {
         let (package, sums) = select_assets(kind, "0.2.0", &assets("0.2.0")).unwrap();
         assert_eq!(
@@ -248,6 +250,7 @@ async fn serve(prerelease_tag: Option<&str>, tamper: bool) -> Server {
     let release = |tag: &str, pre: bool, draft: bool| -> Value {
         json!({
             "tag_name": tag, "prerelease": pre, "draft": draft,
+            "html_url": format!("{base}/releases/{tag}"), "body": format!("notes for {tag}"),
             "assets": assets(tag.trim_start_matches('v')).into_iter().map(|a| json!({
                 "name": a.name, "size": 1, "browser_download_url": format!("{base}/dl/{}", a.name)
             })).collect::<Vec<_>>()
@@ -295,6 +298,17 @@ async fn check_reports_new_current_and_prerelease() {
         .unwrap();
     assert_eq!(found.version, "0.2.0");
     assert_eq!(found.package.name, "skylatch-0.2.0-linux-x86_64.deb");
+
+    let mut android = options(&server, "/latest", "0.1.0");
+    android.kind = Some(InstallKind::AndroidApk);
+    let (found, notes) = check_for_update_with_notes(android).await.unwrap().unwrap();
+    assert_eq!(found.package.name, "Skylatch-0.2.0-android-arm64.apk");
+    assert_eq!(found.checksums.name, "SHA256SUMS");
+    assert_eq!(
+        notes.url.as_deref(),
+        Some(format!("{}/releases/v0.2.0", server.base).as_str())
+    );
+    assert_eq!(notes.body.as_deref(), Some("notes for v0.2.0"));
 
     assert_eq!(
         check_for_update(options(&server, "/latest", "v0.2.0"))

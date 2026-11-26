@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone package: the empty [workspace] table keeps the root workspace (and the desktop
+# clients) free of the `jni` dependency.
+
+[package]
+name = "skylatch-android-jni"
+description = "JNI bridge between the Skylatch Android client and skylatch-client-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/maxesisn/skylatch"
+publish = false
+
+[lib]
+name = "skylatch_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+serde_json = "1"
+skylatch-client-core = { path = "../../../crates/skylatch-client-core" }
+skylatch-proto = { path = "../../../crates/skylatch-proto" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace]
