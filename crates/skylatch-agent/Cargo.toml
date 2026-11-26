@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 socket2 = "0.6"
 skylatch-client-core = { path = "../skylatch-client-core" }
+skylatch-mesh = { path = "../skylatch-mesh" }
 skylatch-proto.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process"] }
