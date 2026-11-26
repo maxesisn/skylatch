@@ -9,9 +9,16 @@
 
 mod config;
 mod host_mgr;
+mod hub_ui;
+mod hub_view;
 mod iso;
 mod live;
 mod mark;
+mod mesh_actions;
+mod mesh_modal;
+mod mesh_ops;
+mod mesh_ui;
+mod mesh_view;
 mod onboard;
 mod onboard_view;
 mod scene;
@@ -123,7 +130,8 @@ OPTIONS
 
 With a hub URL and token the window lists the hub's devices (refreshed every 10 s); offline
 ones keep their seat, drawn faintly, until their record is removed. The same settings can be
-typed into the in-window Hub drawer (click the Hub pill, or press H).
+typed into the in-window drawer (click the Hub pill, or press H), whose second tab manages
+the EasyTier mesh network.
 Without them the first-run screen offers to sign in to a hub (password or account token) or
 to connect to one host directly, and shows an empty L-shaped desk until a device appears.
 While signed in, `+ Add device` shows a one-time pairing code for `skylatch-agent join`.
@@ -142,7 +150,7 @@ KEYS
     V                    toggle Desk / Shelf view
     T                    toggle Light / Dark mode
     R                    refresh the device list
-    H                    open / close the Hub settings drawer
+    H                    open / close the connection and mesh drawer
     E                    arrange the workstation (drag machines, add furniture and rooms)
     0                    reset the camera (auto-fit of the whole room)
     Enter                take over the selected screen (starts the native client)
@@ -217,6 +225,11 @@ fn utf8_range_to_utf16(s: &str, r: &Range<usize>) -> Range<usize> {
 
 fn plain_char(c: char) -> bool {
     !c.is_control()
+}
+
+/// Multi-line boxes (pasted TOML, peer lists) also keep line breaks and tabs.
+fn text_char(c: char) -> bool {
+    !c.is_control() || c == '\n' || c == '\t'
 }
 
 /// Puts `text` (control characters dropped, `keep` applied) over the UTF-16 `range` of `buf`,
@@ -882,6 +895,8 @@ enum HubState {
 enum Field {
     Url,
     Token,
+    User,
+    Pass,
 }
 
 /// The text box that takes keyboard and input-method text right now.
@@ -893,9 +908,11 @@ enum Target {
     Onb(OnbField),
     /// the room of the `+ 添加设备` modal
     Pair,
+    /// the 虚拟组网 tab and its dialogs
+    Mesh(mesh_ui::MeshField),
 }
 
-/// The in-window Hub settings drawer.
+/// The in-window 连接与组网 drawer.
 struct Drawer {
     open: bool,
     field: Field,
@@ -904,24 +921,24 @@ struct Drawer {
     show_token: bool,
     prefer_direct: bool,
     error: Option<String>,
+    account: hub_ui::AccountMode,
+    user: String,
+    /// Only until it is submitted; wiped then.
+    pass: String,
+    busy: bool,
+    /// Background sign-in or signup, with the hub URL it was started for.
+    login: Option<(
+        String,
+        std::sync::mpsc::Receiver<Result<mesh_ops::SignedIn, String>>,
+    )>,
+    /// The sign-out guard was answered for the submit that follows.
+    guard_passed: bool,
 }
 
-const DRAWER_X: f32 = 150.0;
-const DRAWER_W: f32 = 448.0;
-const DRAWER_H: f32 = 398.0;
 const MAX_URL_LEN: usize = 256;
 const MAX_TOKEN_LEN: usize = 512;
 /// How long the copy button shows "已复制".
 const COPIED_FLASH: Duration = Duration::from_millis(1800);
-
-fn drawer_rect() -> Rect2 {
-    Rect2 {
-        x: DRAWER_X,
-        y: HEADER_H + 6.0,
-        w: DRAWER_W,
-        h: DRAWER_H,
-    }
-}
 
 struct Banner {
     text: String,
@@ -1048,6 +1065,16 @@ struct Proto {
     update_options: CheckOptions,
     /// An offline device record on its way out of the hub.
     removing: Option<Removal>,
+    /// The 虚拟组网 tab: EasyTier state, the unlocked vault and its dialogs.
+    mesh: mesh_ui::MeshUi,
+    /// What `/api/v1/info` says about the hub in the drawer.
+    hubinfo: hub_ui::HubInfoSlot,
+    /// This user's Skylatch directory (managed EasyTier files); `None` in tests.
+    mesh_paths: Option<skylatch_mesh::MeshPaths>,
+    /// The account signed in with a password this session.
+    mesh_user: Option<String>,
+    /// Window size of the last frame.
+    vp: (f32, f32),
 }
 
 /// `DELETE /api/v1/devices/:id` in flight for the selected offline machine.
@@ -1116,6 +1143,16 @@ impl Proto {
                 show_token: false,
                 prefer_direct: eff.prefer_direct,
                 error: None,
+                account: if eff.token.is_empty() {
+                    hub_ui::AccountMode::Login
+                } else {
+                    hub_ui::AccountMode::Token
+                },
+                user: String::new(),
+                pass: String::new(),
+                busy: false,
+                login: None,
+                guard_passed: false,
             },
             stored,
             eff,
@@ -1159,6 +1196,11 @@ impl Proto {
             updater: Updater::default(),
             update_options: CheckOptions::default(),
             removing: None,
+            mesh: mesh_ui::MeshUi::new(),
+            hubinfo: hub_ui::HubInfoSlot::new(),
+            mesh_paths: None,
+            mesh_user: None,
+            vp: (1360.0, 860.0),
         };
         p.reset_animation_state();
         p.sel = p.scenes.default_selection(0);
@@ -1175,6 +1217,9 @@ impl Proto {
         self.ensure_pump(cx);
         if self.eff.live() {
             self.live_connect(cx);
+            let url = self.eff.hub_url.clone();
+            self.fetch_hub_info(&url);
+            self.fetch_vault();
         }
         self.sync_host();
         self.refresh_local_id();
@@ -1746,6 +1791,7 @@ impl Proto {
                             || this.pair.pending.is_some()
                             || this.save.inflight.is_some()
                             || this.removing.is_some()
+                            || this.mesh_busy()
                     }) else {
                         break;
                     };
@@ -1833,6 +1879,17 @@ impl Proto {
         };
         self.drawer.prefer_direct = self.eff.prefer_direct;
         self.drawer.show_token = false;
+        self.drawer.account = if self.drawer.token.is_empty() {
+            hub_ui::AccountMode::Login
+        } else {
+            hub_ui::AccountMode::Token
+        };
+        self.drawer.pass.clear();
+        self.mesh.field = None;
+        // a fresh detection round for the tab's dot; none while the drawer stays closed
+        self.mesh.probe_at = None;
+        let url = self.drawer.url.clone();
+        self.fetch_hub_info(&url);
         self.hover = None;
         self.kick();
     }
@@ -1843,8 +1900,7 @@ impl Proto {
             return;
         }
         if self.drawer.open {
-            self.drawer.open = false;
-            self.kick();
+            self.close_drawer();
         } else {
             self.open_drawer();
         }
@@ -1855,10 +1911,21 @@ impl Proto {
     /// The box that takes text now, in the order the overlays stack: the add-device modal, the
     /// Hub drawer, the first-run card, the arrange toolbar's field.
     fn active_target(&self) -> Option<Target> {
+        if let Some(modal) = &self.mesh.modal {
+            return matches!(modal, mesh_ui::Modal::Import(_))
+                .then_some(Target::Mesh(mesh_ui::MeshField::Import));
+        }
         if self.pair.open {
             Some(Target::Pair)
         } else if self.drawer.open {
-            Some(Target::Drawer(self.drawer.field))
+            match self.mesh.tab {
+                mesh_ui::DrawerTab::Server => Some(Target::Drawer(self.drawer.field)),
+                mesh_ui::DrawerTab::Mesh => self
+                    .mesh
+                    .field
+                    .filter(|f| self.mesh.text_of(*f).is_some())
+                    .map(Target::Mesh),
+            }
         } else if self.onboarding_active() {
             Some(Target::Onb(self.onb.field))
         } else if self.edit_input.is_some() {
@@ -1874,8 +1941,11 @@ impl Proto {
             Target::Edit => self.edit_input.as_ref().map(|i| i.text.as_str()),
             Target::Drawer(Field::Url) => Some(&self.drawer.url),
             Target::Drawer(Field::Token) => Some(&self.drawer.token),
+            Target::Drawer(Field::User) => Some(&self.drawer.user),
+            Target::Drawer(Field::Pass) => Some(&self.drawer.pass),
             Target::Onb(f) => Some(self.onb.text_of(f)),
             Target::Pair => Some(&self.pair.room),
+            Target::Mesh(f) => self.mesh.text_of(f),
         }
     }
 
@@ -1883,8 +1953,9 @@ impl Proto {
     fn is_secret(t: Target) -> bool {
         matches!(
             t,
-            Target::Drawer(Field::Token)
+            Target::Drawer(Field::Token | Field::Pass)
                 | Target::Onb(OnbField::Password | OnbField::Token | OnbField::DirectToken)
+                | Target::Mesh(mesh_ui::MeshField::Unlock)
         )
     }
 
@@ -1896,16 +1967,19 @@ impl Proto {
                 .map(|i| (&mut i.text, MAX_INPUT_LEN)),
             Target::Drawer(Field::Url) => Some((&mut self.drawer.url, MAX_URL_LEN)),
             Target::Drawer(Field::Token) => Some((&mut self.drawer.token, MAX_TOKEN_LEN)),
+            Target::Drawer(Field::User) => Some((&mut self.drawer.user, onboard::MAX_NAME_LEN)),
+            Target::Drawer(Field::Pass) => Some((&mut self.drawer.pass, onboard::MAX_SECRET_LEN)),
             Target::Onb(_) => Some(self.onb.buf()),
             Target::Pair => Some((&mut self.pair.room, onboard::MAX_ROOM_LEN)),
+            Target::Mesh(f) => self.mesh.buf(f),
         }
     }
 
     fn keeps(t: Target) -> fn(char) -> bool {
-        if t == Target::Pair {
-            onboard::room_char_ok
-        } else {
-            plain_char
+        match t {
+            Target::Pair => onboard::room_char_ok,
+            Target::Mesh(mesh_ui::MeshField::Import | mesh_ui::MeshField::Peers) => text_char,
+            _ => plain_char,
         }
     }
 
@@ -1933,6 +2007,7 @@ impl Proto {
         match t {
             Target::Drawer(_) => self.drawer.error = None,
             Target::Onb(_) => self.onb.error = None,
+            Target::Mesh(f) => self.mesh.edited(f),
             _ => {}
         }
     }
@@ -1961,23 +2036,32 @@ impl Proto {
         }
     }
 
-    /// Keys of the Hub drawer. Typed characters are not handled here: they reach the input
+    /// Keys of the drawer. Typed characters are not handled here: they reach the input
     /// handler (and so the input method) when nobody claims them. Returns whether the key was
     /// used.
     fn drawer_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        if ks.key == "escape" {
+            self.close_drawer();
+            return true;
+        }
+        if self.mesh.tab == mesh_ui::DrawerTab::Mesh {
+            return self.mesh_tab_key(ks);
+        }
         let m = &ks.modifiers;
         match ks.key.as_str() {
-            "escape" => {
-                self.marked = None;
-                self.drawer.open = false;
-            }
             "tab" => {
                 self.marked = None;
-                self.drawer.field = if self.drawer.field == Field::Url {
-                    Field::Token
+                let order: &[Field] = if self.drawer.account == hub_ui::AccountMode::Token {
+                    &[Field::Url, Field::Token]
                 } else {
-                    Field::Url
+                    &[Field::Url, Field::User, Field::Pass]
                 };
+                let at = order
+                    .iter()
+                    .position(|f| *f == self.drawer.field)
+                    .unwrap_or(0);
+                let step = if m.shift { order.len() - 1 } else { 1 };
+                self.drawer.field = order[(at + step) % order.len()];
             }
             "enter" => {
                 self.marked = None;
@@ -1985,7 +2069,9 @@ impl Proto {
             }
             "backspace" => {
                 self.marked = None;
-                self.field_buf().pop();
+                if let Some((buf, _)) = self.target_buf(Target::Drawer(self.drawer.field)) {
+                    buf.pop();
+                }
                 self.drawer.error = None;
             }
             // pasted by the Paste action; never twice
@@ -1995,36 +2081,91 @@ impl Proto {
         true
     }
 
-    fn field_buf(&mut self) -> &mut String {
-        match self.drawer.field {
-            Field::Url => &mut self.drawer.url,
-            Field::Token => &mut self.drawer.token,
-        }
-    }
-
+    /// Saves the server tab: a pasted token connects at once, a password signs in (or signs
+    /// up) in the background and also unlocks the account's mesh configuration. Switching to
+    /// another hub or account first asks what happens to a managed EasyTier.
     fn save_and_connect(&mut self, cx: &mut Context<Self>) {
+        if self.drawer.busy {
+            return;
+        }
         let url = config::normalize_hub_url(&self.drawer.url);
-        let token = self.drawer.token.trim().to_string();
-        if !config::hub_url_valid(&url) {
-            self.drawer.error = Some("请填写有效的 Hub 地址，例如 wss://hub.example.com".into());
+        let allow_signup = self.hubinfo.for_url(&url).is_some_and(|i| i.allow_signup);
+        let submit = match hub_ui::account_submit(
+            self.drawer.account,
+            &self.drawer.url,
+            &self.drawer.user,
+            &self.drawer.pass,
+            &self.drawer.token,
+            allow_signup,
+        ) {
+            Ok(submit) => submit,
+            Err(e) => {
+                self.drawer.field = if e.contains("地址") {
+                    Field::Url
+                } else if e.contains("Token") {
+                    Field::Token
+                } else if e.contains("用户名") {
+                    Field::User
+                } else {
+                    Field::Pass
+                };
+                self.drawer.error = Some(e);
+                return;
+            }
+        };
+        let current = config::normalize_hub_url(&self.eff.hub_url);
+        let switching = !current.is_empty()
+            && match &submit {
+                hub_ui::AccountSubmit::Token { url, token } => {
+                    *url != current || *token != self.eff.token
+                }
+                hub_ui::AccountSubmit::Credentials { url, username, .. } => {
+                    *url != current || self.mesh_user.as_deref() != Some(username.as_str())
+                }
+            };
+        if switching && !self.drawer.guard_passed && self.guard_needed() {
+            self.marked = None;
+            self.mesh.modal = Some(mesh_ui::Modal::Guard(mesh_ui::AccountAction::Submit));
             return;
         }
-        if token.is_empty() {
-            self.drawer.error = Some("请填写 Hub Token".into());
-            self.drawer.field = Field::Token;
-            return;
-        }
+        self.drawer.guard_passed = false;
         self.stored.prefer_direct = self.drawer.prefer_direct;
         self.eff.prefer_direct = self.drawer.prefer_direct;
-        self.drawer.open = false;
         self.drawer.error = None;
-        self.adopt_hub(url, token, cx);
-        self.say("正在连接 Hub…", false);
+        match submit {
+            hub_ui::AccountSubmit::Token { url, token } => {
+                self.drawer.open = false;
+                self.mesh_user = None;
+                self.adopt_hub(url, token, None, cx);
+                self.say("正在连接 Hub…", false);
+            }
+            hub_ui::AccountSubmit::Credentials {
+                url,
+                username,
+                password,
+                signup,
+            } => {
+                let len = self.drawer.pass.len();
+                self.drawer.pass.clear();
+                self.drawer.pass.extend(std::iter::repeat_n('\0', len));
+                self.drawer.pass.clear();
+                self.drawer.busy = true;
+                let rx =
+                    live::run_async(mesh_ops::sign_in(url.clone(), username, password, signup));
+                self.drawer.login = Some((url, rx));
+            }
+        }
     }
 
     /// Makes `url` + `token` the configured hub: persisted (the token only, never a password),
     /// the scene reset and polling started.
-    fn adopt_hub(&mut self, url: String, token: String, cx: &mut Context<Self>) {
+    fn adopt_hub(
+        &mut self,
+        url: String,
+        token: String,
+        vault: Option<mesh_ui::Vault>,
+        cx: &mut Context<Self>,
+    ) {
         self.stored.hub_url = url.clone();
         self.stored.token = token.clone();
         self.save_config();
@@ -2039,10 +2180,20 @@ impl Proto {
         self.live_connect(cx);
         self.sync_host();
         self.refresh_local_id();
+        self.mesh.forget_vault();
+        self.hubinfo.clear();
+        let url = self.eff.hub_url.clone();
+        self.fetch_hub_info(&url);
+        match vault {
+            Some(mesh_ui::Vault::Open(session)) => self.mesh.open(session),
+            Some(v) => self.mesh.vault = v,
+            None => self.fetch_vault(),
+        }
     }
 
-    /// Forgets the hub (and `--demo`): back to the first-run onboarding.
-    fn sign_out(&mut self) {
+    /// Forgets the hub (and `--demo`): back to the first-run onboarding. EasyTier is left as it
+    /// is; [`Proto::sign_out`] asks first when Skylatch manages it.
+    fn sign_out_now(&mut self) {
         self.stored.hub_url.clear();
         self.stored.token.clear();
         self.save_config();
@@ -2062,6 +2213,10 @@ impl Proto {
         self.forget_arrangement();
         self.install_scenes(build_scene(&[]), true);
         self.sync_host();
+        self.mesh.forget_vault();
+        self.mesh.modal = None;
+        self.mesh_user = None;
+        self.hubinfo.clear();
         self.say("已退出，已清除保存的 Hub 地址与 Token", false);
     }
 
@@ -2106,25 +2261,25 @@ impl Proto {
                     self.stored.host_enabled = self.onb.host_enabled;
                     self.stored.host_room = self.onb.host_room_value();
                     self.onb = Onboarding::new();
-                    self.adopt_hub(url, token, cx);
+                    self.adopt_hub(url, token, None, cx);
                     self.say("正在连接 Hub…", false);
                 }
                 Ok(HubSubmit::Login {
                     url,
                     username,
                     password,
+                    signup,
                 }) => {
                     // the password leaves the form now; only the returned session token is kept
                     self.onb.wipe_password();
                     self.onb.busy = true;
                     self.onb.error = None;
-                    let hub = url.clone();
-                    let rx = live::run_async(async move {
-                        skylatch_client_core::login(&hub, &username, &password)
-                            .await
-                            .map(|r| r.token)
-                            .map_err(|e| onboard::describe_login_error(&e))
-                    });
+                    let rx = live::run_async(mesh_ops::sign_in(
+                        url.clone(),
+                        username,
+                        zeroize::Zeroizing::new(password),
+                        signup,
+                    ));
                     self.onb.login = Some((url, rx));
                 }
             },
@@ -2156,7 +2311,8 @@ impl Proto {
 
     // ───────────── pairing codes ─────────────
 
-    /// Mints a fresh one-time code on a background thread.
+    /// Mints a fresh one-time code on a background thread. With a mesh profile chosen, the
+    /// profile is sealed with a new invite secret first; only the ciphertext goes to the hub.
     fn request_code(&mut self) {
         if !self.eff.live() {
             return;
@@ -2167,13 +2323,48 @@ impl Proto {
         self.pair.error = None;
         self.pair.code = None;
         self.pair.copied_at = None;
-        let rx = live::run_async(async move {
-            skylatch_client_core::create_pairing_code(&t.url, &t.token)
-                .await
-                .map(|r| (r.code, r.expires_in_secs))
-                .map_err(|e| onboard::describe_pairing_error(&e))
+        self.pair.invite = None;
+        let profile = self.pair.mesh.as_ref().and_then(|id| {
+            self.mesh
+                .vault
+                .session()
+                .and_then(|s| s.vault.profile(id).cloned())
         });
+        let rx = match profile {
+            Some(profile) => match mesh_ui::seal_invite(&profile) {
+                Ok((secret, invite)) => {
+                    self.pair.invite = Some((self.pair.generation, secret.display()));
+                    live::run_async(async move {
+                        skylatch_client_core::create_pairing_code_with_invite(
+                            &t.url, &t.token, &invite,
+                        )
+                        .await
+                        .map(|r| (r.code, r.expires_in_secs))
+                        .map_err(|e| onboard::describe_pairing_error(&e))
+                    })
+                }
+                Err(e) => {
+                    self.pair.busy = false;
+                    self.pair.error = Some(format!("无法加密组网邀请：{e}"));
+                    return;
+                }
+            },
+            None => live::run_async(async move {
+                skylatch_client_core::create_pairing_code(&t.url, &t.token)
+                    .await
+                    .map(|r| (r.code, r.expires_in_secs))
+                    .map_err(|e| onboard::describe_pairing_error(&e))
+            }),
+        };
         self.pair.pending = Some((self.pair.generation, rx));
+    }
+
+    /// Which mesh profile the next code invites the new machine into; a new code follows.
+    fn set_pair_mesh(&mut self, profile: Option<String>) {
+        if self.pair.mesh != profile {
+            self.pair.mesh = profile;
+            self.request_code();
+        }
     }
 
     fn open_pair_modal(&mut self) {
@@ -2185,6 +2376,15 @@ impl Proto {
         if !self.pair.open {
             self.pair.open = true;
             self.marked = None;
+            let known = self.mesh.vault.session().map(|s| &s.vault);
+            if self
+                .pair
+                .mesh
+                .as_ref()
+                .is_some_and(|id| known.is_none_or(|v| v.profile(id).is_none()))
+            {
+                self.pair.mesh = None;
+            }
             // the new machine most likely joins the room on screen
             self.pair.room = self.current_room_name().unwrap_or_default();
             self.request_code();
@@ -2209,12 +2409,12 @@ impl Proto {
 
     /// Copies the `skylatch-agent join` command for the current code.
     fn copy_join_command(&mut self, cx: &mut Context<Self>) {
-        let Some(code) = self.pair.code.as_ref().filter(|c| !c.expired()) else {
+        let Some(code) = self.pair.join_code() else {
             return;
         };
         let cmd = onboard::join_command(
             &config::normalize_hub_url(&self.eff.hub_url),
-            &code.code,
+            &code,
             Some(&self.pair.room),
         );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
@@ -2252,11 +2452,12 @@ impl Proto {
             Some(Ok(outcome)) => {
                 let (url, _) = self.onb.login.take().expect("login in flight");
                 match outcome {
-                    Ok(token) => {
+                    Ok(signed) => {
                         self.stored.host_enabled = self.onb.host_enabled;
                         self.stored.host_room = self.onb.host_room_value();
                         self.onb = Onboarding::new();
-                        self.adopt_hub(url, token, cx);
+                        self.mesh_user = Some(signed.username.clone());
+                        self.adopt_hub(url, signed.token, Some(signed.vault), cx);
                         self.say("已登录，正在加载设备…", false);
                     }
                     Err(msg) => {
@@ -2308,6 +2509,9 @@ impl Proto {
         }
 
         if self.pump_save() {
+            changed = true;
+        }
+        if self.pump_mesh(cx) {
             changed = true;
         }
 
@@ -2921,7 +3125,7 @@ impl Proto {
             return None;
         }
         if self.drawer.open {
-            let r = drawer_rect();
+            let r = self.drawer_rect();
             if f(pos.x) >= r.x && f(pos.x) <= r.x + r.w && f(pos.y) >= r.y && f(pos.y) <= r.y + r.h
             {
                 return None;
@@ -2931,7 +3135,7 @@ impl Proto {
     }
 
     fn in_drawer(&self, pos: Point<Pixels>) -> bool {
-        let r = drawer_rect();
+        let r = self.drawer_rect();
         self.drawer.open
             && f(pos.x) >= r.x
             && f(pos.x) <= r.x + r.w
@@ -2943,7 +3147,9 @@ impl Proto {
     /// typed into a text box, input-method keys) travel on to the platform's input handler.
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let handled = if self.pair.open {
+        let handled = if self.mesh.modal.is_some() {
+            self.mesh_modal_key(ks)
+        } else if self.pair.open {
             self.pair_key(ks, cx)
         } else if self.drawer.open {
             self.drawer_key(ks, cx)
@@ -3871,274 +4077,6 @@ impl Proto {
             }
         }
     }
-
-    fn field_box(
-        &self,
-        id: &'static str,
-        field: Field,
-        value: String,
-        placeholder: &'static str,
-        pal: &Pal,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let focused = self.drawer.field == field;
-        let ink = rgba(pal.ink, 1.0);
-        let preedit = self.preedit(
-            Target::Drawer(field),
-            field == Field::Token && !self.drawer.show_token,
-            12.0,
-            true,
-            pal,
-        );
-        let empty = value.is_empty() && preedit.is_none();
-        div()
-            .id(id)
-            .relative()
-            .h(px(ui::FIELD_H))
-            .w_full()
-            .px(px(10.0))
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .rounded(px(ui::RAD_FIELD))
-            .border_1()
-            .border_color(if focused {
-                rgba(pal.accent, 1.0)
-            } else {
-                rgba(pal.hair, 1.0)
-            })
-            .bg(rgba(pal.canvas, 1.0))
-            .cursor_text()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .justify_end()
-                    .child(if empty {
-                        mtxt(placeholder, 12.0, rgba(pal.muted, 0.7))
-                    } else {
-                        mtxt(value, 12.0, ink)
-                    })
-                    .children(preedit)
-                    .when(focused, |d| {
-                        d.child(
-                            div()
-                                .w(px(1.5))
-                                .h(px(15.0))
-                                .ml(px(1.0))
-                                .flex_none()
-                                .bg(rgba(pal.accent, 1.0)),
-                        )
-                    }),
-            )
-            .child(self.ime_anchor(Target::Drawer(field), cx))
-            .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
-                this.marked = None;
-                this.drawer.field = field;
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    fn drawer_view(&self, pal: &Pal, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let ink = rgba(pal.ink, 1.0);
-        let muted = rgba(pal.muted, 1.0);
-        let hair = rgba(pal.hair, 1.0);
-        let accent = rgba(pal.accent, 1.0);
-        let r = drawer_rect();
-        let token_text = if self.drawer.show_token {
-            self.drawer.token.clone()
-        } else {
-            "•".repeat(self.drawer.token.chars().count().min(48))
-        };
-        let status = match (&self.drawer.error, &self.hub) {
-            (Some(e), _) => (e.clone(), rgba(pal.warn, 1.0)),
-            (None, HubState::Demo) => ("当前为演示模式，填写后即可连接真实 Hub".to_string(), muted),
-            (None, HubState::Unconfigured) => (String::new(), muted),
-            (None, HubState::Connecting) => ("正在连接…".to_string(), rgba(pal.blue, 1.0)),
-            (None, HubState::Online { count }) => {
-                (format!("已连接，{count} 台设备在线"), rgba(pal.green, 1.0))
-            }
-            (None, HubState::Failed(m)) => (m.clone(), rgba(pal.warn, 1.0)),
-        };
-        let label = |s: &'static str| txt(s, 11.0, muted);
-        let on_accent = rgba(pal.on_accent, 1.0);
-        let checked = self.drawer.prefer_direct;
-        div()
-            .id("hub-drawer")
-            .absolute()
-            .left(px(r.x))
-            .top(px(r.y))
-            .w(px(r.w))
-            .px(px(18.0))
-            .py(px(16.0))
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .rounded(px(ui::RAD_PANEL))
-            .bg(rgba(pal.bar, 1.0))
-            .border_1()
-            .border_color(hair)
-            .shadow_md()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(txt("Hub 设置", 14.0, ink).font_weight(FontWeight::SEMIBOLD))
-                    .child(
-                        div()
-                            .id("drawer-close")
-                            .px(px(8.0))
-                            .h(px(ui::MINI_H))
-                            .flex()
-                            .items_center()
-                            .rounded(px(ui::RAD_INNER))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgba(pal.wash, 1.0)))
-                            .child(mtxt("Esc", 10.0, muted))
-                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.drawer.open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(label("Hub 地址"))
-            .child(self.field_box(
-                "field-url",
-                Field::Url,
-                self.drawer.url.clone(),
-                "wss://hub.example.com",
-                pal,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(label("Token"))
-                    .child(
-                        div()
-                            .id("token-eye")
-                            .cursor_pointer()
-                            .child(txt(
-                                if self.drawer.show_token {
-                                    "隐藏"
-                                } else {
-                                    "显示"
-                                },
-                                11.0,
-                                accent,
-                            ))
-                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.drawer.show_token = !this.drawer.show_token;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(self.field_box(
-                "field-token",
-                Field::Token,
-                token_text,
-                "账户 Token（粘贴：Ctrl+V）",
-                pal,
-                cx,
-            ))
-            .child(
-                div()
-                    .id("prefer-direct")
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .size(px(15.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(ui::RAD_KBD))
-                            .border_1()
-                            .border_color(if checked { accent } else { muted })
-                            .bg(if checked {
-                                accent
-                            } else {
-                                rgba(pal.canvas, 1.0)
-                            })
-                            .child(if checked {
-                                txt("✓", 10.0, on_accent)
-                            } else {
-                                div()
-                            }),
-                    )
-                    .child(txt("优先直连（取消勾选则只走 Hub 中继）", 12.0, ink))
-                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        this.drawer.prefer_direct = !this.drawer.prefer_direct;
-                        cx.notify();
-                    })),
-            )
-            .child(div().h(px(18.0)).overflow_hidden().child(txt(
-                clip(&status.0, 62),
-                11.5,
-                status.1,
-            )))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .id("drawer-save")
-                            .h(px(ui::FIELD_H))
-                            .px(px(16.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(ui::RAD_FIELD))
-                            .bg(accent)
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgba(pal.accent.mix(pal.ink, 0.18), 1.0)))
-                            .child(
-                                txt("保存并连接", 13.0, on_accent)
-                                    .font_weight(FontWeight::SEMIBOLD),
-                            )
-                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.save_and_connect(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("drawer-signout")
-                            .h(px(ui::FIELD_H))
-                            .px(px(14.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(ui::RAD_FIELD))
-                            .border_1()
-                            .border_color(hair)
-                            .bg(rgba(pal.surface, 1.0))
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgba(pal.wash, 1.0)))
-                            .child(txt("退出登录", 13.0, ink))
-                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                                this.sign_out();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(hint_row(
-                &[("Tab", "切换字段"), ("Enter", "保存"), ("Esc", "关闭")],
-                pal,
-            ))
-            .child(txt("设置保存在本机用户配置目录", 10.5, muted))
-            .child(self.version_row(pal, cx))
-            .into_any_element()
-    }
 }
 
 impl Render for Proto {
@@ -4152,6 +4090,7 @@ impl Render for Proto {
 
         let pal = self.pal();
         let vp = window.viewport_size();
+        self.vp = (f(vp.width), f(vp.height));
         let toolbar_h = if self.edit { TOOLBAR_H } else { 0.0 };
         let (sw, sh) = stage_size(f(vp.width), f(vp.height) - toolbar_h);
         self.stage = (sw, sh);
@@ -4774,7 +4713,7 @@ impl Render for Proto {
                     if this.drawer.open {
                         // clicks inside the drawer belong to it; a click on the stage dismisses it
                         if !this.in_drawer(ev.position) {
-                            this.drawer.open = false;
+                            this.close_drawer();
                             cx.notify();
                         }
                         return;
@@ -5187,6 +5126,7 @@ impl Render for Proto {
             .child(footer)
             .children(self.drawer.open.then(|| self.drawer_view(&pal, cx)))
             .children(self.pair.open.then(|| self.pair_modal(&pal, cx)))
+            .children(self.mesh_modal(&pal, cx))
     }
 }
 
@@ -5244,6 +5184,9 @@ fn attach_parent_console() {}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = mesh_ops::run_helper(&args) {
+        std::process::exit(code);
+    }
     let cli = match config::parse_args(&args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -5315,6 +5258,7 @@ fn main() {
                     let mut p = Proto::new(cx, stored, eff, config_path);
                     p.attach_host(host_for_window, tray_active);
                     p.agent_json = host_mgr::agent_config_path();
+                    p.mesh_paths = mesh_ops::paths();
                     p.start(cx);
                     p
                 });
@@ -5408,6 +5352,11 @@ fn run_tray(
 
 #[cfg(test)]
 mod ui_tests {
+    // the drawer's tests live in their own file but use this module's helpers
+    mod mesh_ui_tests {
+        include!("mesh_ui_tests.rs");
+    }
+
     use super::*;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use skylatch_proto::control::{DeviceFormFactor, DirectEndpoint, EndpointKind};
@@ -6326,6 +6275,16 @@ mod ui_tests {
             v.drawer
                 .error
                 .as_deref()
+                .is_some_and(|e| e.contains("用户名"))
+                && v.drawer.field == Field::User
+        }));
+        // without a token the account form signs in; the Token segment takes a pasted one
+        view.update(cx, |v, _| v.set_account_mode(hub_ui::AccountMode::Token));
+        cx.simulate_keystrokes("enter");
+        assert!(view.read_with(cx, |v, _| {
+            v.drawer
+                .error
+                .as_deref()
                 .is_some_and(|e| e.contains("Token"))
                 && v.drawer.field == Field::Token
         }));
@@ -6349,6 +6308,7 @@ mod ui_tests {
 
         // fill in the fields and Save & Connect: persisted, live mode, scene replaced
         view.update(cx, |v, _| {
+            v.set_account_mode(hub_ui::AccountMode::Token);
             v.drawer.url = "http://127.0.0.1:9/".into();
             v.drawer.token = "tok-123".into();
             v.drawer.prefer_direct = false;
@@ -6557,7 +6517,14 @@ mod ui_tests {
                     .find(|l| l.to_lowercase().starts_with("authorization:"))
                     .unwrap_or("authorization: none")
                     .to_string();
-                log.lock().unwrap().push(format!("{first} | {auth}"));
+                let invite = if text.contains("\"mesh_invite\"") {
+                    " | mesh_invite"
+                } else {
+                    ""
+                };
+                log.lock()
+                    .unwrap()
+                    .push(format!("{first} | {auth}{invite}"));
                 let (status, body) = if first.starts_with("POST /api/v1/login") {
                     if text.contains("\"password\":\"wrong\"") {
                         ("401 Unauthorized", String::new())

@@ -213,6 +213,9 @@ mod tests {
         for (file, src) in [
             ("main.rs", include_str!("main.rs")),
             ("onboard_view.rs", include_str!("onboard_view.rs")),
+            ("hub_view.rs", include_str!("hub_view.rs")),
+            ("mesh_view.rs", include_str!("mesh_view.rs")),
+            ("mesh_modal.rs", include_str!("mesh_modal.rs")),
         ] {
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
